@@ -128,15 +128,26 @@ jobs:
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.IMAGE_NAME }}:scan
-          format: 'sarif'
-          output: 'trivy-image-results.sarif'
+          format: 'table'
+          output: 'trivy-results.txt'
           severity: 'CRITICAL,HIGH'
 
-      - name: Upload Trivy image scan results
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: 'trivy-image-results.sarif'
+      - name: Publish Trivy results to summary
+        run: |
+          if [[ -s trivy-results.txt ]]; then
+            {
+              echo "### Security Scan Results"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```'
+              cat trivy-results.txt
+              echo '```'
+              echo "</details>"
+            } >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Security Scan Results" >> $GITHUB_STEP_SUMMARY
+            echo "No CRITICAL or HIGH vulnerabilities found." >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
