@@ -17,7 +17,7 @@ linters:
     - unparam
     - gosec
     - prealloc
-    - exportloopref
+    - copyloopvar
     - noctx
     - bodyclose
     - errorlint

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"regexp"
 	"testing"
 )
@@ -163,16 +162,8 @@ func TestConfigValidate(t *testing.T) {
 }
 
 func TestConfigApplyEnvOverrides(t *testing.T) {
-	// Save and restore environment
-	origPort := os.Getenv("PROXY_PORT")
-	origPolicy := os.Getenv("PROXY_DEFAULT_POLICY")
-	defer func() {
-		os.Setenv("PROXY_PORT", origPort)
-		os.Setenv("PROXY_DEFAULT_POLICY", origPolicy)
-	}()
-
-	os.Setenv("PROXY_PORT", "9999")
-	os.Setenv("PROXY_DEFAULT_POLICY", "ALLOW")
+	t.Setenv("PROXY_PORT", "9999")
+	t.Setenv("PROXY_DEFAULT_POLICY", "ALLOW")
 
 	cfg := Config{}
 	cfg.ApplyEnvOverrides()
@@ -187,11 +178,11 @@ func TestConfigApplyEnvOverrides(t *testing.T) {
 
 func TestWildcardToRegex(t *testing.T) {
 	tests := []struct {
-		name     string
-		pattern  string
-		matches  []string
-		noMatch  []string
-		wantErr  bool
+		name    string
+		pattern string
+		matches []string
+		noMatch []string
+		wantErr bool
 	}{
 		{
 			name:    "exact match",
@@ -305,8 +296,8 @@ func TestMatches(t *testing.T) {
 	}
 
 	tests := []struct {
-		host  string
-		want  bool
+		host string
+		want bool
 	}{
 		{"www.google.com", true},
 		{"api.google.com", true},
@@ -359,10 +350,10 @@ func TestNormalizeDomainForMetrics(t *testing.T) {
 		host string
 		want string
 	}{
-		{"api.example.com", "api.example.com"},           // exact rewrite match
-		{"www.google.com", "google.com"},                  // whitelist match -> base domain
-		{"sub.blocked.com", "blocked.com"},                // blacklist match -> base domain
-		{"random.unknown.com", "_other"},                  // no match -> _other
+		{"api.example.com", "api.example.com"}, // exact rewrite match
+		{"www.google.com", "google.com"},       // whitelist match -> base domain
+		{"sub.blocked.com", "blocked.com"},     // blacklist match -> base domain
+		{"random.unknown.com", "_other"},       // no match -> _other
 	}
 
 	for _, tt := range tests {
