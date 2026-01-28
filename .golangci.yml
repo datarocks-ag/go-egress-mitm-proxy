@@ -1,0 +1,64 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - unparam
+    - gosec
+    - prealloc
+    - exportloopref
+    - noctx
+    - bodyclose
+    - errorlint
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+    exclude-functions:
+      - (net/http.ResponseWriter).Write
+      - (io.Closer).Close
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+
+  gosec:
+    excludes:
+      - G104 # Audit errors not checked (we handle this with errcheck)
+      - G304 # File path provided as taint input (config file paths are intentional)
+
+  misspell:
+    locale: US
+
+  goimports:
+    local-prefixes: go-egress-proxy
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+  exclude-rules:
+    # Ignore long lines in tests
+    - path: _test\.go
+      linters:
+        - lll
+
+    # Ignore error return value in test cleanup
+    - path: _test\.go
+      linters:
+        - errcheck
+      text: "Error return value is not checked"

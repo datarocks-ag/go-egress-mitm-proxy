@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# GitHub
+.github
+
+# Documentation (not needed in image)
+doc/
+*.md
+!README.md
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test files
+*_test.go
+coverage.out
+
+# Local development files
+docker-compose.yaml
+Makefile
+.golangci.yml
+
+# Certificates (mount at runtime instead)
+certs/
+
+# Build artifacts
+mitm-proxy
+dist/
+build/
+
+# Trivy cache
+.trivy/

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        # 1. Your Application
+        - name: app
+          image: my-app-image:latest
+          env:
+            - name: HTTPS_PROXY
+              value: "http://localhost:8080"
+            - name: SSL_CERT_FILE # Point app to the Proxy CA
+              value: "/etc/ssl/certs/proxy-ca.crt"
+          volumeMounts:
+            - name: ca-certs
+              mountPath: /etc/ssl/certs/proxy-ca.crt
+              subPath: ca.crt
+
+        # 2. The MITM Proxy Sidecar
+        - name: mitm-proxy
+          image: my-registry/mitm-proxy:latest
+          ports:
+            - containerPort: 8080
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /root/config.yaml
+              subPath: config.yaml
+            - name: ca-certs
+              mountPath: /etc/proxy/certs
+
+      volumes:
+        - name: config
+          configMap:
+            name: proxy-config
+        - name: ca-certs
+          secret:
+            secretName: proxy-tls-secret # Contains ca.crt and ca.key
