@@ -1,6 +1,6 @@
 module go-egress-proxy
 
-go 1.25.6
+go 1.24
 
 require (
 	github.com/elazarl/goproxy v1.8.0

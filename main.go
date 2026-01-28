@@ -411,7 +411,7 @@ func loadMITMCertificate(cfg Config) error {
 
 // handleRequest processes each incoming request through the policy engine.
 // It evaluates rules in order: rewrites -> blacklist -> whitelist -> default policy.
-func handleRequest(r *http.Request, ctx *goproxy.ProxyCtx, runtimeCfg *RuntimeConfig) (*http.Request, *http.Response) {
+func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConfig) (*http.Request, *http.Response) {
 	start := time.Now()
 	activeConnections.Inc()
 	defer activeConnections.Dec()
@@ -538,7 +538,8 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		}).DialContext(ctx, network, addr)
 
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				upstreamErrors.WithLabelValues("timeout").Inc()
 			} else {
 				upstreamErrors.WithLabelValues("connection").Inc()
