@@ -1,0 +1,48 @@
+# Binaries
+mitm-proxy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+coverage.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Certificates (generated locally, should not be committed)
+certs/
+*.crt
+*.key
+*.pem
+
+# Configuration with secrets (use example file instead)
+config.yaml
+
+# Build artifacts
+dist/
+build/
+
+# Debug files
+*.log
+debug
+
+# Trivy cache
+.trivy/

@@ -1,0 +1,39 @@
+proxy:
+  port: "8080"
+  metrics_port: "9090"
+  default_policy: "BLOCK"   # Options: ALLOW, BLOCK
+  mitm_cert_path: "certs/ca.crt"
+  mitm_key_path: "certs/ca.key"
+  outgoing_ca_bundle: ""    # Optional: path to CA bundle for upstream TLS verification
+
+# Domain rewrite rules
+# Supports exact match and wildcards (*.example.com)
+# Rewrite rules bypass ACL checks
+rewrites:
+  # Exact domain match
+  - domain: "api.production.com"
+    target_ip: "10.20.30.40"
+    headers:
+      X-Proxy-Source: "egress-gateway"
+      X-Environment: "production"
+
+  # Wildcard match (matches any single subdomain level)
+  - domain: "*.internal.example.com"
+    target_ip: "10.20.30.50"
+    headers:
+      X-Internal: "true"
+
+# Access Control Lists (regex patterns)
+# Evaluated in order: blacklist -> whitelist -> default_policy
+acl:
+  whitelist:
+    - "^.*\\.google\\.com$"
+    - "^.*\\.googleapis\\.com$"
+    - "github\\.com$"
+    - "^.*\\.github\\.com$"
+    - "^.*\\.githubusercontent\\.com$"
+  blacklist:
+    - "^.*\\.tiktok\\.com$"
+    - "^.*\\.facebook\\.com$"
+    - "^.*\\.twitter\\.com$"
+    - "social-media\\.internal"
