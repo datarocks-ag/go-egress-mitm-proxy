@@ -10,7 +10,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /mitm-proxy .
 
-FROM alpine:3.19
+FROM alpine:3.23
 
 # Install ca-certificates for outbound TLS verification
 RUN apk --no-cache add ca-certificates && \
