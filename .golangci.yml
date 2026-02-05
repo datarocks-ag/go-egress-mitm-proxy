@@ -1,64 +1,62 @@
+version: "2"
 run:
-  timeout: 5m
   modules-download-mode: readonly
-
 linters:
   enable:
-    - errcheck
-    - gosimple
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    - gofmt
-    - goimports
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gosec
     - misspell
+    - noctx
+    - prealloc
     - unconvert
     - unparam
-    - gosec
-    - prealloc
-    - copyloopvar
-    - noctx
-    - bodyclose
-    - errorlint
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-    exclude-functions:
-      - (net/http.ResponseWriter).Write
-      - (io.Closer).Close
-
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-
-  gosec:
-    excludes:
-      - G104 # Audit errors not checked (we handle this with errcheck)
-      - G304 # File path provided as taint input (config file paths are intentional)
-
-  misspell:
-    locale: US
-
-  goimports:
-    local-prefixes: go-egress-proxy
-
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - (io.Closer).Close
+    gosec:
+      excludes:
+        - G104
+        - G304
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - lll
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: _test\.go
+        text: Error return value is not checked
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
-
-  exclude-rules:
-    # Ignore long lines in tests
-    - path: _test\.go
-      linters:
-        - lll
-
-    # Ignore error return value in test cleanup
-    - path: _test\.go
-      linters:
-        - errcheck
-      text: "Error return value is not checked"
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - go-egress-proxy
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
