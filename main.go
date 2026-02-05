@@ -201,6 +201,9 @@ func (c *Config) Validate() error {
 			return errors.New("proxy.mitm_key_path is required")
 		}
 	}
+	if hasKeystore && c.Proxy.MitmKeystorePassword == "" {
+		return errors.New("proxy.mitm_keystore_password is required when using proxy.mitm_keystore_path")
+	}
 
 	// Validate rewrite rules
 	for i, rw := range c.Rewrites {
