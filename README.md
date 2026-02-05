@@ -10,6 +10,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 - **Header injection** including automatic `X-Request-ID` for tracing
 - **Hot reload** via SIGHUP signal (no restart required)
 - **Environment variable overrides** for 12-factor app compatibility
+- **Outbound HTTP/2** - negotiates HTTP/2 with upstream servers via ALPN
 - **Prometheus metrics** - request counts, latency histograms, active connections, upstream errors
 - **Graceful shutdown** - proper connection draining on SIGTERM
 - **Health endpoints** - `/healthz` and `/readyz` for Kubernetes probes
@@ -41,9 +42,15 @@ proxy:
   port: "8080"              # Proxy listen port
   metrics_port: "9090"      # Metrics/health endpoint port
   default_policy: "BLOCK"   # ALLOW or BLOCK unmatched hosts
+  outgoing_ca_bundle: ""    # Optional: custom CA for upstream TLS
+
+  # Option A: PEM cert + key (default)
   mitm_cert_path: "certs/ca.crt"
   mitm_key_path: "certs/ca.key"
-  outgoing_ca_bundle: ""    # Optional: custom CA for upstream TLS
+
+  # Option B: PKCS#12 keystore (mutually exclusive with cert+key)
+  # mitm_keystore_path: "certs/ca.p12"
+  # mitm_keystore_password: "changeit"
 
 rewrites:
   - domain: "api.production.com"      # Exact match
@@ -73,9 +80,13 @@ All config options can be overridden via environment variables:
 | `PROXY_PORT` | Proxy listen port |
 | `PROXY_METRICS_PORT` | Metrics endpoint port |
 | `PROXY_DEFAULT_POLICY` | `ALLOW` or `BLOCK` |
-| `PROXY_MITM_CERT_PATH` | Path to MITM certificate |
-| `PROXY_MITM_KEY_PATH` | Path to MITM private key |
+| `PROXY_MITM_CERT_PATH` | Path to MITM CA certificate (PEM) |
+| `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |
+| `PROXY_MITM_KEYSTORE_PATH` | Path to PKCS#12 keystore (`.p12`) containing cert and key |
+| `PROXY_MITM_KEYSTORE_PASSWORD` | Password for PKCS#12 keystore |
 | `PROXY_OUTGOING_CA_BUNDLE` | Path to CA bundle for upstream |
+
+> **Note:** Provide either `PROXY_MITM_CERT_PATH`/`PROXY_MITM_KEY_PATH` **or** `PROXY_MITM_KEYSTORE_PATH`, not both.
 
 ## Development
 

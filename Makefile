@@ -29,7 +29,8 @@ test-short:
 
 ## lint: Run golangci-lint
 lint:
-	golangci-lint run
+	$(GO) mod download
+	$(GO) tool golangci-lint run
 
 ## fmt: Format code
 fmt:
@@ -72,5 +73,4 @@ docker-run:
 
 ## install-tools: Install development tools
 install-tools:
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 	go install golang.org/x/tools/cmd/goimports@latest

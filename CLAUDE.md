@@ -51,6 +51,7 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
 - Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, etc.
+- MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
 - Hot reload via SIGHUP signal
 
 **Metrics:** Prometheus metrics on `:9090/metrics`:
@@ -82,4 +83,5 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 
 - `github.com/elazarl/goproxy` - HTTP proxy with MITM support
 - `github.com/prometheus/client_golang` - Prometheus metrics
+- `golang.org/x/crypto/pkcs12` - PKCS#12 keystore support
 - `gopkg.in/yaml.v3` - Config parsing

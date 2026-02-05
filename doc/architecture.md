@@ -6,30 +6,28 @@ go-egress-proxy is a transparent MITM (Man-in-the-Middle) proxy that implements 
 
 ## Request Flow
 
-```
-Client                         Proxy                              Target Server
-  │                              │                                      │
-  │──CONNECT example.com:443────>│                                      │
-  │<─────────200 OK──────────────│                                      │
-  │                              │                                      │
-  │══════TLS Handshake══════════>│  (Proxy presents cert signed        │
-  │                              │   by internal CA)                    │
-  │                              │                                      │
-  │──GET /api───────────────────>│                                      │
-  │                              │  1. Generate X-Request-ID            │
-  │                              │  2. Check rewrite rules (exact/wild) │
-  │                              │  3. Check ACL blacklist (regex)      │
-  │                              │  4. Check ACL whitelist (regex)      │
-  │                              │  5. Apply default policy             │
-  │                              │                                      │
-  │                              │  If BLOCKED/BLACK-LISTED:            │
-  │<─────403 Forbidden───────────│     Return 403 immediately          │
-  │                              │                                      │
-  │                              │  If REWRITTEN:                       │
-  │                              │──TCP dial to target_ip:443──────────>│
-  │                              │     (inject configured headers)      │
-  │                              │<────────Response─────────────────────│
-  │<─────────Response────────────│                                      │
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant Target as Target Server
+
+    Client->>Proxy: CONNECT example.com:443
+    Proxy-->>Client: 200 OK
+
+    Client->>Proxy: TLS Handshake
+    Note right of Proxy: Proxy presents cert signed<br/>by internal CA
+
+    Client->>Proxy: GET /api
+    Note right of Proxy: 1. Generate X-Request-ID<br/>2. Check rewrite rules (exact/wild)<br/>3. Check ACL blacklist (regex)<br/>4. Check ACL whitelist (regex)<br/>5. Apply default policy
+
+    alt BLOCKED / BLACK-LISTED
+        Proxy-->>Client: 403 Forbidden
+    else REWRITTEN
+        Proxy->>Target: TCP dial to target_ip:443<br/>(inject configured headers)
+        Target-->>Proxy: Response
+        Proxy-->>Client: Response
+    end
 ```
 
 ## Components
@@ -63,7 +61,8 @@ Loads and validates YAML configuration at startup and on SIGHUP:
 
 Environment variable overrides follow 12-factor app principles:
 - `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`
-- `PROXY_MITM_CERT_PATH`, `PROXY_MITM_KEY_PATH`
+- `PROXY_MITM_CERT_PATH`, `PROXY_MITM_KEY_PATH` (PEM cert+key)
+- `PROXY_MITM_KEYSTORE_PATH`, `PROXY_MITM_KEYSTORE_PASSWORD` (PKCS#12 alternative)
 - `PROXY_OUTGOING_CA_BUNDLE`
 
 ### ACL Engine
@@ -82,7 +81,7 @@ Rewrite rules support wildcards for subdomain matching:
 ```go
 // wildcardToRegex converts patterns:
 // "example.com"     -> "^example\.com$"           (exact)
-// "*.example.com"   -> "^[^.]+\.example\.com$"    (single subdomain)
+// "*.example.com"   -> "^.+\.example\.com$"       (any subdomain depth)
 // "*"               -> ".*"                        (match all)
 ```
 
@@ -160,42 +159,36 @@ Separate HTTP server on metrics port exposing:
 
 ## Data Flow
 
-```
-                    ┌─────────────────────────────────────────────┐
-                    │              main.go                         │
-                    │                                              │
-  config.yaml ─────>│  loadConfig()                               │
-       +            │    ├─ Read YAML                             │
-  ENV overrides     │    ├─ ApplyEnvOverrides()                   │
-                    │    └─ Validate()                            │
-                    │         │                                    │
-                    │         v                                    │
-                    │  compileACL() ──────> CompiledACL           │
-                    │  compileRewrites() ──> []CompiledRewriteRule│
-                    │         │                                    │
-                    │         v                                    │
-  SIGHUP ──────────>│  RuntimeConfig.Update()  <──────────────────│
-                    │         │                                    │
-                    │         v                                    │
-                    │  ┌─────────────────────────────────────────┐│
-                    │  │         goproxy.ProxyHttpServer          ││
-  Client ──────────>│  │                                          ││──────> Target
-  Request           │  │  OnRequest().DoFunc()                    ││        Server
-                    │  │    - Generate X-Request-ID               ││
-                    │  │    - RuntimeConfig.Get() (read lock)     ││
-                    │  │    - Rule evaluation                     ││
-                    │  │    - Header injection                    ││
-                    │  │    - Metrics recording                   ││
-                    │  │                                          ││
-                    │  │  OnResponse().DoFunc()                   ││
-                    │  │    - Record response metrics             ││
-                    │  │                                          ││
-                    │  │  Transport.DialContext()                 ││
-                    │  │    - IP rewriting (split-brain DNS)      ││
-                    │  └─────────────────────────────────────────┘│
-                    │                                              │
-  Prometheus <──────│  metricsServer (/metrics, /healthz, /readyz)│
-                    └─────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Inputs
+        config["config.yaml<br/>+ ENV overrides"]
+        sighup["SIGHUP"]
+        client["Client Request"]
+    end
+
+    subgraph main.go
+        load["loadConfig()<br/>Read YAML → ApplyEnvOverrides() → Validate()"]
+        compile["compileACL() → CompiledACL<br/>compileRewrites() → []CompiledRewriteRule"]
+        rtcfg["RuntimeConfig.Update()"]
+
+        subgraph proxy ["goproxy.ProxyHttpServer"]
+            onreq["OnRequest().DoFunc()<br/>- Generate X-Request-ID<br/>- RuntimeConfig.Get() (read lock)<br/>- Rule evaluation<br/>- Header injection<br/>- Metrics recording"]
+            onresp["OnResponse().DoFunc()<br/>- Record response metrics"]
+            dial["Transport.DialContext()<br/>- IP rewriting (split-brain DNS)"]
+        end
+
+        metrics["metricsServer<br/>/metrics, /healthz, /readyz"]
+    end
+
+    target["Target Server"]
+    prom["Prometheus"]
+
+    config --> load --> compile --> rtcfg
+    sighup --> rtcfg
+    rtcfg --> proxy
+    client --> onreq --> onresp --> dial --> target
+    metrics --> prom
 ```
 
 ## Security Considerations
@@ -224,14 +217,12 @@ Separate HTTP server on metrics port exposing:
 ### Sidecar (Recommended)
 
 Deploy alongside each application pod:
-```
-┌─────────────────────────────────┐
-│  Pod                            │
-│  ┌───────────┐  ┌────────────┐  │
-│  │ App       │──│ Proxy      │──│──> External
-│  │ Container │  │ Container  │  │
-│  └───────────┘  └────────────┘  │
-└─────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Pod
+        app["App Container"] --> proxy["Proxy Container"]
+    end
+    proxy --> external["External"]
 ```
 
 Application sets `HTTPS_PROXY=http://localhost:8080`.
@@ -239,22 +230,19 @@ Application sets `HTTPS_PROXY=http://localhost:8080`.
 ### Gateway
 
 Central proxy for multiple services:
-```
-┌─────────┐
-│ Service │──┐
-└─────────┘  │    ┌─────────┐
-             ├───>│ Proxy   │───> External
-┌─────────┐  │    │ Gateway │
-│ Service │──┘    └─────────┘
-└─────────┘
+```mermaid
+flowchart LR
+    svc1["Service"] --> gw["Proxy Gateway"]
+    svc2["Service"] --> gw
+    gw --> external["External"]
 ```
 
 Requires network policies to enforce traffic flow.
 
 ## Limitations
 
-- **No HTTP/2**: HTTP/1.1 only through the proxy
+- **No client-facing HTTP/2**: Clients connect via HTTP/1.1 through the MITM layer; outbound connections support HTTP/2
 - **No WebSocket inspection**: Passes through after CONNECT
 - **Single CA**: All MITM certificates signed by one CA
 - **No request body inspection**: Header-level filtering only
-- **Wildcard depth**: `*.example.com` matches single level only (not `a.b.example.com`)
+

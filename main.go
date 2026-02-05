@@ -28,6 +28,9 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/crypto/pkcs12"
+	"golang.org/x/net/http2"
+
 	"github.com/elazarl/goproxy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -107,12 +110,14 @@ type CompiledRewriteRule struct {
 // Config holds the complete proxy configuration loaded from YAML.
 type Config struct {
 	Proxy struct {
-		Port             string `yaml:"port"`               // Proxy listen port (default: "8080")
-		MetricsPort      string `yaml:"metrics_port"`       // Metrics/health endpoint port (default: "9090")
-		DefaultPolicy    string `yaml:"default_policy"`     // "ALLOW" or "BLOCK" for unmatched domains
-		OutgoingCABundle string `yaml:"outgoing_ca_bundle"` // Optional CA bundle for upstream TLS
-		MitmCertPath     string `yaml:"mitm_cert_path"`     // Path to MITM CA certificate (required)
-		MitmKeyPath      string `yaml:"mitm_key_path"`      // Path to MITM CA private key (required)
+		Port                 string `yaml:"port"`                   // Proxy listen port (default: "8080")
+		MetricsPort          string `yaml:"metrics_port"`           // Metrics/health endpoint port (default: "9090")
+		DefaultPolicy        string `yaml:"default_policy"`         // "ALLOW" or "BLOCK" for unmatched domains
+		OutgoingCABundle     string `yaml:"outgoing_ca_bundle"`     // Optional CA bundle for upstream TLS
+		MitmCertPath         string `yaml:"mitm_cert_path"`         // Path to MITM CA certificate
+		MitmKeyPath          string `yaml:"mitm_key_path"`          // Path to MITM CA private key
+		MitmKeystorePath     string `yaml:"mitm_keystore_path"`     // Path to PKCS#12 keystore (.p12) containing cert and key
+		MitmKeystorePassword string `yaml:"mitm_keystore_password"` // Password for PKCS#12 keystore
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -178,11 +183,26 @@ func (c *Config) Validate() error {
 	if c.Proxy.DefaultPolicy != "ALLOW" && c.Proxy.DefaultPolicy != "BLOCK" {
 		return fmt.Errorf("invalid default_policy %q: must be ALLOW or BLOCK", c.Proxy.DefaultPolicy)
 	}
-	if c.Proxy.MitmCertPath == "" {
-		return errors.New("proxy.mitm_cert_path is required")
+
+	// Require either cert+key or keystore, but not both
+	hasCertKey := c.Proxy.MitmCertPath != "" || c.Proxy.MitmKeyPath != ""
+	hasKeystore := c.Proxy.MitmKeystorePath != ""
+	if hasCertKey && hasKeystore {
+		return errors.New("proxy.mitm_keystore_path and proxy.mitm_cert_path/mitm_key_path are mutually exclusive")
 	}
-	if c.Proxy.MitmKeyPath == "" {
-		return errors.New("proxy.mitm_key_path is required")
+	if !hasCertKey && !hasKeystore {
+		return errors.New("proxy.mitm_cert_path and proxy.mitm_key_path are required (or use proxy.mitm_keystore_path)")
+	}
+	if hasCertKey {
+		if c.Proxy.MitmCertPath == "" {
+			return errors.New("proxy.mitm_cert_path is required")
+		}
+		if c.Proxy.MitmKeyPath == "" {
+			return errors.New("proxy.mitm_key_path is required")
+		}
+	}
+	if hasKeystore && c.Proxy.MitmKeystorePassword == "" {
+		return errors.New("proxy.mitm_keystore_password is required when using proxy.mitm_keystore_path")
 	}
 
 	// Validate rewrite rules
@@ -221,6 +241,12 @@ func (c *Config) ApplyEnvOverrides() {
 	}
 	if v := os.Getenv("PROXY_OUTGOING_CA_BUNDLE"); v != "" {
 		c.Proxy.OutgoingCABundle = v
+	}
+	if v := os.Getenv("PROXY_MITM_KEYSTORE_PATH"); v != "" {
+		c.Proxy.MitmKeystorePath = v
+	}
+	if v := os.Getenv("PROXY_MITM_KEYSTORE_PASSWORD"); v != "" {
+		c.Proxy.MitmKeystorePassword = v
 	}
 }
 
@@ -269,17 +295,22 @@ func main() {
 		return resp
 	})
 
-	// Configure the outbound HTTP transport with connection pooling and TLS settings
+	// Configure the outbound HTTP transport with connection pooling and TLS settings.
+	// ForceAttemptHTTP2 is required because we set a custom TLSClientConfig and DialContext.
 	proxy.Tr = &http.Transport{
 		TLSClientConfig: &tls.Config{
 			RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle),
 			MinVersion: tls.VersionTLS12, // Enforce TLS 1.2 minimum
 		},
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DialContext:           makeDialer(runtimeCfg),
+	}
+	if err := http2.ConfigureTransport(proxy.Tr); err != nil {
+		slog.Warn("Failed to configure HTTP/2 for outbound transport", "err", err)
 	}
 
 	// Setup metrics and health endpoints
@@ -391,12 +422,20 @@ func loadAndCompileConfig(path string) (Config, CompiledACL, []CompiledRewriteRu
 }
 
 // loadMITMCertificate loads the MITM CA certificate and key into goproxy.
+// It supports either PEM cert+key files or a PKCS#12 (.p12) keystore.
 func loadMITMCertificate(cfg Config) error {
-	caCert, err := os.ReadFile(cfg.Proxy.MitmCertPath)
+	if cfg.Proxy.MitmKeystorePath != "" {
+		return loadMITMFromKeystore(cfg.Proxy.MitmKeystorePath, cfg.Proxy.MitmKeystorePassword)
+	}
+	return loadMITMFromPEM(cfg.Proxy.MitmCertPath, cfg.Proxy.MitmKeyPath)
+}
+
+func loadMITMFromPEM(certPath, keyPath string) error {
+	caCert, err := os.ReadFile(certPath)
 	if err != nil {
 		return fmt.Errorf("read certificate: %w", err)
 	}
-	caKey, err := os.ReadFile(cfg.Proxy.MitmKeyPath)
+	caKey, err := os.ReadFile(keyPath)
 	if err != nil {
 		return fmt.Errorf("read key: %w", err)
 	}
@@ -404,6 +443,26 @@ func loadMITMCertificate(cfg Config) error {
 	goproxy.GoproxyCa, err = tls.X509KeyPair(caCert, caKey)
 	if err != nil {
 		return fmt.Errorf("parse keypair: %w", err)
+	}
+
+	return nil
+}
+
+func loadMITMFromKeystore(keystorePath, password string) error {
+	data, err := os.ReadFile(keystorePath)
+	if err != nil {
+		return fmt.Errorf("read keystore: %w", err)
+	}
+
+	privateKey, cert, err := pkcs12.Decode(data, password)
+	if err != nil {
+		return fmt.Errorf("decode keystore: %w", err)
+	}
+
+	goproxy.GoproxyCa = tls.Certificate{
+		Certificate: [][]byte{cert.Raw},
+		PrivateKey:  privateKey,
+		Leaf:        cert,
 	}
 
 	return nil
@@ -673,7 +732,7 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 // wildcardToRegex converts a domain pattern with wildcards to a regex.
 // Supports:
 //   - Exact match: "example.com" -> "^example\.com$"
-//   - Wildcard: "*.example.com" -> "^[^.]+\.example\.com$"
+//   - Wildcard: "*.example.com" -> "^.+\.example\.com$" (matches any subdomain depth)
 //   - Full wildcard: "*" -> ".*"
 func wildcardToRegex(pattern string) (*regexp.Regexp, error) {
 	if pattern == "*" {
@@ -684,9 +743,9 @@ func wildcardToRegex(pattern string) (*regexp.Regexp, error) {
 	escaped := regexp.QuoteMeta(pattern)
 
 	// Replace \* with appropriate regex
-	// *.example.com -> matches any single subdomain level
+	// *.example.com -> matches any subdomain depth (e.g. a.b.c.example.com)
 	if strings.HasPrefix(escaped, `\*\.`) {
-		escaped = `[^.]+\.` + escaped[4:]
+		escaped = `.+\.` + escaped[4:]
 	}
 
 	// Anchor the pattern

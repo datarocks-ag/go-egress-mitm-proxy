@@ -1,153 +1,135 @@
 package main
 
 import (
+	"crypto/tls"
+	"net/http"
 	"regexp"
+	"slices"
 	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
 )
 
 func TestConfigValidate(t *testing.T) {
 	tests := []struct {
 		name    string
-		config  Config
+		modify  func(c *Config)
 		wantErr bool
 		errMsg  string
 	}{
 		{
 			name: "valid config with all fields",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					Port:          "8080",
-					MetricsPort:   "9090",
-					DefaultPolicy: "BLOCK",
-					MitmCertPath:  "/path/to/cert",
-					MitmKeyPath:   "/path/to/key",
-				},
+			modify: func(c *Config) {
+				c.Proxy.Port = "8080"
+				c.Proxy.MetricsPort = "9090"
+				c.Proxy.DefaultPolicy = "BLOCK"
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
 			},
-			wantErr: false,
 		},
 		{
 			name: "valid config with defaults applied",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					MitmCertPath: "/path/to/cert",
-					MitmKeyPath:  "/path/to/key",
-				},
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
 			},
-			wantErr: false,
 		},
 		{
 			name: "invalid default policy",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					DefaultPolicy: "INVALID",
-					MitmCertPath:  "/path/to/cert",
-					MitmKeyPath:   "/path/to/key",
-				},
+			modify: func(c *Config) {
+				c.Proxy.DefaultPolicy = "INVALID"
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
 			},
 			wantErr: true,
 			errMsg:  "invalid default_policy",
 		},
 		{
 			name: "missing mitm cert path",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					MitmKeyPath: "/path/to/key",
-				},
+			modify: func(c *Config) {
+				c.Proxy.MitmKeyPath = "/path/to/key"
 			},
 			wantErr: true,
 			errMsg:  "mitm_cert_path is required",
 		},
 		{
 			name: "missing mitm key path",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					MitmCertPath: "/path/to/cert",
-				},
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
 			},
 			wantErr: true,
 			errMsg:  "mitm_key_path is required",
 		},
 		{
+			name: "valid config with keystore",
+			modify: func(c *Config) {
+				c.Proxy.MitmKeystorePath = "/path/to/keystore.p12"
+				c.Proxy.MitmKeystorePassword = "changeit"
+			},
+		},
+		{
+			name: "missing keystore password",
+			modify: func(c *Config) {
+				c.Proxy.MitmKeystorePath = "/path/to/keystore.p12"
+			},
+			wantErr: true,
+			errMsg:  "mitm_keystore_password is required",
+		},
+		{
+			name: "mutually exclusive cert and keystore",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeystorePath = "/path/to/keystore.p12"
+			},
+			wantErr: true,
+			errMsg:  "mutually exclusive",
+		},
+		{
+			name: "mutually exclusive cert+key and keystore",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Proxy.MitmKeystorePath = "/path/to/keystore.p12"
+			},
+			wantErr: true,
+			errMsg:  "mutually exclusive",
+		},
+		{
+			name:    "no cert or keystore provided",
+			modify:  func(c *Config) {},
+			wantErr: true,
+			errMsg:  "proxy.mitm_cert_path and proxy.mitm_key_path are required",
+		},
+		{
 			name: "invalid rewrite target IP",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					MitmCertPath: "/path/to/cert",
-					MitmKeyPath:  "/path/to/key",
-				},
-				Rewrites: []RewriteRule{
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
 					{Domain: "example.com", TargetIP: "not-an-ip"},
-				},
+				}
 			},
 			wantErr: true,
 			errMsg:  "invalid target_ip",
 		},
 		{
 			name: "valid rewrite rule",
-			config: Config{
-				Proxy: struct {
-					Port             string `yaml:"port"`
-					MetricsPort      string `yaml:"metrics_port"`
-					DefaultPolicy    string `yaml:"default_policy"`
-					OutgoingCABundle string `yaml:"outgoing_ca_bundle"`
-					MitmCertPath     string `yaml:"mitm_cert_path"`
-					MitmKeyPath      string `yaml:"mitm_key_path"`
-				}{
-					MitmCertPath: "/path/to/cert",
-					MitmKeyPath:  "/path/to/key",
-				},
-				Rewrites: []RewriteRule{
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
 					{Domain: "example.com", TargetIP: "10.0.0.1"},
-				},
+				}
 			},
-			wantErr: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := tt.config.Validate()
+			var cfg Config
+			tt.modify(&cfg)
+			err := cfg.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -164,6 +146,8 @@ func TestConfigValidate(t *testing.T) {
 func TestConfigApplyEnvOverrides(t *testing.T) {
 	t.Setenv("PROXY_PORT", "9999")
 	t.Setenv("PROXY_DEFAULT_POLICY", "ALLOW")
+	t.Setenv("PROXY_MITM_KEYSTORE_PATH", "/path/to/keystore.p12")
+	t.Setenv("PROXY_MITM_KEYSTORE_PASSWORD", "secret")
 
 	cfg := Config{}
 	cfg.ApplyEnvOverrides()
@@ -173,6 +157,12 @@ func TestConfigApplyEnvOverrides(t *testing.T) {
 	}
 	if cfg.Proxy.DefaultPolicy != "ALLOW" {
 		t.Errorf("ApplyEnvOverrides() DefaultPolicy = %v, want %v", cfg.Proxy.DefaultPolicy, "ALLOW")
+	}
+	if cfg.Proxy.MitmKeystorePath != "/path/to/keystore.p12" {
+		t.Errorf("ApplyEnvOverrides() MitmKeystorePath = %v, want %v", cfg.Proxy.MitmKeystorePath, "/path/to/keystore.p12")
+	}
+	if cfg.Proxy.MitmKeystorePassword != "secret" {
+		t.Errorf("ApplyEnvOverrides() MitmKeystorePassword = %v, want %v", cfg.Proxy.MitmKeystorePassword, "secret")
 	}
 }
 
@@ -193,8 +183,8 @@ func TestWildcardToRegex(t *testing.T) {
 		{
 			name:    "wildcard subdomain",
 			pattern: "*.example.com",
-			matches: []string{"sub.example.com", "api.example.com", "test.example.com"},
-			noMatch: []string{"example.com", "sub.sub.example.com", "example.org"},
+			matches: []string{"sub.example.com", "api.example.com", "test.example.com", "sub.sub.example.com", "a.b.c.example.com"},
+			noMatch: []string{"example.com", "example.org"},
 		},
 		{
 			name:    "full wildcard",
@@ -452,6 +442,31 @@ func TestGenerateRequestID(t *testing.T) {
 	}
 	if len(id1) != 16 { // 8 bytes = 16 hex chars
 		t.Errorf("generateRequestID() returned ID of length %d, want 16", len(id1))
+	}
+}
+
+func TestOutboundHTTP2TransportConfiguration(t *testing.T) {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
+	if err := http2.ConfigureTransport(tr); err != nil {
+		t.Fatalf("http2.ConfigureTransport() error = %v", err)
+	}
+
+	if tr.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig should not be nil after ConfigureTransport")
+	}
+
+	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
+		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
 	}
 }
 

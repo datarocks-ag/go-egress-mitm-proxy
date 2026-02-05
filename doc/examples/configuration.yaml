@@ -2,9 +2,17 @@ proxy:
   port: "8080"
   metrics_port: "9090"
   default_policy: "BLOCK"   # Options: ALLOW, BLOCK
+  outgoing_ca_bundle: ""    # Optional: path to CA bundle for upstream TLS verification
+
+  # MITM CA certificate - provide either PEM cert+key or a PKCS#12 keystore (not both)
+
+  # Option A: PEM files
   mitm_cert_path: "certs/ca.crt"
   mitm_key_path: "certs/ca.key"
-  outgoing_ca_bundle: ""    # Optional: path to CA bundle for upstream TLS verification
+
+  # Option B: PKCS#12 keystore (.p12 bundle containing cert and key)
+  # mitm_keystore_path: "certs/ca.p12"
+  # mitm_keystore_password: "changeit"
 
 # Domain rewrite rules
 # Supports exact match and wildcards (*.example.com)
@@ -17,7 +25,7 @@ rewrites:
       X-Proxy-Source: "egress-gateway"
       X-Environment: "production"
 
-  # Wildcard match (matches any single subdomain level)
+  # Wildcard match (matches any subdomain depth)
   - domain: "*.internal.example.com"
     target_ip: "10.20.30.50"
     headers:
