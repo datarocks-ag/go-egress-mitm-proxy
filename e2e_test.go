@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -431,5 +432,321 @@ func TestE2E(t *testing.T) {
 				t.Errorf("GET %s returned %d, want 200", endpoint, resp.StatusCode)
 			}
 		}
+	})
+}
+
+// generateUpstreamTLSCerts creates an upstream CA and server certificate for TLS testing.
+// The server cert is signed by the CA and includes the given DNS names as SANs.
+// Writes ca.crt, ca.key, server.crt, server.key to dir.
+func generateUpstreamTLSCerts(t *testing.T, dir string, dnsNames []string) {
+	t.Helper()
+
+	// Generate CA
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate upstream CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "E2E Upstream CA", Organization: []string{"E2E Upstream"}},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create upstream CA cert: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caCertDER)
+	if err != nil {
+		t.Fatalf("parse upstream CA cert: %v", err)
+	}
+
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "ca.crt"), caCertPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream CA cert: %v", writeErr)
+	}
+	caKeyDER, err := x509.MarshalECPrivateKey(caKey)
+	if err != nil {
+		t.Fatalf("marshal upstream CA key: %v", err)
+	}
+	caKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: caKeyDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "ca.key"), caKeyPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream CA key: %v", writeErr)
+	}
+
+	// Generate server cert signed by CA
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate upstream server key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: dnsNames[0]},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+	}
+	srvCertDER, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create upstream server cert: %v", err)
+	}
+	srvCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvCertDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "server.crt"), srvCertPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream server cert: %v", writeErr)
+	}
+
+	srvKeyDER, err := x509.MarshalECPrivateKey(srvKey)
+	if err != nil {
+		t.Fatalf("marshal upstream server key: %v", err)
+	}
+	srvKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: srvKeyDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "server.key"), srvKeyPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream server key: %v", writeErr)
+	}
+}
+
+func TestE2ETLS(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not available (needed for PKCS#12 generation)")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// --- Certificates ---
+
+	// MITM CA (proxy client-facing)
+	mitmCertsDir := filepath.Join(tmpDir, "mitm-certs")
+	if err := os.Mkdir(mitmCertsDir, 0o750); err != nil {
+		t.Fatalf("create mitm certs dir: %v", err)
+	}
+	mitmCAPool := generateE2ECerts(t, mitmCertsDir)
+
+	// Upstream CA + server cert (for nginx TLS)
+	upstreamDir := filepath.Join(tmpDir, "upstream-certs")
+	if err := os.Mkdir(upstreamDir, 0o750); err != nil {
+		t.Fatalf("create upstream certs dir: %v", err)
+	}
+	generateUpstreamTLSCerts(t, upstreamDir, []string{
+		"insecure-tls.example.com",
+		"truststore-tls.example.com",
+	})
+
+	// Create PKCS#12 truststore from upstream CA
+	truststorePath := filepath.Join(tmpDir, "upstream-truststore.p12")
+	//nolint:gosec // test helper: all arguments are test-controlled constants
+	cmd := exec.CommandContext(ctx, "openssl", "pkcs12", "-export",
+		"-in", filepath.Join(upstreamDir, "ca.crt"),
+		"-inkey", filepath.Join(upstreamDir, "ca.key"),
+		"-out", truststorePath,
+		"-passout", "pass:truststorepass",
+		"-certpbe", "PBE-SHA1-3DES", "-keypbe", "PBE-SHA1-3DES", "-macalg", "SHA1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create truststore p12: %v\n%s", err, out)
+	}
+
+	// --- nginx TLS configuration ---
+	nginxConf := filepath.Join(tmpDir, "nginx.conf")
+	nginxConfContent := `events {
+    worker_connections 64;
+}
+
+http {
+    server {
+        listen 443 ssl;
+        ssl_certificate /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+
+        location / {
+            return 200 'nginx-tls-ok';
+            default_type text/plain;
+        }
+    }
+}
+`
+	if err := os.WriteFile(nginxConf, []byte(nginxConfContent), 0o600); err != nil {
+		t.Fatalf("write nginx.conf: %v", err)
+	}
+
+	// --- Docker network ---
+	nw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create docker network: %v", err)
+	}
+	t.Cleanup(func() {
+		if rmErr := nw.Remove(ctx); rmErr != nil {
+			t.Logf("remove network: %v", rmErr)
+		}
+	})
+
+	// --- Start nginx TLS container ---
+	nginxCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "nginx:1.27-alpine",
+			ExposedPorts: []string{"443/tcp"},
+			Networks:     []string{nw.Name},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.crt"),
+					ContainerFilePath: "/etc/nginx/certs/server.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.key"),
+					ContainerFilePath: "/etc/nginx/certs/server.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      nginxConf,
+					ContainerFilePath: "/etc/nginx/nginx.conf",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForListeningPort("443/tcp").WithStartupTimeout(30 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start nginx container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(nginxCtr); termErr != nil {
+			t.Logf("terminate nginx: %v", termErr)
+		}
+	})
+
+	nginxIP, err := nginxCtr.ContainerIP(ctx)
+	if err != nil {
+		t.Fatalf("get nginx IP: %v", err)
+	}
+	t.Logf("nginx TLS container IP: %s", nginxIP)
+
+	// --- Write proxy config ---
+	proxyConfig := fmt.Sprintf(`proxy:
+  port: "8080"
+  metrics_port: "9090"
+  default_policy: "BLOCK"
+  mitm_cert_path: "/app/certs/ca.crt"
+  mitm_key_path: "/app/certs/ca.key"
+  outgoing_truststore_path: "/app/certs/upstream-truststore.p12"
+  outgoing_truststore_password: "truststorepass"
+rewrites:
+  - domain: "insecure-tls.example.com"
+    target_ip: %q
+    insecure: true
+  - domain: "truststore-tls.example.com"
+    target_ip: %q
+`, nginxIP, nginxIP)
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(proxyConfig), 0o600); err != nil {
+		t.Fatalf("write proxy config: %v", err)
+	}
+
+	// --- Start proxy container ---
+	proxyCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
+			Networks:     []string{nw.Name},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
+					ContainerFilePath: "/app/certs/ca.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.key"),
+					ContainerFilePath: "/app/certs/ca.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      truststorePath,
+					ContainerFilePath: "/app/certs/upstream-truststore.p12",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(tmpDir, "config.yaml"),
+					ContainerFilePath: "/app/config.yaml",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForHTTP("/healthz").WithPort("9090/tcp").WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start proxy container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(proxyCtr); termErr != nil {
+			t.Logf("terminate proxy: %v", termErr)
+		}
+	})
+
+	proxyPort, err := proxyCtr.MappedPort(ctx, "8080/tcp")
+	if err != nil {
+		t.Fatalf("get proxy port: %v", err)
+	}
+	proxyHost, err := proxyCtr.Host(ctx)
+	if err != nil {
+		t.Fatalf("get proxy host: %v", err)
+	}
+
+	proxyURL, err := url.Parse(fmt.Sprintf("http://%s:%s", proxyHost, proxyPort.Port()))
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	t.Logf("proxy at %s", proxyURL)
+
+	// Client trusts MITM CA (for client-to-proxy TLS via CONNECT+MITM)
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    mitmCAPool,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	t.Run("insecure_rewrite_to_tls_upstream", func(t *testing.T) {
+		// Client → HTTPS → CONNECT/MITM → proxy → DialTLSContext (insecure:true) → nginx:443
+		// Upstream cert NOT trusted by proxy, but insecure=true skips verification.
+		resp, err := doGet(ctx, tlsClient, "https://insecure-tls.example.com/")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		t.Logf("insecure rewrite response: %d %s", resp.StatusCode, string(body))
+	})
+
+	t.Run("truststore_rewrite_to_tls_upstream", func(t *testing.T) {
+		// Client → HTTPS → CONNECT/MITM → proxy → DialTLSContext → nginx:443
+		// Upstream cert signed by CA that is in the proxy's PKCS#12 truststore.
+		resp, err := doGet(ctx, tlsClient, "https://truststore-tls.example.com/")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		t.Logf("truststore rewrite response: %d %s", resp.StatusCode, string(body))
 	})
 }

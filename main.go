@@ -32,7 +32,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/pkcs12"
-	"golang.org/x/net/http2"
 
 	"github.com/elazarl/goproxy"
 	"github.com/prometheus/client_golang/prometheus"
@@ -102,6 +101,7 @@ type RewriteRule struct {
 	TargetIP   string            `yaml:"target_ip"`   // IP address to route to (e.g., "10.0.0.1")
 	TargetHost string            `yaml:"target_host"` // Hostname to route to (resolved via DNS at dial time)
 	Headers    map[string]string `yaml:"headers"`     // Headers to inject into the request
+	Insecure   bool              `yaml:"insecure"`    // Skip TLS verification for this rewrite only
 }
 
 // CompiledRewriteRule holds a rewrite rule with its compiled pattern.
@@ -111,20 +111,24 @@ type CompiledRewriteRule struct {
 	TargetHost string
 	Headers    map[string]string
 	Original   string // Original domain string for exact match optimization
+	Insecure   bool   // Skip TLS verification for this rewrite only
 }
 
 // Config holds the complete proxy configuration loaded from YAML.
 type Config struct {
 	Proxy struct {
-		Port                 string `yaml:"port"`                   // Proxy listen port (default: "8080")
-		MetricsPort          string `yaml:"metrics_port"`           // Metrics/health endpoint port (default: "9090")
-		DefaultPolicy        string `yaml:"default_policy"`         // "ALLOW" or "BLOCK" for unmatched domains
-		OutgoingCABundle     string `yaml:"outgoing_ca_bundle"`     // Optional CA bundle for upstream TLS
-		MitmCertPath         string `yaml:"mitm_cert_path"`         // Path to MITM CA certificate
-		MitmKeyPath          string `yaml:"mitm_key_path"`          // Path to MITM CA private key
-		MitmKeystorePath     string `yaml:"mitm_keystore_path"`     // Path to PKCS#12 keystore (.p12) containing cert and key
-		MitmKeystorePassword string `yaml:"mitm_keystore_password"` // Password for PKCS#12 keystore
-		BlockedLogPath       string `yaml:"blocked_log_path"`       // Optional path for blocked request log
+		Port                       string `yaml:"port"`                         // Proxy listen port (default: "8080")
+		MetricsPort                string `yaml:"metrics_port"`                 // Metrics/health endpoint port (default: "9090")
+		DefaultPolicy              string `yaml:"default_policy"`               // "ALLOW" or "BLOCK" for unmatched domains
+		OutgoingCABundle           string `yaml:"outgoing_ca_bundle"`           // Optional CA bundle for upstream TLS
+		OutgoingTruststorePath     string `yaml:"outgoing_truststore_path"`     // Optional PKCS#12 truststore for upstream TLS
+		OutgoingTruststorePassword string `yaml:"outgoing_truststore_password"` // Password for outgoing truststore
+		InsecureSkipVerify         bool   `yaml:"insecure_skip_verify"`         // Disable TLS verification globally
+		MitmCertPath               string `yaml:"mitm_cert_path"`               // Path to MITM CA certificate
+		MitmKeyPath                string `yaml:"mitm_key_path"`                // Path to MITM CA private key
+		MitmKeystorePath           string `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
+		MitmKeystorePassword       string `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
+		BlockedLogPath             string `yaml:"blocked_log_path"`             // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -255,6 +259,11 @@ func (c *Config) Validate() error {
 		return errors.New("proxy.mitm_keystore_password is required when using proxy.mitm_keystore_path")
 	}
 
+	// Validate outgoing truststore
+	if c.Proxy.OutgoingTruststorePath != "" && c.Proxy.OutgoingTruststorePassword == "" {
+		return errors.New("proxy.outgoing_truststore_password is required when using proxy.outgoing_truststore_path")
+	}
+
 	// Validate rewrite rules
 	for i, rw := range c.Rewrites {
 		if rw.Domain == "" {
@@ -303,6 +312,15 @@ func (c *Config) ApplyEnvOverrides() {
 	if v := os.Getenv("PROXY_MITM_KEYSTORE_PASSWORD"); v != "" {
 		c.Proxy.MitmKeystorePassword = v
 	}
+	if v := os.Getenv("PROXY_OUTGOING_TRUSTSTORE_PATH"); v != "" {
+		c.Proxy.OutgoingTruststorePath = v
+	}
+	if v := os.Getenv("PROXY_OUTGOING_TRUSTSTORE_PASSWORD"); v != "" {
+		c.Proxy.OutgoingTruststorePassword = v
+	}
+	if v := os.Getenv("PROXY_INSECURE_SKIP_VERIFY"); v == "true" {
+		c.Proxy.InsecureSkipVerify = true
+	}
 	if v := os.Getenv("PROXY_BLOCKED_LOG_PATH"); v != "" {
 		c.Proxy.BlockedLogPath = v
 	}
@@ -318,10 +336,11 @@ func runValidate(configPath string) error {
 
 	// Check that all referenced files exist and are readable
 	filesToCheck := map[string]string{
-		"mitm_cert_path":     cfg.Proxy.MitmCertPath,
-		"mitm_key_path":      cfg.Proxy.MitmKeyPath,
-		"mitm_keystore_path": cfg.Proxy.MitmKeystorePath,
-		"outgoing_ca_bundle": cfg.Proxy.OutgoingCABundle,
+		"mitm_cert_path":           cfg.Proxy.MitmCertPath,
+		"mitm_key_path":            cfg.Proxy.MitmKeyPath,
+		"mitm_keystore_path":       cfg.Proxy.MitmKeystorePath,
+		"outgoing_ca_bundle":       cfg.Proxy.OutgoingCABundle,
+		"outgoing_truststore_path": cfg.Proxy.OutgoingTruststorePath,
 	}
 	for name, path := range filesToCheck {
 		if path == "" {
@@ -455,22 +474,30 @@ func main() {
 		io.WriteString(w, errStr) //nolint:errcheck // best-effort response to client
 	}
 
+	// Build base TLS configuration for outbound connections.
+	baseTLSConfig := &tls.Config{
+		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+
+	if cfg.Proxy.InsecureSkipVerify {
+		slog.Warn("Global insecure_skip_verify is ENABLED — upstream TLS certificate verification is disabled")
+		baseTLSConfig.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured global insecure for dev/test
+	}
+
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
-	// ForceAttemptHTTP2 is required because we set a custom TLSClientConfig and DialContext.
+	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
+	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
 	proxy.Tr = &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle),
-			MinVersion: tls.VersionTLS12, // Enforce TLS 1.2 minimum
-		},
+		TLSClientConfig:       baseTLSConfig,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DialContext:           makeDialer(runtimeCfg),
-	}
-	if err := http2.ConfigureTransport(proxy.Tr); err != nil {
-		slog.Warn("Failed to configure HTTP/2 for outbound transport", "err", err)
+		DialTLSContext:        makeTLSDialer(runtimeCfg, baseTLSConfig),
 	}
 
 	// Setup metrics and health endpoints
@@ -565,6 +592,8 @@ func main() {
 		"whitelist_rules", len(acl.Whitelist),
 		"blacklist_rules", len(acl.Blacklist),
 		"outgoing_ca_bundle", cfg.Proxy.OutgoingCABundle,
+		"outgoing_truststore_path", cfg.Proxy.OutgoingTruststorePath,
+		"insecure_skip_verify", cfg.Proxy.InsecureSkipVerify,
 		"blocked_log_path", cfg.Proxy.BlockedLogPath)
 
 	if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -789,6 +818,37 @@ func recordResponseMetrics(resp *http.Response) {
 	responseStatus.WithLabelValues(statusClass).Inc()
 }
 
+// rewriteResult holds the outcome of a rewrite rule lookup.
+type rewriteResult struct {
+	targetIP   string
+	targetHost string
+	insecure   bool
+	matched    bool
+}
+
+// lookupRewrite checks whether host matches a rewrite rule (exact map first, then patterns).
+func lookupRewrite(host string, rewrites []CompiledRewriteRule, rewriteExact map[string]*CompiledRewriteRule) rewriteResult {
+	if rw, ok := rewriteExact[host]; ok {
+		return rewriteResult{targetIP: rw.TargetIP, targetHost: rw.TargetHost, insecure: rw.Insecure, matched: true}
+	}
+	for i := range rewrites {
+		if rewrites[i].Pattern.MatchString(host) {
+			return rewriteResult{targetIP: rewrites[i].TargetIP, targetHost: rewrites[i].TargetHost, insecure: rewrites[i].Insecure, matched: true}
+		}
+	}
+	return rewriteResult{}
+}
+
+// recordDialError records a dial error in the upstream error metrics.
+func recordDialError(err error) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		upstreamErrors.WithLabelValues("timeout").Inc()
+	} else {
+		upstreamErrors.WithLabelValues("connection").Inc()
+	}
+}
+
 // makeDialer creates a custom DialContext function that implements split-brain DNS.
 // It intercepts TCP dials and routes matching domains to their configured target IPs.
 func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -800,46 +860,79 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		}
 
 		_, _, rewrites, rewriteExact := runtimeCfg.Get()
+		rw := lookupRewrite(host, rewrites, rewriteExact)
 
-		// Check for rewrite (fast path first)
-		var targetIP, targetHost string
-		if rw, ok := rewriteExact[host]; ok {
-			targetIP = rw.TargetIP
-			targetHost = rw.TargetHost
-		} else {
-			for i := range rewrites {
-				if rewrites[i].Pattern.MatchString(host) {
-					targetIP = rewrites[i].TargetIP
-					targetHost = rewrites[i].TargetHost
-					break
-				}
-			}
+		if rw.targetIP != "" {
+			addr = net.JoinHostPort(rw.targetIP, port)
+			slog.Debug("Rewriting dial", "original", host, "target", rw.targetIP)
+		} else if rw.targetHost != "" {
+			addr = net.JoinHostPort(rw.targetHost, port)
+			slog.Debug("Rewriting dial", "original", host, "target", rw.targetHost)
 		}
 
-		if targetIP != "" {
-			addr = net.JoinHostPort(targetIP, port)
-			slog.Debug("Rewriting dial", "original", host, "target", targetIP)
-		} else if targetHost != "" {
-			addr = net.JoinHostPort(targetHost, port)
-			slog.Debug("Rewriting dial", "original", host, "target", targetHost)
-		}
-
-		conn, err := (&net.Dialer{
+		conn, dialErr := (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext(ctx, network, addr)
 
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				upstreamErrors.WithLabelValues("timeout").Inc()
-			} else {
-				upstreamErrors.WithLabelValues("connection").Inc()
-			}
-			return nil, err
+		if dialErr != nil {
+			recordDialError(dialErr)
+			return nil, dialErr
 		}
 
 		return conn, nil
+	}
+}
+
+// makeTLSDialer creates a custom DialTLSContext function that performs TCP dial with
+// rewrite IP substitution followed by a TLS handshake with per-connection configuration.
+// This enables per-rewrite InsecureSkipVerify without affecting other connections.
+func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			upstreamErrors.WithLabelValues("invalid_address").Inc()
+			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+		}
+
+		cfg, _, rewrites, rewriteExact := runtimeCfg.Get()
+		rw := lookupRewrite(host, rewrites, rewriteExact)
+
+		dialAddr := addr
+		if rw.targetIP != "" {
+			dialAddr = net.JoinHostPort(rw.targetIP, port)
+			slog.Debug("Rewriting TLS dial", "original", host, "target", rw.targetIP)
+		} else if rw.targetHost != "" {
+			dialAddr = net.JoinHostPort(rw.targetHost, port)
+			slog.Debug("Rewriting TLS dial", "original", host, "target", rw.targetHost)
+		}
+
+		// TCP connect
+		rawConn, dialErr := (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext(ctx, network, dialAddr)
+		if dialErr != nil {
+			recordDialError(dialErr)
+			return nil, dialErr
+		}
+
+		// Build per-connection TLS config
+		tlsCfg := baseTLSConfig.Clone()
+		tlsCfg.ServerName = host // SNI = original hostname
+		if cfg.Proxy.InsecureSkipVerify || rw.insecure {
+			tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured insecure for dev/internal endpoints
+		}
+
+		// TLS handshake
+		tlsConn := tls.Client(rawConn, tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close() //nolint:errcheck // best-effort cleanup on handshake failure
+			recordDialError(err)
+			return nil, err
+		}
+
+		return tlsConn, nil
 	}
 }
 
@@ -895,22 +988,64 @@ func extractBaseDomain(host string) string {
 	return strings.Join(parts[len(parts)-2:], ".")
 }
 
-// loadCertPool loads the system CA pool and optionally appends a custom CA bundle.
-func loadCertPool(path string) *x509.CertPool {
+// loadCertPool loads the system CA pool, optionally appends a PEM CA bundle, and optionally
+// appends certificates from a PKCS#12 truststore. Both sources are additive.
+func loadCertPool(caBundle, truststorePath, truststorePassword string) *x509.CertPool {
 	pool, err := x509.SystemCertPool()
 	if err != nil {
 		slog.Warn("Failed to load system cert pool, using empty pool", "err", err)
 		pool = x509.NewCertPool()
 	}
-	if path != "" {
-		ca, err := os.ReadFile(path)
-		if err != nil {
-			slog.Warn("Failed to read CA bundle", "path", path, "err", err)
+	if caBundle != "" {
+		ca, readErr := os.ReadFile(caBundle)
+		if readErr != nil {
+			slog.Warn("Failed to read CA bundle", "path", caBundle, "err", readErr)
 		} else if !pool.AppendCertsFromPEM(ca) {
-			slog.Warn("Failed to parse CA bundle", "path", path)
+			slog.Warn("Failed to parse CA bundle", "path", caBundle)
+		}
+	}
+	if truststorePath != "" {
+		certs, tsErr := loadTruststoreCerts(truststorePath, truststorePassword)
+		if tsErr != nil {
+			slog.Warn("Failed to load truststore", "path", truststorePath, "err", tsErr)
+		} else {
+			for _, cert := range certs {
+				pool.AddCert(cert)
+			}
+			slog.Info("Loaded truststore certificates", "path", truststorePath, "count", len(certs))
 		}
 	}
 	return pool
+}
+
+// loadTruststoreCerts extracts CA certificates from a PKCS#12 (.p12) truststore.
+func loadTruststoreCerts(path, password string) ([]*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read truststore: %w", err)
+	}
+
+	pemBlocks, err := pkcs12.ToPEM(data, password)
+	if err != nil {
+		return nil, fmt.Errorf("decode truststore: %w", err)
+	}
+
+	var certs []*x509.Certificate
+	for _, block := range pemBlocks {
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse truststore certificate: %w", parseErr)
+		}
+		certs = append(certs, cert)
+	}
+
+	if len(certs) == 0 {
+		return nil, errors.New("truststore contains no certificates")
+	}
+	return certs, nil
 }
 
 // matches checks if a host matches any of the compiled regex patterns.
@@ -959,6 +1094,7 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 			TargetHost: rule.TargetHost,
 			Headers:    rule.Headers,
 			Original:   rule.Domain,
+			Insecure:   rule.Insecure,
 		})
 	}
 	return compiled, nil

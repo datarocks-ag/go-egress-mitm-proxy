@@ -60,13 +60,19 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `compileACL()` / `compileRewrites()` - Pre-compiles patterns via `wildcardToRegex()`
 - `wildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
 - `handleRequest()` - Request handler with policy evaluation
-- `makeDialer()` - Custom DialContext for split-brain DNS
+- `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match)
+- `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS
+- `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify
+- `loadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
-- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, etc.
+- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`
 - MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
+- Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
+- Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
+- Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
 - Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation
 - Hot reload via SIGHUP signal
 

@@ -2,7 +2,14 @@ proxy:
   port: "8080"
   metrics_port: "9090"
   default_policy: "BLOCK"   # Options: ALLOW, BLOCK
-  outgoing_ca_bundle: ""    # Optional: path to CA bundle for upstream TLS verification
+  outgoing_ca_bundle: ""    # Optional: path to PEM CA bundle for upstream TLS verification
+
+  # Optional: PKCS#12 truststore for upstream TLS verification (additive with outgoing_ca_bundle)
+  # outgoing_truststore_path: "certs/upstream-cas.p12"
+  # outgoing_truststore_password: "changeit"
+
+  # Disable upstream TLS certificate verification globally (for dev/test only!)
+  # insecure_skip_verify: false
 
   # MITM CA certificate - provide either PEM cert+key or a PKCS#12 keystore (not both)
 
@@ -41,6 +48,11 @@ rewrites:
     target_host: "internal-gateway.corp.example.com"
     headers:
       X-Routed-Via: "egress-proxy"
+
+  # Rewrite with insecure flag (skip TLS verification for this target only)
+  - domain: "self-signed.internal.com"
+    target_ip: "10.20.30.70"
+    insecure: true
 
 # Access Control Lists (exact match, wildcards, or ~regex)
 # Evaluated in order: blacklist -> whitelist -> default_policy
