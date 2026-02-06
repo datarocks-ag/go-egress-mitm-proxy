@@ -4,11 +4,16 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 
 ## Features
 
-- **Split-brain DNS** via TCP dial interception (not DNS-level)
+- **Split-brain DNS** via TCP dial interception (not DNS-level), with `target_ip` or `target_host` routing
+- **Path-based routing** - route different URL paths on the same domain to different backends (`path_pattern`)
+- **Scheme rewriting** - change the request scheme before forwarding (`target_scheme`)
 - **ACL** with whitelist/blacklist support (exact match, wildcards, regex)
-- **Domain rewriting** with wildcard (`*.example.com`) and regex (`~<pattern>`) support
-- **Header injection** including automatic `X-Request-ID` for tracing
+- **Header injection** on rewritten requests, plus automatic `X-Request-ID` for tracing
+- **Header stripping** - remove sensitive headers before forwarding (`drop_headers`)
+- **Per-rewrite TLS bypass** - skip upstream TLS verification for specific targets (`insecure`)
+- **Outgoing TLS trust** - custom CA bundle (PEM) and/or PKCS#12 truststore for upstream verification
 - **Hot reload** via SIGHUP signal (no restart required)
+- **Blocked request log** - optional JSON log file for auditing blocked requests
 - **Environment variable overrides** for 12-factor app compatibility
 - **Outbound HTTP/2** - negotiates HTTP/2 with upstream servers via ALPN
 - **Prometheus metrics** - request counts, latency histograms, active connections, upstream errors
@@ -42,7 +47,17 @@ proxy:
   port: "8080"              # Proxy listen port
   metrics_port: "9090"      # Metrics/health endpoint port
   default_policy: "BLOCK"   # ALLOW or BLOCK unmatched hosts
-  outgoing_ca_bundle: ""    # Optional: custom CA for upstream TLS
+  outgoing_ca_bundle: ""    # Optional: PEM CA bundle for upstream TLS
+  blocked_log_path: ""      # Optional: JSON log file for blocked requests
+
+  # Optional: PKCS#12 truststore for upstream TLS (additive with outgoing_ca_bundle)
+  # outgoing_truststore_path: "certs/upstream-cas.p12"
+  # outgoing_truststore_password: "changeit"
+
+  # Disable upstream TLS certificate verification globally (for dev/test only!)
+  # insecure_skip_verify: false
+
+  # MITM CA certificate - provide either PEM cert+key or a PKCS#12 keystore (not both)
 
   # Option A: PEM cert + key (default)
   mitm_cert_path: "certs/ca.crt"
@@ -53,14 +68,52 @@ proxy:
   # mitm_keystore_password: "changeit"
 
 rewrites:
-  - domain: "api.production.com"      # Exact match
+  # Route by IP address
+  - domain: "api.production.com"
     target_ip: "10.20.30.40"
     headers:
       X-Proxy-Source: "egress-gateway"
-  - domain: "*.internal.example.com"  # Wildcard match
+
+  # Route by hostname (DNS-resolved at dial time)
+  - domain: "external-api.partner.com"
+    target_host: "internal-gateway.corp.example.com"
+
+  # Wildcard match (any subdomain depth)
+  - domain: "*.internal.example.com"
     target_ip: "10.20.30.50"
-  - domain: "~^api[0-9]+\\.example\\.com$"  # Regex match
+
+  # Regex match (prefix with ~)
+  - domain: "~^api[0-9]+\\.example\\.com$"
     target_ip: "10.20.30.60"
+
+  # Per-rewrite TLS bypass for self-signed internal services
+  - domain: "self-signed.internal.com"
+    target_ip: "10.20.30.70"
+    insecure: true
+
+  # Path-based routing (first match wins, evaluated in YAML order)
+  - domain: "api.example.com"
+    path_pattern: "^/v1/"
+    target_ip: "10.20.30.80"
+    headers:
+      X-Backend: "v1"
+  - domain: "api.example.com"
+    path_pattern: "^/v2/"
+    target_ip: "10.20.30.81"
+  - domain: "api.example.com"       # Catch-all (no path_pattern)
+    target_ip: "10.20.30.82"
+
+  # Scheme rewriting: forward HTTPS client requests as HTTP to backend
+  - domain: "legacy-backend.internal.com"
+    target_ip: "10.20.30.90"
+    target_scheme: "http"
+
+  # Strip sensitive headers before forwarding
+  - domain: "sanitized-api.internal.com"
+    target_ip: "10.20.30.91"
+    drop_headers:
+      - "Authorization"
+      - "Cookie"
 
 acl:
   whitelist:
@@ -71,6 +124,30 @@ acl:
 ```
 
 See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.
+
+### Rewrite Rule Reference
+
+Each rewrite rule supports these fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `domain` | yes | Domain pattern: exact, wildcard (`*.example.com`), or regex (`~<pattern>`) |
+| `target_ip` | one of | IP address to route to (mutually exclusive with `target_host`) |
+| `target_host` | one of | Hostname to route to, resolved via DNS at dial time |
+| `path_pattern` | no | Regex matched against `r.URL.Path` for path-based routing |
+| `target_scheme` | no | `"http"` or `"https"` to change the request scheme before forwarding |
+| `headers` | no | Map of headers to inject into the request |
+| `drop_headers` | no | List of header names to remove before forwarding |
+| `insecure` | no | Skip upstream TLS verification for this target only |
+
+### Response Status Codes
+
+| Code | Meaning | When |
+|------|---------|------|
+| 200 | OK | Request succeeded through to upstream |
+| 403 | Forbidden | Request blocked by ACL (blacklisted or default BLOCK policy) |
+| 502 | Bad Gateway | Upstream unreachable: DNS lookup failed, connection refused, or connection reset |
+| 504 | Gateway Timeout | Upstream accepted the connection but did not respond in time |
 
 ### Configuration Validation
 
@@ -89,9 +166,11 @@ go-egress-proxy validate
 
 The `validate` subcommand checks:
 - YAML syntax and structure
-- Required fields and valid values
+- Required fields and valid values (including `target_scheme`, `path_pattern` regex)
+- Mutual exclusivity of `target_ip`/`target_host` and cert+key/keystore
 - ACL and rewrite pattern compilation
-- Referenced files exist and are readable (certificates, CA bundles)
+- Referenced files exist and are readable (certificates, CA bundles, truststores)
+- Parent directory exists for `blocked_log_path`
 
 Exits with code 0 on success, 1 on failure.
 
@@ -109,7 +188,11 @@ All config options can be overridden via environment variables:
 | `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |
 | `PROXY_MITM_KEYSTORE_PATH` | Path to PKCS#12 keystore (`.p12`) containing cert and key |
 | `PROXY_MITM_KEYSTORE_PASSWORD` | Password for PKCS#12 keystore |
-| `PROXY_OUTGOING_CA_BUNDLE` | Path to CA bundle for upstream |
+| `PROXY_OUTGOING_CA_BUNDLE` | Path to PEM CA bundle for upstream TLS |
+| `PROXY_OUTGOING_TRUSTSTORE_PATH` | Path to PKCS#12 truststore for upstream TLS |
+| `PROXY_OUTGOING_TRUSTSTORE_PASSWORD` | Password for PKCS#12 truststore |
+| `PROXY_INSECURE_SKIP_VERIFY` | Set to `true` to disable all upstream TLS verification |
+| `PROXY_BLOCKED_LOG_PATH` | Path to JSON log file for blocked requests |
 
 > **Note:** Provide either `PROXY_MITM_CERT_PATH`/`PROXY_MITM_KEY_PATH` **or** `PROXY_MITM_KEYSTORE_PATH`, not both.
 
@@ -124,6 +207,9 @@ make lint
 
 # Run tests
 make test
+
+# Run end-to-end tests (requires Docker)
+make test-e2e
 
 # Build binary
 make build
@@ -164,13 +250,17 @@ Reload configuration without restarting the proxy:
 
 ```bash
 # Find the process ID
-pgrep mitm-proxy
+pgrep go-egress-proxy
 
 # Send SIGHUP to reload config
 kill -HUP <pid>
 ```
 
-The proxy will log successful reloads and any errors.
+The proxy will log successful reloads and any errors. SIGHUP also reopens the blocked request log file, enabling log rotation.
+
+## Blocked Request Log
+
+When `blocked_log_path` is configured, the proxy writes a JSON log entry for every request with action `BLACK-LISTED` or `BLOCKED`. Each entry includes `request_id`, `client`, `host`, `method`, `path`, and `action`. The log file is reopened on SIGHUP for log rotation support.
 
 ## Metrics
 

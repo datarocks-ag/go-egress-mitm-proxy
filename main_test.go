@@ -246,6 +246,48 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: true,
 			errMsg:  "invalid path_pattern",
 		},
+		{
+			name: "valid rewrite with target_scheme http",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetScheme: "http"},
+				}
+			},
+		},
+		{
+			name: "valid rewrite with target_scheme https",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetScheme: "https"},
+				}
+			},
+		},
+		{
+			name: "invalid rewrite target_scheme",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetScheme: "ftp"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "invalid target_scheme",
+		},
+		{
+			name: "valid rewrite with drop_headers",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", DropHeaders: []string{"Authorization", "Cookie"}},
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1154,6 +1196,40 @@ func writeTestCAPEM(t *testing.T, dir, cn, org string) {
 	}
 }
 
+func TestCompileRewritesTargetSchemeAndDropHeaders(t *testing.T) {
+	rules := []RewriteRule{
+		{Domain: "legacy.example.com", TargetIP: "10.0.0.1", TargetScheme: "http", DropHeaders: []string{"Authorization", "Cookie"}},
+		{Domain: "plain.example.com", TargetIP: "10.0.0.2"},
+	}
+
+	compiled, err := compileRewrites(rules)
+	if err != nil {
+		t.Fatalf("compileRewrites() error = %v", err)
+	}
+
+	if len(compiled) != 2 {
+		t.Fatalf("compileRewrites() returned %d rules, want 2", len(compiled))
+	}
+	if compiled[0].TargetScheme != "http" {
+		t.Errorf("compiled[0].TargetScheme = %q, want %q", compiled[0].TargetScheme, "http")
+	}
+	if len(compiled[0].DropHeaders) != 2 {
+		t.Errorf("compiled[0].DropHeaders length = %d, want 2", len(compiled[0].DropHeaders))
+	}
+	if compiled[0].DropHeaders[0] != "Authorization" {
+		t.Errorf("compiled[0].DropHeaders[0] = %q, want %q", compiled[0].DropHeaders[0], "Authorization")
+	}
+	if compiled[0].DropHeaders[1] != "Cookie" {
+		t.Errorf("compiled[0].DropHeaders[1] = %q, want %q", compiled[0].DropHeaders[1], "Cookie")
+	}
+	if compiled[1].TargetScheme != "" {
+		t.Errorf("compiled[1].TargetScheme = %q, want empty", compiled[1].TargetScheme)
+	}
+	if len(compiled[1].DropHeaders) != 0 {
+		t.Errorf("compiled[1].DropHeaders length = %d, want 0", len(compiled[1].DropHeaders))
+	}
+}
+
 func TestCompileRewritesInsecure(t *testing.T) {
 	rules := []RewriteRule{
 		{Domain: "secure.example.com", TargetIP: "10.0.0.1", Insecure: false},
@@ -1447,6 +1523,119 @@ func TestHandleRequestPathNoMatchBlocked(t *testing.T) {
 	defer resp.Body.Close() //nolint:errcheck // test cleanup
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("response status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestHandleRequestDropHeaders(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^drop\.example\.com$`),
+			TargetIP:    "10.0.0.1",
+			Original:    "drop.example.com",
+			DropHeaders: []string{"Authorization", "Cookie"},
+			Headers:     map[string]string{"X-Injected": "yes"},
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://drop.example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("Cookie", "session=abc123")
+	req.Header.Set("Accept", "application/json")
+
+	resultReq, resp := handleRequest(req, nil, rc)
+	if resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected nil response, got %d", resp.StatusCode)
+	}
+
+	// Dropped headers should be gone
+	if got := resultReq.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization header should be dropped, got %q", got)
+	}
+	if got := resultReq.Header.Get("Cookie"); got != "" {
+		t.Errorf("Cookie header should be dropped, got %q", got)
+	}
+
+	// Non-dropped headers should remain
+	if got := resultReq.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("Accept header = %q, want %q", got, "application/json")
+	}
+
+	// Injected headers should be present
+	if got := resultReq.Header.Get("X-Injected"); got != "yes" {
+		t.Errorf("X-Injected header = %q, want %q", got, "yes")
+	}
+}
+
+func TestHandleRequestTargetScheme(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:      regexp.MustCompile(`^scheme\.example\.com$`),
+			TargetIP:     "10.0.0.1",
+			Original:     "scheme.example.com",
+			TargetScheme: "http",
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://scheme.example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resultReq, resp := handleRequest(req, nil, rc)
+	if resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected nil response, got %d", resp.StatusCode)
+	}
+
+	if resultReq.URL.Scheme != "http" {
+		t.Errorf("URL.Scheme = %q, want %q", resultReq.URL.Scheme, "http")
+	}
+}
+
+func TestHandleRequestTargetSchemeEmpty(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:  regexp.MustCompile(`^noscheme\.example\.com$`),
+			TargetIP: "10.0.0.1",
+			Original: "noscheme.example.com",
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://noscheme.example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resultReq, resp := handleRequest(req, nil, rc)
+	if resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected nil response, got %d", resp.StatusCode)
+	}
+
+	if resultReq.URL.Scheme != "https" {
+		t.Errorf("URL.Scheme = %q, want %q (should be unchanged)", resultReq.URL.Scheme, "https")
 	}
 }
 

@@ -140,6 +140,22 @@ rewrites:
     target_ip: %[1]q
     headers:
       X-Backend: "pathonly"
+
+  # target_scheme: client connects via HTTPS, proxy forwards as HTTP to backend
+  - domain: "schemetest.example.com"
+    target_ip: %[1]q
+    target_scheme: "http"
+    headers:
+      X-Scheme-Test: "downgraded"
+
+  # drop_headers: strip Authorization and X-Secret before forwarding
+  - domain: "droptest.example.com"
+    target_ip: %[1]q
+    drop_headers:
+      - "Authorization"
+      - "X-Secret"
+    headers:
+      X-Drop-Test: "applied"
 acl:
   whitelist:
     - "whitelisted.example.com"
@@ -647,6 +663,73 @@ func TestE2E(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("expected 403, got %d", resp.StatusCode)
 		}
+	})
+
+	t.Run("target_scheme_rewrites_to_http", func(t *testing.T) {
+		// Client sends HTTP request, proxy applies target_scheme: "http" and routes to httpbin.
+		// httpbin's /headers endpoint shows what arrived.
+		resp, err := doGet(ctx, plainClient, "http://schemetest.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Scheme-Test", "downgraded")
+	})
+
+	t.Run("drop_headers_strips_specified_headers", func(t *testing.T) {
+		// Send request with Authorization and X-Secret headers; they should be stripped.
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "http://droptest.example.com:8080/headers", nil)
+		if reqErr != nil {
+			t.Fatalf("create request: %v", reqErr)
+		}
+		req.Header.Set("Authorization", "Bearer secret-token")
+		req.Header.Set("X-Secret", "do-not-forward")
+		req.Header.Set("X-Keep-Me", "should-survive")
+
+		resp, err := plainClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+
+		var result struct {
+			Headers map[string][]string `json:"headers"`
+		}
+		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
+			t.Fatalf("unmarshal response: %v (body: %s)", unmarshalErr, string(body))
+		}
+
+		// Dropped headers should NOT be present
+		if _, ok := result.Headers["Authorization"]; ok {
+			t.Errorf("Authorization header should have been dropped, but found: %v", result.Headers["Authorization"])
+		}
+		if _, ok := result.Headers["X-Secret"]; ok {
+			t.Errorf("X-Secret header should have been dropped, but found: %v", result.Headers["X-Secret"])
+		}
+
+		// Non-dropped headers should survive
+		if _, ok := result.Headers["X-Keep-Me"]; !ok {
+			t.Errorf("X-Keep-Me header should have survived, but was not found")
+		}
+
+		// Injected header should be present
+		e2eCheckHeader(t, body, "X-Drop-Test", "applied")
 	})
 
 	t.Run("health_endpoints", func(t *testing.T) {

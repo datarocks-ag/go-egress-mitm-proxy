@@ -101,23 +101,27 @@ var (
 // and the specified Headers will be injected.
 // Exactly one of TargetIP or TargetHost must be set.
 type RewriteRule struct {
-	Domain      string            `yaml:"domain"`       // Domain pattern (exact or wildcard like "*.example.com")
-	PathPattern string            `yaml:"path_pattern"` // Optional regex matched against r.URL.Path
-	TargetIP    string            `yaml:"target_ip"`    // IP address to route to (e.g., "10.0.0.1")
-	TargetHost  string            `yaml:"target_host"`  // Hostname to route to (resolved via DNS at dial time)
-	Headers     map[string]string `yaml:"headers"`      // Headers to inject into the request
-	Insecure    bool              `yaml:"insecure"`     // Skip TLS verification for this rewrite only
+	Domain       string            `yaml:"domain"`        // Domain pattern (exact or wildcard like "*.example.com")
+	PathPattern  string            `yaml:"path_pattern"`  // Optional regex matched against r.URL.Path
+	TargetIP     string            `yaml:"target_ip"`     // IP address to route to (e.g., "10.0.0.1")
+	TargetHost   string            `yaml:"target_host"`   // Hostname to route to (resolved via DNS at dial time)
+	TargetScheme string            `yaml:"target_scheme"` // Optional: "http" or "https" to change request scheme
+	Headers      map[string]string `yaml:"headers"`       // Headers to inject into the request
+	DropHeaders  []string          `yaml:"drop_headers"`  // Headers to remove before forwarding
+	Insecure     bool              `yaml:"insecure"`      // Skip TLS verification for this rewrite only
 }
 
 // CompiledRewriteRule holds a rewrite rule with its compiled pattern.
 type CompiledRewriteRule struct {
-	Pattern     *regexp.Regexp
-	PathPattern *regexp.Regexp // nil when no path_pattern is set
-	TargetIP    string
-	TargetHost  string
-	Headers     map[string]string
-	Original    string // Original domain string for exact match optimization
-	Insecure    bool   // Skip TLS verification for this rewrite only
+	Pattern      *regexp.Regexp
+	PathPattern  *regexp.Regexp // nil when no path_pattern is set
+	TargetIP     string
+	TargetHost   string
+	TargetScheme string // "http" or "https" to change request scheme (empty = keep original)
+	Headers      map[string]string
+	DropHeaders  []string // Headers to remove before forwarding
+	Original     string   // Original domain string for exact match optimization
+	Insecure     bool     // Skip TLS verification for this rewrite only
 }
 
 // rewriteCtxKeyType is an unexported type for context keys to avoid collisions.
@@ -306,6 +310,9 @@ func (c *Config) Validate() error {
 			if _, err := regexp.Compile(rw.PathPattern); err != nil {
 				return fmt.Errorf("rewrites[%d]: invalid path_pattern %q: %w", i, rw.PathPattern, err)
 			}
+		}
+		if rw.TargetScheme != "" && rw.TargetScheme != "http" && rw.TargetScheme != "https" {
+			return fmt.Errorf("rewrites[%d]: invalid target_scheme %q: must be \"http\" or \"https\"", i, rw.TargetScheme)
 		}
 	}
 
@@ -846,10 +853,16 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
 	}
 
-	// Inject headers for rewritten requests
+	// Apply rewrite transformations: drop headers, inject headers, change scheme
 	if matchedRewrite != nil {
+		for _, h := range matchedRewrite.DropHeaders {
+			r.Header.Del(h)
+		}
 		for k, v := range matchedRewrite.Headers {
 			r.Header.Set(k, v)
+		}
+		if matchedRewrite.TargetScheme != "" {
+			r.URL.Scheme = matchedRewrite.TargetScheme
 		}
 	}
 
@@ -1175,13 +1188,15 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 			}
 		}
 		compiled = append(compiled, CompiledRewriteRule{
-			Pattern:     pattern,
-			PathPattern: pathPattern,
-			TargetIP:    rule.TargetIP,
-			TargetHost:  rule.TargetHost,
-			Headers:     rule.Headers,
-			Original:    rule.Domain,
-			Insecure:    rule.Insecure,
+			Pattern:      pattern,
+			PathPattern:  pathPattern,
+			TargetIP:     rule.TargetIP,
+			TargetHost:   rule.TargetHost,
+			TargetScheme: rule.TargetScheme,
+			Headers:      rule.Headers,
+			DropHeaders:  rule.DropHeaders,
+			Original:     rule.Domain,
+			Insecure:     rule.Insecure,
 		})
 	}
 	return compiled, nil

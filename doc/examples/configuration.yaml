@@ -75,6 +75,23 @@ rewrites:
     headers:
       X-Backend: "default"
 
+  # Scheme rewrite: forward HTTPS client requests as HTTP to the backend
+  - domain: "legacy-backend.internal.com"
+    target_ip: "10.20.30.90"
+    target_scheme: "http"
+    headers:
+      X-Forwarded-Proto: "https"
+
+  # Drop headers: strip sensitive client headers before forwarding
+  - domain: "sanitized-api.internal.com"
+    target_ip: "10.20.30.91"
+    drop_headers:
+      - "Authorization"
+      - "Cookie"
+      - "X-Internal-Token"
+    headers:
+      X-Proxy-Auth: "service-account"
+
 # Access Control Lists (exact match, wildcards, or ~regex)
 # Evaluated in order: blacklist -> whitelist -> default_policy
 acl:
