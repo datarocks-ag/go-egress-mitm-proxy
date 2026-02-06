@@ -15,15 +15,21 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -43,6 +49,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 )
+
+// version is set at build time via -ldflags "-X main.version=<value>".
+var version = "dev"
 
 // Prometheus metrics for monitoring proxy behavior.
 var (
@@ -144,6 +153,7 @@ type Config struct {
 		MitmKeyPath                string `yaml:"mitm_key_path"`                // Path to MITM CA private key
 		MitmKeystorePath           string `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
 		MitmKeystorePassword       string `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
+		MitmOrg                    string `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
 		BlockedLogPath             string `yaml:"blocked_log_path"`             // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
@@ -368,6 +378,9 @@ func (c *Config) ApplyEnvOverrides() {
 	if v := os.Getenv("PROXY_OUTGOING_TRUSTSTORE_PASSWORD"); v != "" {
 		c.Proxy.OutgoingTruststorePassword = v
 	}
+	if v := os.Getenv("PROXY_MITM_ORG"); v != "" {
+		c.Proxy.MitmOrg = v
+	}
 	if v := os.Getenv("PROXY_INSECURE_SKIP_VERIFY"); v == "true" {
 		c.Proxy.InsecureSkipVerify = true
 	}
@@ -416,16 +429,67 @@ func runValidate(configPath string) error {
 	return nil
 }
 
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `Usage: %s [flags] [command]
+
+Commands:
+  validate    Validate configuration file and exit
+
+Flags:
+  -h, --help      Show this help message
+  --version       Print version and exit
+  -v              Verbose output (info level, default)
+  -vv             Debug output
+  -vvv            Trace output (most verbose)
+
+Environment:
+  CONFIG_PATH     Path to config file (default: config.yaml)
+`, os.Args[0])
+}
+
 func main() {
-	// Initialize structured JSON logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Parse top-level flags from os.Args[1:]
+	var (
+		showVersion bool
+		showHelp    bool
+		logLevel    = slog.LevelInfo
+	)
+	var remaining []string
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--version":
+			showVersion = true
+		case "-h", "--help":
+			showHelp = true
+		case "-vvv":
+			logLevel = slog.Level(-8) // Trace: below slog.LevelDebug (-4)
+		case "-vv":
+			logLevel = slog.LevelDebug
+		case "-v":
+			// Explicit info level (same as default)
+		default:
+			remaining = append(remaining, arg)
+		}
+	}
+
+	if showVersion {
+		fmt.Println(version)
+		return
+	}
+	if showHelp {
+		printUsage()
+		return
+	}
+
+	// Initialize structured JSON logging with configured level
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
 	// Subcommand dispatch
-	if len(os.Args) > 1 && os.Args[1] == "validate" {
+	if len(remaining) > 0 && remaining[0] == "validate" {
 		fs := flag.NewFlagSet("validate", flag.ExitOnError)
 		configFlag := fs.String("config", "", "path to configuration file")
-		if err := fs.Parse(os.Args[2:]); err != nil {
+		if err := fs.Parse(remaining[1:]); err != nil {
 			slog.Error("Failed to parse flags", "err", err)
 			os.Exit(1)
 		}
@@ -481,7 +545,18 @@ func main() {
 
 	// Initialize the proxy server
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	if cfg.Proxy.MitmOrg != "" {
+		mitmAction := &goproxy.ConnectAction{
+			Action:    goproxy.ConnectMitm,
+			TLSConfig: mitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg),
+		}
+		proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
+			func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+				return mitmAction, host
+			}))
+	} else {
+		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	}
 
 	// Register the request handler for policy enforcement
 	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
@@ -511,6 +586,17 @@ func main() {
 	// Register response handler for metrics and upstream error handling
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp != nil {
+			// Normalize response protocol to HTTP/1.1 for MITM tunnels.
+			// goproxy writes responses via resp.Write() which serializes
+			// ProtoMajor/ProtoMinor into the status line. Two cases need fixing:
+			// 1) goproxy.NewResponse() leaves Proto fields at zero → "HTTP/0.0"
+			// 2) Upstream HTTP/2 responses have Proto "HTTP/2.0" → "HTTP/2.0"
+			// Both cause "Unsupported HTTP version" errors in clients.
+			if resp.ProtoMajor != 1 {
+				resp.Proto = "HTTP/1.1"
+				resp.ProtoMajor = 1
+				resp.ProtoMinor = 1
+			}
 			recordResponseMetrics(resp)
 			return resp
 		}
@@ -769,6 +855,113 @@ func logMITMCertInfo() {
 		slog.Warn("MITM CA certificate has EXPIRED", "expired_at", leaf.NotAfter.Format(time.RFC3339))
 	} else if time.Until(leaf.NotAfter) < 30*24*time.Hour {
 		slog.Warn("MITM CA certificate expires soon", "expires_in_days", int(time.Until(leaf.NotAfter).Hours()/24))
+	}
+}
+
+// signHost generates a leaf TLS certificate for the given hosts, signed by the CA,
+// using the specified Organization. The key type matches the CA key (RSA, ECDSA, or Ed25519).
+func signHost(ca tls.Certificate, hosts []string, org string) (*tls.Certificate, error) {
+	// Parse the CA certificate
+	caCert, err := x509.ParseCertificate(ca.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse CA cert: %w", err)
+	}
+
+	// Generate serial number
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
+
+	// Build leaf certificate template
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{org},
+			CommonName:   hosts[0],
+		},
+		NotBefore:             time.Now().Add(-24 * 30 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, h)
+		}
+	}
+
+	// Generate key matching the CA key type
+	var privKey any
+	switch ca.PrivateKey.(type) {
+	case *ecdsa.PrivateKey:
+		privKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	case ed25519.PrivateKey:
+		_, privKey, err = ed25519.GenerateKey(rand.Reader)
+	default: // RSA or unknown → RSA 2048
+		privKey, err = rsa.GenerateKey(rand.Reader, 2048)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %w", err)
+	}
+
+	// Extract public key
+	var pubKey any
+	switch k := privKey.(type) {
+	case *ecdsa.PrivateKey:
+		pubKey = &k.PublicKey
+	case ed25519.PrivateKey:
+		pubKey = k.Public()
+	case *rsa.PrivateKey:
+		pubKey = &k.PublicKey
+	}
+
+	// Sign the leaf certificate with the CA
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, pubKey, ca.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("sign certificate: %w", err)
+	}
+
+	return &tls.Certificate{
+		Certificate: [][]byte{certDER, ca.Certificate[0]},
+		PrivateKey:  privKey,
+	}, nil
+}
+
+// mitmTLSConfigFromCA returns a TLS config callback that generates leaf certificates
+// with the specified Organization, using the given CA. A sync.Map cache avoids
+// regenerating certificates for the same host.
+func mitmTLSConfigFromCA(ca *tls.Certificate, org string) func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
+	certCache := &sync.Map{}
+	return func(host string, _ *goproxy.ProxyCtx) (*tls.Config, error) {
+		// Strip port if present
+		hostname, _, err := net.SplitHostPort(host)
+		if err != nil {
+			hostname = host
+		}
+
+		if cached, ok := certCache.Load(hostname); ok {
+			cert := cached.(*tls.Certificate) //nolint:errcheck // stored type is always *tls.Certificate
+			return &tls.Config{
+				Certificates: []tls.Certificate{*cert},
+				MinVersion:   tls.VersionTLS12,
+			}, nil
+		}
+
+		cert, err := signHost(*ca, []string{hostname}, org)
+		if err != nil {
+			return nil, err
+		}
+
+		certCache.Store(hostname, cert)
+		return &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			MinVersion:   tls.VersionTLS12,
+		}, nil
 	}
 }
 

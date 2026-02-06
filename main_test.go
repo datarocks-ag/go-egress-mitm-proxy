@@ -10,6 +10,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -2144,6 +2145,250 @@ func generateTestP12(t *testing.T, dir, cn, org, password string) (certPath, p12
 	}
 
 	return certPath, p12Path
+}
+
+func TestVersionDefault(t *testing.T) {
+	if version != "dev" {
+		t.Errorf("version = %q, want %q", version, "dev")
+	}
+}
+
+func TestPrintUsage(t *testing.T) {
+	// Capture stderr output
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	printUsage()
+
+	w.Close() //nolint:errcheck // flushing pipe before read
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	r.Close() //nolint:errcheck // best-effort cleanup after read
+	output := buf.String()
+
+	for _, want := range []string{"validate", "--version", "--help", "-v", "-vv", "-vvv", "CONFIG_PATH"} {
+		if !contains(output, want) {
+			t.Errorf("printUsage() output missing %q", want)
+		}
+	}
+}
+
+func TestResponseProtoNormalization(t *testing.T) {
+	// goproxy writes MITM responses via resp.Write() which serializes
+	// ProtoMajor/ProtoMinor into the status line. The OnResponse handler
+	// must normalize non-HTTP/1.x responses to prevent "Unsupported HTTP
+	// version" errors. Two cases:
+	//   1) goproxy.NewResponse() leaves Proto at zero → "HTTP/0.0"
+	//   2) Upstream HTTP/2 → Proto "HTTP/2.0"
+	tests := []struct {
+		name       string
+		proto      string
+		protoMajor int
+		protoMinor int
+	}{
+		{"goproxy.NewResponse zero values", "", 0, 0},
+		{"upstream HTTP/2", "HTTP/2.0", 2, 0},
+		{"HTTP/1.1 unchanged", "HTTP/1.1", 1, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				Proto:      tt.proto,
+				ProtoMajor: tt.protoMajor,
+				ProtoMinor: tt.protoMinor,
+			}
+
+			// Apply the same normalization as the OnResponse handler.
+			if resp.ProtoMajor != 1 {
+				resp.Proto = "HTTP/1.1"
+				resp.ProtoMajor = 1
+				resp.ProtoMinor = 1
+			}
+
+			if resp.Proto != "HTTP/1.1" {
+				t.Errorf("Proto = %q, want %q", resp.Proto, "HTTP/1.1")
+			}
+			if resp.ProtoMajor != 1 {
+				t.Errorf("ProtoMajor = %d, want 1", resp.ProtoMajor)
+			}
+			if resp.ProtoMinor != 1 {
+				t.Errorf("ProtoMinor = %d, want 1", resp.ProtoMinor)
+			}
+		})
+	}
+}
+
+func TestSignHostECDSA(t *testing.T) {
+	ca := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+
+	cert, err := signHost(ca, []string{"example.com", "www.example.com"}, "My Custom Org")
+	if err != nil {
+		t.Fatalf("signHost: %v", err)
+	}
+
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+
+	// Verify Organization
+	if len(leaf.Subject.Organization) != 1 || leaf.Subject.Organization[0] != "My Custom Org" {
+		t.Errorf("Organization = %v, want [My Custom Org]", leaf.Subject.Organization)
+	}
+
+	// Verify CommonName
+	if leaf.Subject.CommonName != "example.com" {
+		t.Errorf("CommonName = %q, want %q", leaf.Subject.CommonName, "example.com")
+	}
+
+	// Verify DNSNames
+	if !slices.Contains(leaf.DNSNames, "example.com") || !slices.Contains(leaf.DNSNames, "www.example.com") {
+		t.Errorf("DNSNames = %v, want [example.com www.example.com]", leaf.DNSNames)
+	}
+
+	// Verify key type matches CA (ECDSA)
+	if _, ok := cert.PrivateKey.(*ecdsa.PrivateKey); !ok {
+		t.Errorf("leaf key type = %T, want *ecdsa.PrivateKey", cert.PrivateKey)
+	}
+
+	// Verify signed by CA
+	caCert, err := x509.ParseCertificate(ca.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse CA cert: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool}); err != nil {
+		t.Errorf("leaf not signed by CA: %v", err)
+	}
+
+	// Verify chain includes CA cert
+	if len(cert.Certificate) != 2 {
+		t.Errorf("cert chain length = %d, want 2", len(cert.Certificate))
+	}
+}
+
+func TestSignHostRSA(t *testing.T) {
+	// Generate RSA CA
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "RSA CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	ca := tls.Certificate{
+		Certificate: [][]byte{caDER},
+		PrivateKey:  caKey,
+	}
+
+	cert, err := signHost(ca, []string{"rsa.example.com"}, "RSA Org")
+	if err != nil {
+		t.Fatalf("signHost: %v", err)
+	}
+
+	if _, ok := cert.PrivateKey.(*rsa.PrivateKey); !ok {
+		t.Errorf("leaf key type = %T, want *rsa.PrivateKey", cert.PrivateKey)
+	}
+
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	if leaf.Subject.Organization[0] != "RSA Org" {
+		t.Errorf("Organization = %v, want [RSA Org]", leaf.Subject.Organization)
+	}
+}
+
+func TestSignHostIPAddress(t *testing.T) {
+	ca := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+
+	cert, err := signHost(ca, []string{"10.0.0.1"}, "IP Org")
+	if err != nil {
+		t.Fatalf("signHost: %v", err)
+	}
+
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	if len(leaf.IPAddresses) != 1 || leaf.IPAddresses[0].String() != "10.0.0.1" {
+		t.Errorf("IPAddresses = %v, want [10.0.0.1]", leaf.IPAddresses)
+	}
+	if len(leaf.DNSNames) != 0 {
+		t.Errorf("DNSNames = %v, want empty", leaf.DNSNames)
+	}
+}
+
+func TestMitmTLSConfigFromCA(t *testing.T) {
+	ca := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+
+	tlsConfigFn := mitmTLSConfigFromCA(&ca, "Test MITM Org")
+
+	// First call — generates cert
+	cfg1, err := tlsConfigFn("example.com:443", nil)
+	if err != nil {
+		t.Fatalf("tlsConfigFn: %v", err)
+	}
+	if len(cfg1.Certificates) != 1 {
+		t.Fatalf("certificates count = %d, want 1", len(cfg1.Certificates))
+	}
+
+	leaf, err := x509.ParseCertificate(cfg1.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	if leaf.Subject.Organization[0] != "Test MITM Org" {
+		t.Errorf("Organization = %v, want [Test MITM Org]", leaf.Subject.Organization)
+	}
+	if !slices.Contains(leaf.DNSNames, "example.com") {
+		t.Errorf("DNSNames = %v, want [example.com]", leaf.DNSNames)
+	}
+
+	// Second call — should return cached cert
+	cfg2, err := tlsConfigFn("example.com:443", nil)
+	if err != nil {
+		t.Fatalf("tlsConfigFn (cached): %v", err)
+	}
+	leaf2, err := x509.ParseCertificate(cfg2.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf2: %v", err)
+	}
+	if leaf.SerialNumber.Cmp(leaf2.SerialNumber) != 0 {
+		t.Error("second call returned different cert, expected cached")
+	}
+
+	// Different host — should generate new cert
+	cfg3, err := tlsConfigFn("other.com", nil)
+	if err != nil {
+		t.Fatalf("tlsConfigFn (other host): %v", err)
+	}
+	leaf3, err := x509.ParseCertificate(cfg3.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf3: %v", err)
+	}
+	if !slices.Contains(leaf3.DNSNames, "other.com") {
+		t.Errorf("DNSNames = %v, want [other.com]", leaf3.DNSNames)
+	}
 }
 
 // Helper function

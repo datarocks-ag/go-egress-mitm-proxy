@@ -9,7 +9,7 @@ go-egress-proxy is a MITM HTTP/HTTPS proxy that implements split-brain DNS funct
 ## Build and Run Commands
 
 ```bash
-make build          # Build binary
+make build          # Build binary (injects version from git describe)
 make test           # Run tests with race detector
 make lint           # Run golangci-lint
 make run            # Run directly with go run
@@ -18,8 +18,17 @@ make docker-build   # Build Docker image
 make docker-run     # Run in Docker
 make install-tools  # Install dev tools (golangci-lint, goimports)
 
+# CLI flags
+./mitm-proxy --version       # Print version and exit
+./mitm-proxy --help          # Show usage
+./mitm-proxy -vv             # Run with debug logging
+./mitm-proxy -vvv            # Run with trace logging (most verbose)
+
 # Validate configuration without starting the proxy
 go run . validate --config config.yaml
+
+# Build with specific version
+VERSION=1.0.0 make build
 ```
 
 ## Testing
@@ -64,13 +73,16 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match); skips path-pattern rules (resolved via context)
 - `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
 - `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
+- `signHost()` - Generates MITM leaf certificates with custom Organization (key type matches CA)
+- `mitmTLSConfigFromCA()` - TLS config factory for custom MITM certs with sync.Map cache
 - `loadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
-- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`
+- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`, `PROXY_MITM_ORG`
 - MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
+- `mitm_org`: optional custom Organization for MITM leaf certificates (default: goproxy's built-in `"GoProxy untrusted MITM proxy Inc"`)
 - Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
 - Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
 - Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)

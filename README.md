@@ -38,6 +38,35 @@ make run
 curl -v -x http://localhost:8080 --cacert certs/ca.crt https://example.com
 ```
 
+## CLI Usage
+
+```bash
+# Print version
+mitm-proxy --version
+
+# Show help
+mitm-proxy --help
+
+# Run with default verbosity (info level)
+mitm-proxy
+
+# Run with debug output
+mitm-proxy -vv
+
+# Validate configuration
+mitm-proxy validate --config config.yaml
+```
+
+| Flag | Description |
+|------|-------------|
+| `--version` | Print version and exit |
+| `-h`, `--help` | Show help message |
+| `-v` | Verbose output (info level, default) |
+| `-vv` | Debug output |
+| `-vvv` | Trace output (most verbose) |
+
+The version is injected at build time. Use `VERSION=1.0.0 make build` to set a specific version, otherwise it defaults to the git describe output or `dev`.
+
 ## Configuration
 
 Create a `config.yaml` file (or set `CONFIG_PATH` environment variable):
@@ -155,13 +184,13 @@ Validate your configuration file without starting the proxy:
 
 ```bash
 # Use --config flag
-go-egress-proxy validate --config config.yaml
+mitm-proxy validate --config config.yaml
 
 # Or use CONFIG_PATH environment variable
-CONFIG_PATH=config.yaml go-egress-proxy validate
+CONFIG_PATH=config.yaml mitm-proxy validate
 
 # Default: reads config.yaml from current directory
-go-egress-proxy validate
+mitm-proxy validate
 ```
 
 The `validate` subcommand checks:
@@ -250,7 +279,7 @@ Reload configuration without restarting the proxy:
 
 ```bash
 # Find the process ID
-pgrep go-egress-proxy
+pgrep mitm-proxy
 
 # Send SIGHUP to reload config
 kill -HUP <pid>
