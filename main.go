@@ -462,7 +462,7 @@ func main() {
 		case "-h", "--help":
 			showHelp = true
 		case "-vvv":
-			logLevel = slog.LevelDebug
+			logLevel = slog.Level(-8) // Trace: below slog.LevelDebug (-4)
 		case "-vv":
 			logLevel = slog.LevelDebug
 		case "-v":

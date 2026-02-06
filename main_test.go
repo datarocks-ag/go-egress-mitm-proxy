@@ -2171,6 +2171,7 @@ func TestPrintUsage(t *testing.T) {
 	if _, err := buf.ReadFrom(r); err != nil {
 		t.Fatal(err)
 	}
+	r.Close() //nolint:errcheck // best-effort cleanup after read
 	output := buf.String()
 
 	for _, want := range []string{"validate", "--version", "--help", "-v", "-vv", "-vvv", "CONFIG_PATH"} {
