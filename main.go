@@ -339,6 +339,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Log MITM CA certificate details
+	logMITMCertInfo()
+
 	// Initialize the proxy server
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
@@ -452,7 +455,8 @@ func main() {
 		"default_policy", cfg.Proxy.DefaultPolicy,
 		"rewrites", len(rewrites),
 		"whitelist_rules", len(acl.Whitelist),
-		"blacklist_rules", len(acl.Blacklist))
+		"blacklist_rules", len(acl.Blacklist),
+		"outgoing_ca_bundle", cfg.Proxy.OutgoingCABundle)
 
 	if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("Proxy server error", "err", err)
@@ -527,6 +531,37 @@ func loadMITMFromKeystore(keystorePath, password string) error {
 	}
 
 	return nil
+}
+
+// logMITMCertInfo parses the loaded MITM CA certificate and logs its details.
+func logMITMCertInfo() {
+	if len(goproxy.GoproxyCa.Certificate) == 0 {
+		return
+	}
+
+	leaf := goproxy.GoproxyCa.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		if err != nil {
+			slog.Warn("Failed to parse MITM CA certificate for logging", "err", err)
+			return
+		}
+	}
+
+	slog.Info("MITM CA certificate loaded",
+		"subject", leaf.Subject.String(),
+		"issuer", leaf.Issuer.String(),
+		"serial", leaf.SerialNumber.String(),
+		"not_before", leaf.NotBefore.Format(time.RFC3339),
+		"not_after", leaf.NotAfter.Format(time.RFC3339),
+		"is_ca", leaf.IsCA)
+
+	if time.Now().After(leaf.NotAfter) {
+		slog.Warn("MITM CA certificate has EXPIRED", "expired_at", leaf.NotAfter.Format(time.RFC3339))
+	} else if time.Until(leaf.NotAfter) < 30*24*time.Hour {
+		slog.Warn("MITM CA certificate expires soon", "expires_in_days", int(time.Until(leaf.NotAfter).Hours()/24))
+	}
 }
 
 // handleRequest processes each incoming request through the policy engine.

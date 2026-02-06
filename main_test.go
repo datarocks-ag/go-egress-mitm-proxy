@@ -1,7 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elazarl/goproxy"
 	"golang.org/x/net/http2"
 )
 
@@ -529,6 +539,151 @@ func TestOutboundHTTP2TransportConfiguration(t *testing.T) {
 	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
 		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
 	}
+}
+
+// generateTestCert creates a self-signed CA certificate valid for the given duration.
+func generateTestCert(t *testing.T, notBefore, notAfter time.Time) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName:   "Test CA",
+			Organization: []string{"Test Org"},
+		},
+		Issuer: pkix.Name{
+			CommonName:   "Test CA",
+			Organization: []string{"Test Org"},
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tlsCert
+}
+
+// captureLogs runs fn and returns the captured slog JSON output.
+func captureLogs(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	old := slog.Default()
+	slog.SetDefault(logger)
+	defer slog.SetDefault(old)
+	fn()
+	return buf.String()
+}
+
+func TestLogMITMCertInfo(t *testing.T) {
+	// Save and restore global state
+	origCa := goproxy.GoproxyCa
+	defer func() { goproxy.GoproxyCa = origCa }()
+
+	t.Run("valid long-lived cert", func(t *testing.T) {
+		goproxy.GoproxyCa = generateTestCert(t,
+			time.Now().Add(-24*time.Hour),
+			time.Now().Add(365*24*time.Hour),
+		)
+		output := captureLogs(t, logMITMCertInfo)
+
+		if !contains(output, "MITM CA certificate loaded") {
+			t.Error("expected 'MITM CA certificate loaded' log line")
+		}
+		if !contains(output, "Test CA") {
+			t.Error("expected subject/issuer to contain 'Test CA'")
+		}
+		if !contains(output, `"is_ca":true`) {
+			t.Error("expected is_ca to be true")
+		}
+		if contains(output, "EXPIRED") || contains(output, "expires soon") {
+			t.Error("should not warn about expiry for long-lived cert")
+		}
+	})
+
+	t.Run("expired cert", func(t *testing.T) {
+		goproxy.GoproxyCa = generateTestCert(t,
+			time.Now().Add(-48*time.Hour),
+			time.Now().Add(-1*time.Hour),
+		)
+		output := captureLogs(t, logMITMCertInfo)
+
+		if !contains(output, "MITM CA certificate loaded") {
+			t.Error("expected 'MITM CA certificate loaded' log line")
+		}
+		if !contains(output, "EXPIRED") {
+			t.Error("expected expiry warning for expired cert")
+		}
+	})
+
+	t.Run("expiring soon cert", func(t *testing.T) {
+		goproxy.GoproxyCa = generateTestCert(t,
+			time.Now().Add(-24*time.Hour),
+			time.Now().Add(15*24*time.Hour), // 15 days left
+		)
+		output := captureLogs(t, logMITMCertInfo)
+
+		if !contains(output, "MITM CA certificate loaded") {
+			t.Error("expected 'MITM CA certificate loaded' log line")
+		}
+		if !contains(output, "expires soon") {
+			t.Error("expected 'expires soon' warning for cert expiring in 15 days")
+		}
+	})
+
+	t.Run("cert with pre-set Leaf", func(t *testing.T) {
+		cert := generateTestCert(t,
+			time.Now().Add(-24*time.Hour),
+			time.Now().Add(365*24*time.Hour),
+		)
+		// Parse and set Leaf explicitly
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert.Leaf = leaf
+		goproxy.GoproxyCa = cert
+
+		output := captureLogs(t, logMITMCertInfo)
+
+		if !contains(output, "MITM CA certificate loaded") {
+			t.Error("expected 'MITM CA certificate loaded' log line")
+		}
+		if !contains(output, "Test CA") {
+			t.Error("expected subject to contain 'Test CA'")
+		}
+	})
+
+	t.Run("empty certificate", func(t *testing.T) {
+		goproxy.GoproxyCa = tls.Certificate{}
+		output := captureLogs(t, logMITMCertInfo)
+
+		if output != "" {
+			t.Errorf("expected no output for empty certificate, got: %s", output)
+		}
+	})
 }
 
 func TestRunValidate(t *testing.T) {
