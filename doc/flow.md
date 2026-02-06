@@ -71,12 +71,15 @@ When the proxy intercepts a CONNECT tunnel, `goproxy` dynamically generates a TL
 
 The proxy maintains **two separate TLS sessions** simultaneously:
 
-```
-Client <--- TLS (MITM cert) ---> Proxy <--- TLS (real cert) ---> Upstream Server
-```
+```mermaid
+graph LR
+    C["Client"] -- "TLS Session #1<br/>MITM cert (forged for domain)<br/>Proxy = TLS server" --> P["MITM Proxy<br/>(plaintext access)"]
+    P -- "TLS Session #2<br/>Real server cert<br/>Proxy = TLS client" --> U["Upstream Server"]
 
-- **Left side:** The proxy is the TLS *server*, using a certificate forged for the target domain.
-- **Right side:** The proxy is the TLS *client*, verifying the real server certificate.
+    style C fill:#dceeff,stroke:#4a90d9
+    style P fill:#e8f5e9,stroke:#66bb6a,font-weight:bold
+    style U fill:#fff3e0,stroke:#e6a23c
+```
 
 The proxy has access to the plaintext HTTP request/response between these two TLS sessions, which is what enables inspection, policy enforcement, header injection, and logging.
 

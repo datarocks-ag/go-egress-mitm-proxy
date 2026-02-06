@@ -142,19 +142,20 @@ var rewriteCtxKey = rewriteCtxKeyType{}
 // Config holds the complete proxy configuration loaded from YAML.
 type Config struct {
 	Proxy struct {
-		Port                       string `yaml:"port"`                         // Proxy listen port (default: "8080")
-		MetricsPort                string `yaml:"metrics_port"`                 // Metrics/health endpoint port (default: "9090")
-		DefaultPolicy              string `yaml:"default_policy"`               // "ALLOW" or "BLOCK" for unmatched domains
-		OutgoingCABundle           string `yaml:"outgoing_ca_bundle"`           // Optional CA bundle for upstream TLS
-		OutgoingTruststorePath     string `yaml:"outgoing_truststore_path"`     // Optional PKCS#12 truststore for upstream TLS
-		OutgoingTruststorePassword string `yaml:"outgoing_truststore_password"` // Password for outgoing truststore
-		InsecureSkipVerify         bool   `yaml:"insecure_skip_verify"`         // Disable TLS verification globally
-		MitmCertPath               string `yaml:"mitm_cert_path"`               // Path to MITM CA certificate
-		MitmKeyPath                string `yaml:"mitm_key_path"`                // Path to MITM CA private key
-		MitmKeystorePath           string `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
-		MitmKeystorePassword       string `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
-		MitmOrg                    string `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
-		BlockedLogPath             string `yaml:"blocked_log_path"`             // Optional path for blocked request log
+		Port                       string   `yaml:"port"`                         // Proxy listen port (default: "8080")
+		MetricsPort                string   `yaml:"metrics_port"`                 // Metrics/health endpoint port (default: "9090")
+		DefaultPolicy              string   `yaml:"default_policy"`               // "ALLOW" or "BLOCK" for unmatched domains
+		OutgoingCABundle           string   `yaml:"outgoing_ca_bundle"`           // Optional CA bundle for upstream TLS
+		OutgoingCA                 []string `yaml:"outgoing_ca"`                  // Optional list of individual CA cert files
+		OutgoingTruststorePath     string   `yaml:"outgoing_truststore_path"`     // Optional PKCS#12 truststore for upstream TLS
+		OutgoingTruststorePassword string   `yaml:"outgoing_truststore_password"` // Password for outgoing truststore
+		InsecureSkipVerify         bool     `yaml:"insecure_skip_verify"`         // Disable TLS verification globally
+		MitmCertPath               string   `yaml:"mitm_cert_path"`               // Path to MITM CA certificate
+		MitmKeyPath                string   `yaml:"mitm_key_path"`                // Path to MITM CA private key
+		MitmKeystorePath           string   `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
+		MitmKeystorePassword       string   `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
+		MitmOrg                    string   `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
+		BlockedLogPath             string   `yaml:"blocked_log_path"`             // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -632,7 +633,7 @@ func main() {
 
 	// Build base TLS configuration for outbound connections.
 	baseTLSConfig := &tls.Config{
-		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
+		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingCA, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2", "http/1.1"},
 	}
@@ -1307,9 +1308,9 @@ func extractBaseDomain(host string) string {
 	return strings.Join(parts[len(parts)-2:], ".")
 }
 
-// loadCertPool loads the system CA pool, optionally appends a PEM CA bundle, and optionally
-// appends certificates from a PKCS#12 truststore. Both sources are additive.
-func loadCertPool(caBundle, truststorePath, truststorePassword string) *x509.CertPool {
+// loadCertPool loads the system CA pool, optionally appends a PEM CA bundle, individual CA cert
+// files, and/or certificates from a PKCS#12 truststore. All sources are additive.
+func loadCertPool(caBundle string, certPaths []string, truststorePath, truststorePassword string) *x509.CertPool {
 	pool, err := x509.SystemCertPool()
 	if err != nil {
 		slog.Warn("Failed to load system cert pool, using empty pool", "err", err)
@@ -1321,6 +1322,16 @@ func loadCertPool(caBundle, truststorePath, truststorePassword string) *x509.Cer
 			slog.Warn("Failed to read CA bundle", "path", caBundle, "err", readErr)
 		} else if !pool.AppendCertsFromPEM(ca) {
 			slog.Warn("Failed to parse CA bundle", "path", caBundle)
+		}
+	}
+	for _, p := range certPaths {
+		ca, readErr := os.ReadFile(p)
+		if readErr != nil {
+			slog.Warn("Failed to read CA cert", "path", p, "err", readErr)
+			continue
+		}
+		if !pool.AppendCertsFromPEM(ca) {
+			slog.Warn("Failed to parse CA cert", "path", p)
 		}
 	}
 	if truststorePath != "" {

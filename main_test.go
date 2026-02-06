@@ -1806,21 +1806,21 @@ func TestLoadCertPoolWithTruststore(t *testing.T) {
 	certPath, p12Path := generateTestP12(t, dir, "Pool Test CA", "Test Org", "pooltest")
 
 	t.Run("pool with truststore only", func(t *testing.T) {
-		pool := loadCertPool("", p12Path, "pooltest")
+		pool := loadCertPool("", nil, p12Path, "pooltest")
 		if pool == nil {
 			t.Fatal("loadCertPool() returned nil")
 		}
 	})
 
 	t.Run("pool with PEM bundle and truststore", func(t *testing.T) {
-		pool := loadCertPool(certPath, p12Path, "pooltest")
+		pool := loadCertPool(certPath, nil, p12Path, "pooltest")
 		if pool == nil {
 			t.Fatal("loadCertPool() returned nil")
 		}
 	})
 
 	t.Run("pool with no extra certs", func(t *testing.T) {
-		pool := loadCertPool("", "", "")
+		pool := loadCertPool("", nil, "", "")
 		if pool == nil {
 			t.Fatal("loadCertPool() returned nil")
 		}
@@ -1828,7 +1828,7 @@ func TestLoadCertPoolWithTruststore(t *testing.T) {
 
 	t.Run("pool with bad truststore path logs warning", func(t *testing.T) {
 		output := captureLogs(t, func() {
-			pool := loadCertPool("", "/nonexistent/truststore.p12", "pass")
+			pool := loadCertPool("", nil, "/nonexistent/truststore.p12", "pass")
 			if pool == nil {
 				t.Fatal("loadCertPool() returned nil")
 			}
