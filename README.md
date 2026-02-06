@@ -5,8 +5,8 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 ## Features
 
 - **Split-brain DNS** via TCP dial interception (not DNS-level)
-- **Regex-based ACL** with whitelist/blacklist support
-- **Domain rewriting** with wildcard support (`*.example.com`)
+- **ACL** with whitelist/blacklist support (exact match, wildcards, regex)
+- **Domain rewriting** with wildcard (`*.example.com`) and regex (`~<pattern>`) support
 - **Header injection** including automatic `X-Request-ID` for tracing
 - **Hot reload** via SIGHUP signal (no restart required)
 - **Environment variable overrides** for 12-factor app compatibility
@@ -59,13 +59,15 @@ rewrites:
       X-Proxy-Source: "egress-gateway"
   - domain: "*.internal.example.com"  # Wildcard match
     target_ip: "10.20.30.50"
+  - domain: "~^api[0-9]+\\.example\\.com$"  # Regex match
+    target_ip: "10.20.30.60"
 
 acl:
   whitelist:
-    - "^.*\\.google\\.com$"
+    - "*.google.com"
     - "github.com"
   blacklist:
-    - "^.*\\.tiktok\\.com$"
+    - "*.tiktok.com"
 ```
 
 See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.

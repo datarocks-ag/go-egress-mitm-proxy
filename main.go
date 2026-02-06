@@ -703,19 +703,20 @@ func matches(host string, patterns []*regexp.Regexp) bool {
 	return false
 }
 
-// compileACL compiles all regex patterns in the configuration.
+// compileACL compiles all patterns in the configuration using wildcardToRegex.
+// Patterns support exact match, wildcards (*.example.com), and raw regex (~<pattern>).
 // Returns an error if any pattern is invalid.
 func compileACL(cfg Config) (CompiledACL, error) {
 	c := CompiledACL{}
 	for i, p := range cfg.ACL.Whitelist {
-		re, err := regexp.Compile(p)
+		re, err := wildcardToRegex(p)
 		if err != nil {
 			return CompiledACL{}, fmt.Errorf("invalid whitelist pattern[%d] %q: %w", i, p, err)
 		}
 		c.Whitelist = append(c.Whitelist, re)
 	}
 	for i, p := range cfg.ACL.Blacklist {
-		re, err := regexp.Compile(p)
+		re, err := wildcardToRegex(p)
 		if err != nil {
 			return CompiledACL{}, fmt.Errorf("invalid blacklist pattern[%d] %q: %w", i, p, err)
 		}
@@ -748,7 +749,12 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 //   - Exact match: "example.com" -> "^example\.com$"
 //   - Wildcard: "*.example.com" -> "^.+\.example\.com$" (matches any subdomain depth)
 //   - Full wildcard: "*" -> ".*"
+//   - Raw regex: "~<regex>" -> compiled as-is (no escaping/anchoring)
 func wildcardToRegex(pattern string) (*regexp.Regexp, error) {
+	if strings.HasPrefix(pattern, "~") {
+		return regexp.Compile(pattern[1:])
+	}
+
 	if pattern == "*" {
 		return regexp.Compile(".*")
 	}

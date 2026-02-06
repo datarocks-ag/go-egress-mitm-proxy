@@ -42,8 +42,8 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 **Key Components:**
 - `RuntimeConfig` - Thread-safe config holder with RWMutex for hot reload
 - `loadConfig()` - Loads YAML, applies env overrides, validates
-- `compileACL()` / `compileRewrites()` - Pre-compiles regex patterns
-- `wildcardToRegex()` - Converts `*.example.com` to regex
+- `compileACL()` / `compileRewrites()` - Pre-compiles patterns via `wildcardToRegex()`
+- `wildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
 - `handleRequest()` - Request handler with policy evaluation
 - `makeDialer()` - Custom DialContext for split-brain DNS
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality

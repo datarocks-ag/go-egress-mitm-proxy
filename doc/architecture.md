@@ -57,7 +57,7 @@ Loads and validates YAML configuration at startup and on SIGHUP:
 1. Read YAML file from `CONFIG_PATH` (default: `config.yaml`)
 2. Apply environment variable overrides
 3. Validate required fields and values
-4. Compile regex patterns (ACL) and wildcard patterns (rewrites)
+4. Compile patterns (ACL and rewrites) via `wildcardToRegex()`
 
 Environment variable overrides follow 12-factor app principles:
 - `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`
@@ -67,22 +67,23 @@ Environment variable overrides follow 12-factor app principles:
 
 ### ACL Engine
 
-Pre-compiles regex patterns at startup for efficient runtime matching. Evaluation order:
+Pre-compiles patterns at startup for efficient runtime matching. ACL patterns support the same syntax as rewrite rules: exact match, wildcards (`*.example.com`), and raw regex (`~<pattern>`). Evaluation order:
 
 1. **Rewrite rules** - Exact match first (O(1) map lookup), then wildcard patterns
-2. **Blacklist** - Regex patterns, blocks request if matched
-3. **Whitelist** - Regex patterns, allows request if matched
+2. **Blacklist** - Blocks request if matched
+3. **Whitelist** - Allows request if matched
 4. **Default policy** - `ALLOW` or `BLOCK` for unmatched domains
 
-### Wildcard Pattern Matching
+### Domain Pattern Matching
 
-Rewrite rules support wildcards for subdomain matching:
+Rewrite rules support wildcards and raw regex for domain matching:
 
 ```go
 // wildcardToRegex converts patterns:
 // "example.com"     -> "^example\.com$"           (exact)
 // "*.example.com"   -> "^.+\.example\.com$"       (any subdomain depth)
 // "*"               -> ".*"                        (match all)
+// "~<regex>"        -> compiled as-is             (raw regex, no escaping/anchoring)
 ```
 
 ### Request Handler

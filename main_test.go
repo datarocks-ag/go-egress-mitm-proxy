@@ -231,6 +231,23 @@ func TestWildcardToRegex(t *testing.T) {
 			matches: []string{"api-v2.example.com"},
 			noMatch: []string{"api.v2.example.com", "apiv2.example.com"},
 		},
+		{
+			name:    "regex with tilde prefix anchored",
+			pattern: `~^api[0-9]+\.example\.com$`,
+			matches: []string{"api1.example.com", "api42.example.com"},
+			noMatch: []string{"api.example.com", "xapi1.example.com"},
+		},
+		{
+			name:    "regex with tilde prefix unanchored",
+			pattern: `~\.internal\.`,
+			matches: []string{"foo.internal.bar", "a.internal.b.c"},
+			noMatch: []string{"internal", "foointernal"},
+		},
+		{
+			name:    "regex with tilde prefix invalid",
+			pattern: `~[`,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -265,14 +282,14 @@ func TestCompileACL(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid regex patterns",
+			name: "valid patterns",
 			config: Config{
 				ACL: struct {
 					Whitelist []string `yaml:"whitelist"`
 					Blacklist []string `yaml:"blacklist"`
 				}{
-					Whitelist: []string{`^.*\.google\.com$`, `github\.com`},
-					Blacklist: []string{`^.*\.tiktok\.com$`},
+					Whitelist: []string{`*.google.com`, `github.com`},
+					Blacklist: []string{`*.tiktok.com`},
 				},
 			},
 			wantErr: false,
@@ -284,7 +301,7 @@ func TestCompileACL(t *testing.T) {
 					Whitelist []string `yaml:"whitelist"`
 					Blacklist []string `yaml:"blacklist"`
 				}{
-					Whitelist: []string{`[invalid`},
+					Whitelist: []string{`~[invalid`},
 				},
 			},
 			wantErr: true,
@@ -296,7 +313,7 @@ func TestCompileACL(t *testing.T) {
 					Whitelist []string `yaml:"whitelist"`
 					Blacklist []string `yaml:"blacklist"`
 				}{
-					Blacklist: []string{`[invalid`},
+					Blacklist: []string{`~[invalid`},
 				},
 			},
 			wantErr: true,
@@ -314,10 +331,9 @@ func TestCompileACL(t *testing.T) {
 }
 
 func TestMatches(t *testing.T) {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^.*\.google\.com$`),
-		regexp.MustCompile(`^github\.com$`),
-	}
+	p1, _ := wildcardToRegex("*.google.com")
+	p2, _ := wildcardToRegex("github.com")
+	patterns := []*regexp.Regexp{p1, p2}
 
 	tests := []struct {
 		host string
