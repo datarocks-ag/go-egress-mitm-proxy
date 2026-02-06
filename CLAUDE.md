@@ -38,7 +38,7 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 **Request Flow:**
 1. Client connects → Proxy presents cert signed by internal CA (MITM)
 2. Request ID generated and injected (`X-Request-ID`)
-3. Rule matching: Check rewrites first (exact then wildcard), then ACL blacklist/whitelist (regex), then default policy
+3. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
 4. Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
 5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
 6. Headers injected on rewritten requests
@@ -59,10 +59,10 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `loadConfig()` - Loads YAML, applies env overrides, validates
 - `compileACL()` / `compileRewrites()` - Pre-compiles patterns via `wildcardToRegex()`
 - `wildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
-- `handleRequest()` - Request handler with policy evaluation
-- `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match)
-- `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS
-- `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify
+- `handleRequest()` - Request handler with policy evaluation; stores matched rewrite in request context for path-based rules
+- `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match); skips path-pattern rules (resolved via context)
+- `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
+- `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
 - `loadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality
 
@@ -73,6 +73,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
 - Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
 - Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
+- Per-rewrite `path_pattern`: optional regex matched against `r.URL.Path` for path-based routing (rules evaluated in YAML order, first match wins; passed to dialers via request context)
 - Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation
 - Hot reload via SIGHUP signal
 

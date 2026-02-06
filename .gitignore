@@ -1,5 +1,5 @@
 # Binaries
-mitm-proxy
+go-egress-proxy
 *.exe
 *.exe~
 *.dll

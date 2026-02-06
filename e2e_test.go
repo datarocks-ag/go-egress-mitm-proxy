@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sebastian Schmelzer / Data Rocks AG.
+// All rights reserved. Use of this source code is governed
+// by a MIT license that can be found in the LICENSE file.
+
 //go:build e2e
 
 package main
@@ -86,11 +90,56 @@ func writeE2EConfig(t *testing.T, dir, httpbinIP string) {
   mitm_cert_path: "/app/certs/ca.crt"
   mitm_key_path: "/app/certs/ca.key"
 rewrites:
+  # Exact domain + target_ip (existing)
   - domain: "rewrite.example.com"
-    target_ip: %q
+    target_ip: %[1]q
     headers:
       X-Rewritten: "true"
       X-Custom-Header: "proxy-injected"
+
+  # Wildcard domain + target_ip
+  - domain: "*.wildcard.example.com"
+    target_ip: %[1]q
+    headers:
+      X-Rewrite-Type: "wildcard"
+
+  # Regex domain + target_ip
+  - domain: "~^regex[0-9]+\\.example\\.com$"
+    target_ip: %[1]q
+    headers:
+      X-Rewrite-Type: "regex"
+
+  # Exact domain + target_host (DNS-resolved via Docker network alias)
+  - domain: "hostrouted.example.com"
+    target_host: "httpbin-internal"
+    headers:
+      X-Rewrite-Type: "target-host"
+
+  # Path-based rewrites (first-match-wins order)
+  - domain: "pathtest.example.com"
+    path_pattern: "^/anything/v1"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "v1"
+
+  - domain: "pathtest.example.com"
+    path_pattern: "^/anything/v2"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "v2"
+
+  # Catch-all for pathtest.example.com (no path_pattern = matches all paths)
+  - domain: "pathtest.example.com"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "default"
+
+  # Path-only domain (no catch-all — unmatched paths get blocked)
+  - domain: "pathonly.example.com"
+    path_pattern: "^/anything/allowed"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "pathonly"
 acl:
   whitelist:
     - "whitelisted.example.com"
@@ -100,6 +149,34 @@ acl:
 
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+// e2eCheckHeader parses an httpbin JSON response and verifies that a specific header was injected.
+func e2eCheckHeader(t *testing.T, body []byte, headerName, expectedValue string) {
+	t.Helper()
+
+	var result struct {
+		Headers map[string][]string `json:"headers"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal response: %v (body: %s)", err, string(body))
+	}
+
+	vals, ok := result.Headers[headerName]
+	if !ok {
+		t.Errorf("header %q not found in response headers: %v", headerName, result.Headers)
+		return
+	}
+	found := false
+	for _, v := range vals {
+		if v == expectedValue {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("header %q = %v, want value %q", headerName, vals, expectedValue)
 	}
 }
 
@@ -136,13 +213,14 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
-	// Start go-httpbin container
+	// Start go-httpbin container (with network alias for target_host tests)
 	httpbinCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "mccutchen/go-httpbin:v2.15.0",
-			ExposedPorts: []string{"8080/tcp"},
-			Networks:     []string{nw.Name},
-			WaitingFor:   wait.ForHTTP("/get").WithPort("8080/tcp").WithStartupTimeout(30 * time.Second),
+			Image:          "mccutchen/go-httpbin:v2.15.0",
+			ExposedPorts:   []string{"8080/tcp"},
+			Networks:       []string{nw.Name},
+			NetworkAliases: map[string][]string{nw.Name: {"httpbin-internal"}},
+			WaitingFor:     wait.ForHTTP("/get").WithPort("8080/tcp").WithStartupTimeout(30 * time.Second),
 		},
 		Started: true,
 	})
@@ -420,6 +498,157 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("wildcard_rewrite_routes_to_upstream", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://sub.wildcard.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "wildcard")
+	})
+
+	t.Run("wildcard_deep_subdomain", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://a.b.c.wildcard.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "wildcard")
+	})
+
+	t.Run("regex_rewrite_routes_to_upstream", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://regex42.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "regex")
+	})
+
+	t.Run("target_host_rewrite_routes_to_upstream", func(t *testing.T) {
+		// target_host resolves "httpbin-internal" via Docker DNS to the httpbin container
+		resp, err := doGet(ctx, plainClient, "http://hostrouted.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "target-host")
+	})
+
+	t.Run("path_rewrite_v1", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://pathtest.example.com:8080/anything/v1/foo")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "v1")
+	})
+
+	t.Run("path_rewrite_v2", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://pathtest.example.com:8080/anything/v2/bar")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "v2")
+	})
+
+	t.Run("path_rewrite_catchall", func(t *testing.T) {
+		// Path /anything/other/baz does not match /v1 or /v2, falls through to catch-all
+		resp, err := doGet(ctx, plainClient, "http://pathtest.example.com:8080/anything/other/baz")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "default")
+	})
+
+	t.Run("path_only_match_allowed", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://pathonly.example.com:8080/anything/allowed/ok")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "pathonly")
+	})
+
+	t.Run("path_only_no_match_blocked", func(t *testing.T) {
+		// No path_pattern matches /anything/denied, no catch-all → default BLOCK → 403
+		resp, err := doGet(ctx, plainClient, "http://pathonly.example.com:8080/anything/denied/nope")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("expected 403, got %d", resp.StatusCode)
+		}
+	})
+
 	t.Run("health_endpoints", func(t *testing.T) {
 		for _, endpoint := range []string{"/healthz", "/readyz"} {
 			resp, err := doGet(ctx, directClient, metricsBase+endpoint)
@@ -643,8 +872,8 @@ rewrites:
     target_ip: %q
 `, nginxIP, nginxIP)
 
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(proxyConfig), 0o600); err != nil {
-		t.Fatalf("write proxy config: %v", err)
+	if writeErr := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(proxyConfig), 0o600); writeErr != nil {
+		t.Fatalf("write proxy config: %v", writeErr)
 	}
 
 	// --- Start proxy container ---
@@ -726,7 +955,10 @@ rewrites:
 			t.Fatalf("request failed: %v", err)
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
@@ -742,7 +974,10 @@ rewrites:
 			t.Fatalf("request failed: %v", err)
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))

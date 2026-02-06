@@ -54,6 +54,27 @@ rewrites:
     target_ip: "10.20.30.70"
     insecure: true
 
+  # Path-based rewrites: route different URL paths on the same domain to different backends.
+  # Rules are evaluated in YAML order (first match wins).
+  # path_pattern is a regex matched against r.URL.Path.
+  - domain: "api.example.com"
+    path_pattern: "^/v1/"
+    target_ip: "10.20.30.80"
+    headers:
+      X-Backend: "v1"
+
+  - domain: "api.example.com"
+    path_pattern: "^/v2/"
+    target_ip: "10.20.30.81"
+    headers:
+      X-Backend: "v2"
+
+  # Catch-all for remaining paths on the same domain (no path_pattern = matches all paths)
+  - domain: "api.example.com"
+    target_ip: "10.20.30.82"
+    headers:
+      X-Backend: "default"
+
 # Access Control Lists (exact match, wildcards, or ~regex)
 # Evaluated in order: blacklist -> whitelist -> default_policy
 acl:

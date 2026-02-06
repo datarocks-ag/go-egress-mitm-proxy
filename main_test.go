@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sebastian Schmelzer / Data Rocks AG.
+// All rights reserved. Use of this source code is governed
+// by a MIT license that can be found in the LICENSE file.
+
 package main
 
 import (
@@ -219,6 +223,28 @@ func TestConfigValidate(t *testing.T) {
 					{Domain: "internal.example.com", TargetIP: "10.0.0.1", Insecure: true},
 				}
 			},
+		},
+		{
+			name: "valid rewrite with path_pattern",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+				}
+			},
+		},
+		{
+			name: "invalid rewrite path_pattern regex",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "[invalid"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "invalid path_pattern",
 		},
 	}
 
@@ -524,6 +550,24 @@ func TestCompileRewrites(t *testing.T) {
 			wantLen: 0,
 			wantErr: false,
 		},
+		{
+			name: "rules with path_pattern",
+			rules: []RewriteRule{
+				{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+				{Domain: "api.example.com", TargetIP: "10.0.0.2", PathPattern: "^/v2/"},
+				{Domain: "api.example.com", TargetIP: "10.0.0.3"},
+			},
+			wantLen: 3,
+			wantErr: false,
+		},
+		{
+			name: "invalid path_pattern",
+			rules: []RewriteRule{
+				{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "[invalid"},
+			},
+			wantLen: 0,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -537,6 +581,29 @@ func TestCompileRewrites(t *testing.T) {
 				t.Errorf("compileRewrites() returned %d rules, want %d", len(got), tt.wantLen)
 			}
 		})
+	}
+}
+
+func TestCompileRewritesPathPattern(t *testing.T) {
+	rules := []RewriteRule{
+		{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+		{Domain: "api.example.com", TargetIP: "10.0.0.2"},
+	}
+	compiled, err := compileRewrites(rules)
+	if err != nil {
+		t.Fatalf("compileRewrites() error = %v", err)
+	}
+	if compiled[0].PathPattern == nil {
+		t.Error("compiled[0].PathPattern should be non-nil for rule with path_pattern")
+	}
+	if !compiled[0].PathPattern.MatchString("/v1/users") {
+		t.Error("compiled[0].PathPattern should match /v1/users")
+	}
+	if compiled[0].PathPattern.MatchString("/v2/users") {
+		t.Error("compiled[0].PathPattern should not match /v2/users")
+	}
+	if compiled[1].PathPattern != nil {
+		t.Error("compiled[1].PathPattern should be nil for rule without path_pattern")
 	}
 }
 
@@ -1189,6 +1256,237 @@ func TestLookupRewrite(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLookupRewriteSkipsPathPatternRules(t *testing.T) {
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+		},
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v2/`),
+			TargetIP:    "10.0.0.2",
+			Original:    "api.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`^other\.example\.com$`),
+			TargetIP: "10.0.0.9",
+			Original: "other.example.com",
+		},
+	}
+	rewriteExact := map[string]*CompiledRewriteRule{}
+
+	// Path-pattern rules should be skipped by lookupRewrite
+	result := lookupRewrite("api.example.com", rewrites, rewriteExact)
+	if result.matched {
+		t.Error("lookupRewrite() should not match api.example.com when all rules have path patterns")
+	}
+
+	// Domain-only rule should still match
+	result = lookupRewrite("other.example.com", rewrites, rewriteExact)
+	if !result.matched {
+		t.Error("lookupRewrite() should match other.example.com (no path pattern)")
+	}
+	if result.targetIP != "10.0.0.9" {
+		t.Errorf("lookupRewrite().targetIP = %v, want 10.0.0.9", result.targetIP)
+	}
+}
+
+func TestRuntimeConfigUpdateExcludesPathDomains(t *testing.T) {
+	rc := &RuntimeConfig{}
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`^api\.example\.com$`),
+			TargetIP: "10.0.0.3",
+			Original: "api.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`^simple\.example\.com$`),
+			TargetIP: "10.0.0.5",
+			Original: "simple.example.com",
+		},
+	}
+
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil)
+	_, _, _, exactMap := rc.Get()
+
+	// api.example.com has at least one path-pattern rule → excluded from exact map
+	if _, ok := exactMap["api.example.com"]; ok {
+		t.Error("api.example.com should be excluded from exact map (has path-pattern rules)")
+	}
+
+	// simple.example.com has no path rules → should be in exact map
+	if _, ok := exactMap["simple.example.com"]; !ok {
+		t.Error("simple.example.com should be in exact map (no path-pattern rules)")
+	}
+}
+
+func TestHandleRequestPathRewrite(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.Proxy.MitmCertPath = "/path/to/cert"
+	cfg.Proxy.MitmKeyPath = "/path/to/key"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+			Headers:     map[string]string{"X-Backend": "v1"},
+		},
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v2/`),
+			TargetIP:    "10.0.0.2",
+			Original:    "api.example.com",
+			Headers:     map[string]string{"X-Backend": "v2"},
+		},
+		{
+			Pattern:  regexp.MustCompile(`^api\.example\.com$`),
+			TargetIP: "10.0.0.3",
+			Original: "api.example.com",
+			Headers:  map[string]string{"X-Backend": "default"},
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	tests := []struct {
+		name          string
+		path          string
+		wantHeader    string
+		wantContextIP string
+	}{
+		{
+			name:          "matches /v1/ path rule",
+			path:          "/v1/users",
+			wantHeader:    "v1",
+			wantContextIP: "10.0.0.1",
+		},
+		{
+			name:          "matches /v2/ path rule",
+			path:          "/v2/items",
+			wantHeader:    "v2",
+			wantContextIP: "10.0.0.2",
+		},
+		{
+			name:          "falls through to catch-all",
+			path:          "/v3/other",
+			wantHeader:    "default",
+			wantContextIP: "10.0.0.3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://api.example.com"+tt.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resultReq, resp := handleRequest(req, nil, rc)
+			if resp != nil {
+				resp.Body.Close() //nolint:errcheck // test cleanup
+				t.Fatalf("expected nil response (not blocked), got %d", resp.StatusCode)
+			}
+
+			if got := resultReq.Header.Get("X-Backend"); got != tt.wantHeader {
+				t.Errorf("X-Backend header = %q, want %q", got, tt.wantHeader)
+			}
+
+			// Check context carries the rewrite result
+			rw, ok := resultReq.Context().Value(rewriteCtxKey).(rewriteResult)
+			if !ok {
+				t.Fatal("rewriteResult not found in request context")
+			}
+			if rw.targetIP != tt.wantContextIP {
+				t.Errorf("context rewriteResult.targetIP = %q, want %q", rw.targetIP, tt.wantContextIP)
+			}
+		})
+	}
+}
+
+func TestHandleRequestPathNoMatchBlocked(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	// Only path-based rules, no catch-all
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://api.example.com/v2/items", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, resp := handleRequest(req, nil, rc)
+	if resp == nil {
+		t.Fatal("expected blocked response, got nil")
+	}
+	defer resp.Body.Close() //nolint:errcheck // test cleanup
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("response status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestDialerUsesContextRewrite(t *testing.T) {
+	// Start a plain TCP listener to accept the dial
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck // test cleanup
+
+	_, port, splitErr := net.SplitHostPort(ln.Addr().String())
+	if splitErr != nil {
+		t.Fatalf("split host port: %v", splitErr)
+	}
+
+	// Accept one connection in background
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		conn.Close() //nolint:errcheck // test cleanup
+	}()
+
+	rc := &RuntimeConfig{}
+	_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil)
+
+	dial := makeDialer(rc)
+
+	// Put a rewrite result in context pointing to our listener
+	rw := rewriteResult{targetIP: "127.0.0.1", matched: true}
+	ctx := context.WithValue(context.Background(), rewriteCtxKey, rw)
+
+	conn, dialErr := dial(ctx, "tcp", net.JoinHostPort("nonexistent.test", port))
+	if dialErr != nil {
+		t.Fatalf("dial failed: %v", dialErr)
+	}
+	conn.Close() //nolint:errcheck // test cleanup
 }
 
 func TestLoadTruststoreCerts(t *testing.T) {

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sebastian Schmelzer / Data Rocks AG.
+// All rights reserved. Use of this source code is governed
+// by a MIT license that can be found in the LICENSE file.
+//
 // Package main implements a MITM HTTP/HTTPS proxy with split-brain DNS capabilities.
 //
 // The proxy intercepts egress traffic and applies configurable policies:
@@ -97,22 +101,30 @@ var (
 // and the specified Headers will be injected.
 // Exactly one of TargetIP or TargetHost must be set.
 type RewriteRule struct {
-	Domain     string            `yaml:"domain"`      // Domain pattern (exact or wildcard like "*.example.com")
-	TargetIP   string            `yaml:"target_ip"`   // IP address to route to (e.g., "10.0.0.1")
-	TargetHost string            `yaml:"target_host"` // Hostname to route to (resolved via DNS at dial time)
-	Headers    map[string]string `yaml:"headers"`     // Headers to inject into the request
-	Insecure   bool              `yaml:"insecure"`    // Skip TLS verification for this rewrite only
+	Domain      string            `yaml:"domain"`       // Domain pattern (exact or wildcard like "*.example.com")
+	PathPattern string            `yaml:"path_pattern"` // Optional regex matched against r.URL.Path
+	TargetIP    string            `yaml:"target_ip"`    // IP address to route to (e.g., "10.0.0.1")
+	TargetHost  string            `yaml:"target_host"`  // Hostname to route to (resolved via DNS at dial time)
+	Headers     map[string]string `yaml:"headers"`      // Headers to inject into the request
+	Insecure    bool              `yaml:"insecure"`     // Skip TLS verification for this rewrite only
 }
 
 // CompiledRewriteRule holds a rewrite rule with its compiled pattern.
 type CompiledRewriteRule struct {
-	Pattern    *regexp.Regexp
-	TargetIP   string
-	TargetHost string
-	Headers    map[string]string
-	Original   string // Original domain string for exact match optimization
-	Insecure   bool   // Skip TLS verification for this rewrite only
+	Pattern     *regexp.Regexp
+	PathPattern *regexp.Regexp // nil when no path_pattern is set
+	TargetIP    string
+	TargetHost  string
+	Headers     map[string]string
+	Original    string // Original domain string for exact match optimization
+	Insecure    bool   // Skip TLS verification for this rewrite only
 }
+
+// rewriteCtxKeyType is an unexported type for context keys to avoid collisions.
+type rewriteCtxKeyType struct{}
+
+// rewriteCtxKey is used to pass a matched rewriteResult from handleRequest to the dialers.
+var rewriteCtxKey = rewriteCtxKeyType{}
 
 // Config holds the complete proxy configuration loaded from YAML.
 type Config struct {
@@ -158,9 +170,19 @@ type RuntimeConfig struct {
 // It returns the previous blocked log file (if any) so the caller can close it after releasing the lock.
 func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule,
 	blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
+	// Collect domains that have at least one path-based rule.
+	// These domains must be excluded from the exact map so that all their rules
+	// are evaluated sequentially (preserving YAML order / first-match-wins).
+	domainsWithPath := make(map[string]bool)
+	for i := range rewrites {
+		if rewrites[i].PathPattern != nil {
+			domainsWithPath[rewrites[i].Original] = true
+		}
+	}
+
 	exactMap := make(map[string]*CompiledRewriteRule)
 	for i := range rewrites {
-		if !strings.Contains(rewrites[i].Original, "*") {
+		if !strings.Contains(rewrites[i].Original, "*") && !domainsWithPath[rewrites[i].Original] {
 			exactMap[rewrites[i].Original] = &rewrites[i]
 		}
 	}
@@ -279,6 +301,11 @@ func (c *Config) Validate() error {
 		}
 		if hasIP && net.ParseIP(rw.TargetIP) == nil {
 			return fmt.Errorf("rewrites[%d]: invalid target_ip %q", i, rw.TargetIP)
+		}
+		if rw.PathPattern != "" {
+			if _, err := regexp.Compile(rw.PathPattern); err != nil {
+				return fmt.Errorf("rewrites[%d]: invalid path_pattern %q: %w", i, rw.PathPattern, err)
+			}
 		}
 	}
 
@@ -435,6 +462,26 @@ func main() {
 
 	// Register the request handler for policy enforcement
 	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		// Wrap the transport to convert errors into synthetic HTTP responses.
+		// goproxy's MITM handler drops the connection on RoundTrip errors without
+		// writing a response (causing EOF on the client). By catching errors here
+		// and returning synthetic 502/504 responses, the MITM handler writes them
+		// to the client normally.
+		ctx.RoundTripper = goproxy.RoundTripperFunc(func(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
+			resp, err := proxy.Tr.RoundTrip(req)
+			if err != nil {
+				status, reason := upstreamErrorResponse(err)
+				slog.Warn("Upstream connection error",
+					"host", req.URL.Host,
+					"status", status,
+					"err", err)
+				return goproxy.NewResponse(req,
+					goproxy.ContentTypeText,
+					status,
+					reason), nil
+			}
+			return resp, nil
+		})
 		return handleRequest(r, ctx, runtimeCfg)
 	})
 
@@ -720,19 +767,35 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 	var matchedRewrite *CompiledRewriteRule
 
 	// Check rewrite rules first (highest priority, bypasses ACL)
-	// Fast path: exact match
+	// Fast path: exact match (only for domains without path_pattern rules)
 	if rw, ok := rewriteExact[host]; ok {
 		matchedRewrite = rw
 		action = "REWRITTEN"
 	} else {
-		// Slow path: pattern match
+		// Slow path: pattern match with optional path filtering
 		for i := range rewrites {
-			if rewrites[i].Pattern.MatchString(host) {
-				matchedRewrite = &rewrites[i]
-				action = "REWRITTEN"
-				break
+			if !rewrites[i].Pattern.MatchString(host) {
+				continue
 			}
+			if rewrites[i].PathPattern != nil && !rewrites[i].PathPattern.MatchString(r.URL.Path) {
+				continue
+			}
+			matchedRewrite = &rewrites[i]
+			action = "REWRITTEN"
+			break
 		}
+	}
+
+	// Store matched rewrite in request context so dialers can use it
+	// (dialers only receive addr, not the HTTP request path)
+	if matchedRewrite != nil {
+		rw := rewriteResult{
+			targetIP:   matchedRewrite.TargetIP,
+			targetHost: matchedRewrite.TargetHost,
+			insecure:   matchedRewrite.Insecure,
+			matched:    true,
+		}
+		r = r.WithContext(context.WithValue(r.Context(), rewriteCtxKey, rw))
 	}
 
 	// Evaluate ACL if not rewritten
@@ -827,11 +890,16 @@ type rewriteResult struct {
 }
 
 // lookupRewrite checks whether host matches a rewrite rule (exact map first, then patterns).
+// Rules with PathPattern are skipped because the dialer has no access to the HTTP request path;
+// those are resolved in handleRequest and passed via request context instead.
 func lookupRewrite(host string, rewrites []CompiledRewriteRule, rewriteExact map[string]*CompiledRewriteRule) rewriteResult {
 	if rw, ok := rewriteExact[host]; ok {
 		return rewriteResult{targetIP: rw.TargetIP, targetHost: rw.TargetHost, insecure: rw.Insecure, matched: true}
 	}
 	for i := range rewrites {
+		if rewrites[i].PathPattern != nil {
+			continue // path-based rules are resolved via context
+		}
 		if rewrites[i].Pattern.MatchString(host) {
 			return rewriteResult{targetIP: rewrites[i].TargetIP, targetHost: rewrites[i].TargetHost, insecure: rewrites[i].Insecure, matched: true}
 		}
@@ -851,6 +919,7 @@ func recordDialError(err error) {
 
 // makeDialer creates a custom DialContext function that implements split-brain DNS.
 // It intercepts TCP dials and routes matching domains to their configured target IPs.
+// Path-based rewrites are passed via request context from handleRequest.
 func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -859,8 +928,12 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 		}
 
-		_, _, rewrites, rewriteExact := runtimeCfg.Get()
-		rw := lookupRewrite(host, rewrites, rewriteExact)
+		// Check context first (set by handleRequest for path-based rewrites)
+		rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
+		if !ok {
+			_, _, rewrites, rewriteExact := runtimeCfg.Get()
+			rw = lookupRewrite(host, rewrites, rewriteExact)
+		}
 
 		if rw.targetIP != "" {
 			addr = net.JoinHostPort(rw.targetIP, port)
@@ -887,6 +960,7 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 // makeTLSDialer creates a custom DialTLSContext function that performs TCP dial with
 // rewrite IP substitution followed by a TLS handshake with per-connection configuration.
 // This enables per-rewrite InsecureSkipVerify without affecting other connections.
+// Path-based rewrites are passed via request context from handleRequest.
 func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -896,7 +970,12 @@ func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ct
 		}
 
 		cfg, _, rewrites, rewriteExact := runtimeCfg.Get()
-		rw := lookupRewrite(host, rewrites, rewriteExact)
+
+		// Check context first (set by handleRequest for path-based rewrites)
+		rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
+		if !ok {
+			rw = lookupRewrite(host, rewrites, rewriteExact)
+		}
 
 		dialAddr := addr
 		if rw.targetIP != "" {
@@ -1088,13 +1167,21 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid rewrite domain[%d] %q: %w", i, rule.Domain, err)
 		}
+		var pathPattern *regexp.Regexp
+		if rule.PathPattern != "" {
+			pathPattern, err = regexp.Compile(rule.PathPattern)
+			if err != nil {
+				return nil, fmt.Errorf("invalid rewrite path_pattern[%d] %q: %w", i, rule.PathPattern, err)
+			}
+		}
 		compiled = append(compiled, CompiledRewriteRule{
-			Pattern:    pattern,
-			TargetIP:   rule.TargetIP,
-			TargetHost: rule.TargetHost,
-			Headers:    rule.Headers,
-			Original:   rule.Domain,
-			Insecure:   rule.Insecure,
+			Pattern:     pattern,
+			PathPattern: pathPattern,
+			TargetIP:    rule.TargetIP,
+			TargetHost:  rule.TargetHost,
+			Headers:     rule.Headers,
+			Original:    rule.Domain,
+			Insecure:    rule.Insecure,
 		})
 	}
 	return compiled, nil
