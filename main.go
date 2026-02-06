@@ -187,7 +187,9 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 	exactMap := make(map[string]*CompiledRewriteRule)
 	for i := range rewrites {
 		if !strings.Contains(rewrites[i].Original, "*") && !domainsWithPath[rewrites[i].Original] {
-			exactMap[rewrites[i].Original] = &rewrites[i]
+			if _, exists := exactMap[rewrites[i].Original]; !exists {
+				exactMap[rewrites[i].Original] = &rewrites[i]
+			}
 		}
 	}
 
@@ -314,6 +316,20 @@ func (c *Config) Validate() error {
 		if rw.TargetScheme != "" && rw.TargetScheme != "http" && rw.TargetScheme != "https" {
 			return fmt.Errorf("rewrites[%d]: invalid target_scheme %q: must be \"http\" or \"https\"", i, rw.TargetScheme)
 		}
+	}
+
+	// Detect duplicate exact domains without path_pattern (second rule would be unreachable).
+	// Domains with path_pattern are exempt because multiple path-based rules on the same
+	// domain is the intended usage (first-match-wins).
+	seen := make(map[string]int) // domain -> first index
+	for i, rw := range c.Rewrites {
+		if rw.PathPattern != "" {
+			continue
+		}
+		if first, ok := seen[rw.Domain]; ok {
+			return fmt.Errorf("rewrites[%d]: duplicate domain %q without path_pattern (first at rewrites[%d]); second rule is unreachable", i, rw.Domain, first)
+		}
+		seen[rw.Domain] = i
 	}
 
 	return nil

@@ -288,6 +288,41 @@ func TestConfigValidate(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "duplicate exact domain without path_pattern",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1"},
+					{Domain: "api.example.com", TargetIP: "10.0.0.2"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "duplicate domain",
+		},
+		{
+			name: "same domain with different path_patterns is valid",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+					{Domain: "api.example.com", TargetIP: "10.0.0.2", PathPattern: "^/v2/"},
+				}
+			},
+		},
+		{
+			name: "same domain with path_pattern and catch-all is valid",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+					{Domain: "api.example.com", TargetIP: "10.0.0.2"},
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1404,6 +1439,42 @@ func TestRuntimeConfigUpdateExcludesPathDomains(t *testing.T) {
 	// simple.example.com has no path rules → should be in exact map
 	if _, ok := exactMap["simple.example.com"]; !ok {
 		t.Error("simple.example.com should be in exact map (no path-pattern rules)")
+	}
+}
+
+func TestRuntimeConfigUpdateExactMapFirstMatchWins(t *testing.T) {
+	rc := &RuntimeConfig{}
+
+	// Simulate two rules for the same exact domain (no path patterns).
+	// In practice Validate() rejects this, but Update() should still be
+	// defensive and keep the first rule (YAML order / first-match-wins).
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:  regexp.MustCompile(`^dup\.example\.com$`),
+			TargetIP: "10.0.0.1",
+			Original: "dup.example.com",
+			Headers:  map[string]string{"X-First": "true"},
+		},
+		{
+			Pattern:  regexp.MustCompile(`^dup\.example\.com$`),
+			TargetIP: "10.0.0.2",
+			Original: "dup.example.com",
+			Headers:  map[string]string{"X-Second": "true"},
+		},
+	}
+
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil)
+	_, _, _, exactMap := rc.Get()
+
+	rw, ok := exactMap["dup.example.com"]
+	if !ok {
+		t.Fatal("dup.example.com should be in exact map")
+	}
+	if rw.TargetIP != "10.0.0.1" {
+		t.Errorf("exactMap[dup.example.com].TargetIP = %q, want %q (first rule should win)", rw.TargetIP, "10.0.0.1")
+	}
+	if _, hasFirst := rw.Headers["X-First"]; !hasFirst {
+		t.Error("exactMap should contain the first rule's headers")
 	}
 }
 
