@@ -42,19 +42,19 @@ curl -v -x http://localhost:8080 --cacert certs/ca.crt https://example.com
 
 ```bash
 # Print version
-go-egress-proxy --version
+mitm-proxy --version
 
 # Show help
-go-egress-proxy --help
+mitm-proxy --help
 
 # Run with default verbosity (info level)
-go-egress-proxy
+mitm-proxy
 
 # Run with debug output
-go-egress-proxy -vv
+mitm-proxy -vv
 
 # Validate configuration
-go-egress-proxy validate --config config.yaml
+mitm-proxy validate --config config.yaml
 ```
 
 | Flag | Description |
@@ -184,13 +184,13 @@ Validate your configuration file without starting the proxy:
 
 ```bash
 # Use --config flag
-go-egress-proxy validate --config config.yaml
+mitm-proxy validate --config config.yaml
 
 # Or use CONFIG_PATH environment variable
-CONFIG_PATH=config.yaml go-egress-proxy validate
+CONFIG_PATH=config.yaml mitm-proxy validate
 
 # Default: reads config.yaml from current directory
-go-egress-proxy validate
+mitm-proxy validate
 ```
 
 The `validate` subcommand checks:
@@ -279,7 +279,7 @@ Reload configuration without restarting the proxy:
 
 ```bash
 # Find the process ID
-pgrep go-egress-proxy
+pgrep mitm-proxy
 
 # Send SIGHUP to reload config
 kill -HUP <pid>
