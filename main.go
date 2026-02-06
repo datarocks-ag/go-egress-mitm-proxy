@@ -15,15 +15,21 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -147,6 +153,7 @@ type Config struct {
 		MitmKeyPath                string `yaml:"mitm_key_path"`                // Path to MITM CA private key
 		MitmKeystorePath           string `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
 		MitmKeystorePassword       string `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
+		MitmOrg                    string `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
 		BlockedLogPath             string `yaml:"blocked_log_path"`             // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
@@ -371,6 +378,9 @@ func (c *Config) ApplyEnvOverrides() {
 	if v := os.Getenv("PROXY_OUTGOING_TRUSTSTORE_PASSWORD"); v != "" {
 		c.Proxy.OutgoingTruststorePassword = v
 	}
+	if v := os.Getenv("PROXY_MITM_ORG"); v != "" {
+		c.Proxy.MitmOrg = v
+	}
 	if v := os.Getenv("PROXY_INSECURE_SKIP_VERIFY"); v == "true" {
 		c.Proxy.InsecureSkipVerify = true
 	}
@@ -535,7 +545,18 @@ func main() {
 
 	// Initialize the proxy server
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	if cfg.Proxy.MitmOrg != "" {
+		mitmAction := &goproxy.ConnectAction{
+			Action:    goproxy.ConnectMitm,
+			TLSConfig: mitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg),
+		}
+		proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
+			func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+				return mitmAction, host
+			}))
+	} else {
+		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	}
 
 	// Register the request handler for policy enforcement
 	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
@@ -834,6 +855,113 @@ func logMITMCertInfo() {
 		slog.Warn("MITM CA certificate has EXPIRED", "expired_at", leaf.NotAfter.Format(time.RFC3339))
 	} else if time.Until(leaf.NotAfter) < 30*24*time.Hour {
 		slog.Warn("MITM CA certificate expires soon", "expires_in_days", int(time.Until(leaf.NotAfter).Hours()/24))
+	}
+}
+
+// signHost generates a leaf TLS certificate for the given hosts, signed by the CA,
+// using the specified Organization. The key type matches the CA key (RSA, ECDSA, or Ed25519).
+func signHost(ca tls.Certificate, hosts []string, org string) (*tls.Certificate, error) {
+	// Parse the CA certificate
+	caCert, err := x509.ParseCertificate(ca.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse CA cert: %w", err)
+	}
+
+	// Generate serial number
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
+
+	// Build leaf certificate template
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{org},
+			CommonName:   hosts[0],
+		},
+		NotBefore:             time.Now().Add(-24 * 30 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, h)
+		}
+	}
+
+	// Generate key matching the CA key type
+	var privKey any
+	switch ca.PrivateKey.(type) {
+	case *ecdsa.PrivateKey:
+		privKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	case ed25519.PrivateKey:
+		_, privKey, err = ed25519.GenerateKey(rand.Reader)
+	default: // RSA or unknown → RSA 2048
+		privKey, err = rsa.GenerateKey(rand.Reader, 2048)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %w", err)
+	}
+
+	// Extract public key
+	var pubKey any
+	switch k := privKey.(type) {
+	case *ecdsa.PrivateKey:
+		pubKey = &k.PublicKey
+	case ed25519.PrivateKey:
+		pubKey = k.Public()
+	case *rsa.PrivateKey:
+		pubKey = &k.PublicKey
+	}
+
+	// Sign the leaf certificate with the CA
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, pubKey, ca.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("sign certificate: %w", err)
+	}
+
+	return &tls.Certificate{
+		Certificate: [][]byte{certDER, ca.Certificate[0]},
+		PrivateKey:  privKey,
+	}, nil
+}
+
+// mitmTLSConfigFromCA returns a TLS config callback that generates leaf certificates
+// with the specified Organization, using the given CA. A sync.Map cache avoids
+// regenerating certificates for the same host.
+func mitmTLSConfigFromCA(ca *tls.Certificate, org string) func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
+	certCache := &sync.Map{}
+	return func(host string, _ *goproxy.ProxyCtx) (*tls.Config, error) {
+		// Strip port if present
+		hostname, _, err := net.SplitHostPort(host)
+		if err != nil {
+			hostname = host
+		}
+
+		if cached, ok := certCache.Load(hostname); ok {
+			cert := cached.(*tls.Certificate) //nolint:errcheck // stored type is always *tls.Certificate
+			return &tls.Config{
+				Certificates: []tls.Certificate{*cert},
+				MinVersion:   tls.VersionTLS12,
+			}, nil
+		}
+
+		cert, err := signHost(*ca, []string{hostname}, org)
+		if err != nil {
+			return nil, err
+		}
+
+		certCache.Store(hostname, cert)
+		return &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			MinVersion:   tls.VersionTLS12,
+		}, nil
 	}
 }
 

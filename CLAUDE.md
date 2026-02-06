@@ -73,13 +73,16 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match); skips path-pattern rules (resolved via context)
 - `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
 - `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
+- `signHost()` - Generates MITM leaf certificates with custom Organization (key type matches CA)
+- `mitmTLSConfigFromCA()` - TLS config factory for custom MITM certs with sync.Map cache
 - `loadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
-- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`
+- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`, `PROXY_MITM_ORG`
 - MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
+- `mitm_org`: optional custom Organization for MITM leaf certificates (default: goproxy's built-in `"GoProxy untrusted MITM proxy Inc"`)
 - Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
 - Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
 - Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
