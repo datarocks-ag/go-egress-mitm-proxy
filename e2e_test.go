@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sebastian Schmelzer / Data Rocks AG.
+// All rights reserved. Use of this source code is governed
+// by a MIT license that can be found in the LICENSE file.
+
 //go:build e2e
 
 package main
@@ -18,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -85,11 +90,72 @@ func writeE2EConfig(t *testing.T, dir, httpbinIP string) {
   mitm_cert_path: "/app/certs/ca.crt"
   mitm_key_path: "/app/certs/ca.key"
 rewrites:
+  # Exact domain + target_ip (existing)
   - domain: "rewrite.example.com"
-    target_ip: %q
+    target_ip: %[1]q
     headers:
       X-Rewritten: "true"
       X-Custom-Header: "proxy-injected"
+
+  # Wildcard domain + target_ip
+  - domain: "*.wildcard.example.com"
+    target_ip: %[1]q
+    headers:
+      X-Rewrite-Type: "wildcard"
+
+  # Regex domain + target_ip
+  - domain: "~^regex[0-9]+\\.example\\.com$"
+    target_ip: %[1]q
+    headers:
+      X-Rewrite-Type: "regex"
+
+  # Exact domain + target_host (DNS-resolved via Docker network alias)
+  - domain: "hostrouted.example.com"
+    target_host: "httpbin-internal"
+    headers:
+      X-Rewrite-Type: "target-host"
+
+  # Path-based rewrites (first-match-wins order)
+  - domain: "pathtest.example.com"
+    path_pattern: "^/anything/v1"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "v1"
+
+  - domain: "pathtest.example.com"
+    path_pattern: "^/anything/v2"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "v2"
+
+  # Catch-all for pathtest.example.com (no path_pattern = matches all paths)
+  - domain: "pathtest.example.com"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "default"
+
+  # Path-only domain (no catch-all — unmatched paths get blocked)
+  - domain: "pathonly.example.com"
+    path_pattern: "^/anything/allowed"
+    target_ip: %[1]q
+    headers:
+      X-Backend: "pathonly"
+
+  # target_scheme: client connects via HTTPS, proxy forwards as HTTP to backend
+  - domain: "schemetest.example.com"
+    target_ip: %[1]q
+    target_scheme: "http"
+    headers:
+      X-Scheme-Test: "downgraded"
+
+  # drop_headers: strip Authorization and X-Secret before forwarding
+  - domain: "droptest.example.com"
+    target_ip: %[1]q
+    drop_headers:
+      - "Authorization"
+      - "X-Secret"
+    headers:
+      X-Drop-Test: "applied"
 acl:
   whitelist:
     - "whitelisted.example.com"
@@ -99,6 +165,34 @@ acl:
 
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+// e2eCheckHeader parses an httpbin JSON response and verifies that a specific header was injected.
+func e2eCheckHeader(t *testing.T, body []byte, headerName, expectedValue string) {
+	t.Helper()
+
+	var result struct {
+		Headers map[string][]string `json:"headers"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal response: %v (body: %s)", err, string(body))
+	}
+
+	vals, ok := result.Headers[headerName]
+	if !ok {
+		t.Errorf("header %q not found in response headers: %v", headerName, result.Headers)
+		return
+	}
+	found := false
+	for _, v := range vals {
+		if v == expectedValue {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("header %q = %v, want value %q", headerName, vals, expectedValue)
 	}
 }
 
@@ -135,13 +229,14 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
-	// Start go-httpbin container
+	// Start go-httpbin container (with network alias for target_host tests)
 	httpbinCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "mccutchen/go-httpbin:v2.15.0",
-			ExposedPorts: []string{"8080/tcp"},
-			Networks:     []string{nw.Name},
-			WaitingFor:   wait.ForHTTP("/get").WithPort("8080/tcp").WithStartupTimeout(30 * time.Second),
+			Image:          "mccutchen/go-httpbin:v2.15.0",
+			ExposedPorts:   []string{"8080/tcp"},
+			Networks:       []string{nw.Name},
+			NetworkAliases: map[string][]string{nw.Name: {"httpbin-internal"}},
+			WaitingFor:     wait.ForHTTP("/get").WithPort("8080/tcp").WithStartupTimeout(30 * time.Second),
 		},
 		Started: true,
 	})
@@ -419,6 +514,224 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("wildcard_rewrite_routes_to_upstream", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://sub.wildcard.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "wildcard")
+	})
+
+	t.Run("wildcard_deep_subdomain", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://a.b.c.wildcard.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "wildcard")
+	})
+
+	t.Run("regex_rewrite_routes_to_upstream", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://regex42.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "regex")
+	})
+
+	t.Run("target_host_rewrite_routes_to_upstream", func(t *testing.T) {
+		// target_host resolves "httpbin-internal" via Docker DNS to the httpbin container
+		resp, err := doGet(ctx, plainClient, "http://hostrouted.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Rewrite-Type", "target-host")
+	})
+
+	t.Run("path_rewrite_v1", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://pathtest.example.com:8080/anything/v1/foo")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "v1")
+	})
+
+	t.Run("path_rewrite_v2", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://pathtest.example.com:8080/anything/v2/bar")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "v2")
+	})
+
+	t.Run("path_rewrite_catchall", func(t *testing.T) {
+		// Path /anything/other/baz does not match /v1 or /v2, falls through to catch-all
+		resp, err := doGet(ctx, plainClient, "http://pathtest.example.com:8080/anything/other/baz")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "default")
+	})
+
+	t.Run("path_only_match_allowed", func(t *testing.T) {
+		resp, err := doGet(ctx, plainClient, "http://pathonly.example.com:8080/anything/allowed/ok")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Backend", "pathonly")
+	})
+
+	t.Run("path_only_no_match_blocked", func(t *testing.T) {
+		// No path_pattern matches /anything/denied, no catch-all → default BLOCK → 403
+		resp, err := doGet(ctx, plainClient, "http://pathonly.example.com:8080/anything/denied/nope")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("expected 403, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("target_scheme_rewrites_to_http", func(t *testing.T) {
+		// Client sends HTTP request, proxy applies target_scheme: "http" and routes to httpbin.
+		// httpbin's /headers endpoint shows what arrived.
+		resp, err := doGet(ctx, plainClient, "http://schemetest.example.com:8080/headers")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Scheme-Test", "downgraded")
+	})
+
+	t.Run("drop_headers_strips_specified_headers", func(t *testing.T) {
+		// Send request with Authorization and X-Secret headers; they should be stripped.
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "http://droptest.example.com:8080/headers", nil)
+		if reqErr != nil {
+			t.Fatalf("create request: %v", reqErr)
+		}
+		req.Header.Set("Authorization", "Bearer secret-token")
+		req.Header.Set("X-Secret", "do-not-forward")
+		req.Header.Set("X-Keep-Me", "should-survive")
+
+		resp, err := plainClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+
+		var result struct {
+			Headers map[string][]string `json:"headers"`
+		}
+		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
+			t.Fatalf("unmarshal response: %v (body: %s)", unmarshalErr, string(body))
+		}
+
+		// Dropped headers should NOT be present
+		if _, ok := result.Headers["Authorization"]; ok {
+			t.Errorf("Authorization header should have been dropped, but found: %v", result.Headers["Authorization"])
+		}
+		if _, ok := result.Headers["X-Secret"]; ok {
+			t.Errorf("X-Secret header should have been dropped, but found: %v", result.Headers["X-Secret"])
+		}
+
+		// Non-dropped headers should survive
+		if _, ok := result.Headers["X-Keep-Me"]; !ok {
+			t.Errorf("X-Keep-Me header should have survived, but was not found")
+		}
+
+		// Injected header should be present
+		e2eCheckHeader(t, body, "X-Drop-Test", "applied")
+	})
+
 	t.Run("health_endpoints", func(t *testing.T) {
 		for _, endpoint := range []string{"/healthz", "/readyz"} {
 			resp, err := doGet(ctx, directClient, metricsBase+endpoint)
@@ -431,5 +744,327 @@ func TestE2E(t *testing.T) {
 				t.Errorf("GET %s returned %d, want 200", endpoint, resp.StatusCode)
 			}
 		}
+	})
+}
+
+// generateUpstreamTLSCerts creates an upstream CA and server certificate for TLS testing.
+// The server cert is signed by the CA and includes the given DNS names as SANs.
+// Writes ca.crt, ca.key, server.crt, server.key to dir.
+func generateUpstreamTLSCerts(t *testing.T, dir string, dnsNames []string) {
+	t.Helper()
+
+	// Generate CA
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate upstream CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "E2E Upstream CA", Organization: []string{"E2E Upstream"}},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create upstream CA cert: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caCertDER)
+	if err != nil {
+		t.Fatalf("parse upstream CA cert: %v", err)
+	}
+
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "ca.crt"), caCertPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream CA cert: %v", writeErr)
+	}
+	caKeyDER, err := x509.MarshalECPrivateKey(caKey)
+	if err != nil {
+		t.Fatalf("marshal upstream CA key: %v", err)
+	}
+	caKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: caKeyDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "ca.key"), caKeyPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream CA key: %v", writeErr)
+	}
+
+	// Generate server cert signed by CA
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate upstream server key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: dnsNames[0]},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+	}
+	srvCertDER, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create upstream server cert: %v", err)
+	}
+	srvCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvCertDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "server.crt"), srvCertPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream server cert: %v", writeErr)
+	}
+
+	srvKeyDER, err := x509.MarshalECPrivateKey(srvKey)
+	if err != nil {
+		t.Fatalf("marshal upstream server key: %v", err)
+	}
+	srvKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: srvKeyDER})
+	if writeErr := os.WriteFile(filepath.Join(dir, "server.key"), srvKeyPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream server key: %v", writeErr)
+	}
+}
+
+func TestE2ETLS(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not available (needed for PKCS#12 generation)")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// --- Certificates ---
+
+	// MITM CA (proxy client-facing)
+	mitmCertsDir := filepath.Join(tmpDir, "mitm-certs")
+	if err := os.Mkdir(mitmCertsDir, 0o750); err != nil {
+		t.Fatalf("create mitm certs dir: %v", err)
+	}
+	mitmCAPool := generateE2ECerts(t, mitmCertsDir)
+
+	// Upstream CA + server cert (for nginx TLS)
+	upstreamDir := filepath.Join(tmpDir, "upstream-certs")
+	if err := os.Mkdir(upstreamDir, 0o750); err != nil {
+		t.Fatalf("create upstream certs dir: %v", err)
+	}
+	generateUpstreamTLSCerts(t, upstreamDir, []string{
+		"insecure-tls.example.com",
+		"truststore-tls.example.com",
+	})
+
+	// Create PKCS#12 truststore from upstream CA
+	truststorePath := filepath.Join(tmpDir, "upstream-truststore.p12")
+	//nolint:gosec // test helper: all arguments are test-controlled constants
+	cmd := exec.CommandContext(ctx, "openssl", "pkcs12", "-export",
+		"-in", filepath.Join(upstreamDir, "ca.crt"),
+		"-inkey", filepath.Join(upstreamDir, "ca.key"),
+		"-out", truststorePath,
+		"-passout", "pass:truststorepass",
+		"-certpbe", "PBE-SHA1-3DES", "-keypbe", "PBE-SHA1-3DES", "-macalg", "SHA1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create truststore p12: %v\n%s", err, out)
+	}
+
+	// --- nginx TLS configuration ---
+	nginxConf := filepath.Join(tmpDir, "nginx.conf")
+	nginxConfContent := `events {
+    worker_connections 64;
+}
+
+http {
+    server {
+        listen 443 ssl;
+        ssl_certificate /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+
+        location / {
+            return 200 'nginx-tls-ok';
+            default_type text/plain;
+        }
+    }
+}
+`
+	if err := os.WriteFile(nginxConf, []byte(nginxConfContent), 0o600); err != nil {
+		t.Fatalf("write nginx.conf: %v", err)
+	}
+
+	// --- Docker network ---
+	nw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create docker network: %v", err)
+	}
+	t.Cleanup(func() {
+		if rmErr := nw.Remove(ctx); rmErr != nil {
+			t.Logf("remove network: %v", rmErr)
+		}
+	})
+
+	// --- Start nginx TLS container ---
+	nginxCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "nginx:1.27-alpine",
+			ExposedPorts: []string{"443/tcp"},
+			Networks:     []string{nw.Name},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.crt"),
+					ContainerFilePath: "/etc/nginx/certs/server.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.key"),
+					ContainerFilePath: "/etc/nginx/certs/server.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      nginxConf,
+					ContainerFilePath: "/etc/nginx/nginx.conf",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForListeningPort("443/tcp").WithStartupTimeout(30 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start nginx container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(nginxCtr); termErr != nil {
+			t.Logf("terminate nginx: %v", termErr)
+		}
+	})
+
+	nginxIP, err := nginxCtr.ContainerIP(ctx)
+	if err != nil {
+		t.Fatalf("get nginx IP: %v", err)
+	}
+	t.Logf("nginx TLS container IP: %s", nginxIP)
+
+	// --- Write proxy config ---
+	proxyConfig := fmt.Sprintf(`proxy:
+  port: "8080"
+  metrics_port: "9090"
+  default_policy: "BLOCK"
+  mitm_cert_path: "/app/certs/ca.crt"
+  mitm_key_path: "/app/certs/ca.key"
+  outgoing_truststore_path: "/app/certs/upstream-truststore.p12"
+  outgoing_truststore_password: "truststorepass"
+rewrites:
+  - domain: "insecure-tls.example.com"
+    target_ip: %q
+    insecure: true
+  - domain: "truststore-tls.example.com"
+    target_ip: %q
+`, nginxIP, nginxIP)
+
+	if writeErr := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(proxyConfig), 0o600); writeErr != nil {
+		t.Fatalf("write proxy config: %v", writeErr)
+	}
+
+	// --- Start proxy container ---
+	proxyCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
+			Networks:     []string{nw.Name},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
+					ContainerFilePath: "/app/certs/ca.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.key"),
+					ContainerFilePath: "/app/certs/ca.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      truststorePath,
+					ContainerFilePath: "/app/certs/upstream-truststore.p12",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(tmpDir, "config.yaml"),
+					ContainerFilePath: "/app/config.yaml",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForHTTP("/healthz").WithPort("9090/tcp").WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start proxy container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(proxyCtr); termErr != nil {
+			t.Logf("terminate proxy: %v", termErr)
+		}
+	})
+
+	proxyPort, err := proxyCtr.MappedPort(ctx, "8080/tcp")
+	if err != nil {
+		t.Fatalf("get proxy port: %v", err)
+	}
+	proxyHost, err := proxyCtr.Host(ctx)
+	if err != nil {
+		t.Fatalf("get proxy host: %v", err)
+	}
+
+	proxyURL, err := url.Parse(fmt.Sprintf("http://%s:%s", proxyHost, proxyPort.Port()))
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	t.Logf("proxy at %s", proxyURL)
+
+	// Client trusts MITM CA (for client-to-proxy TLS via CONNECT+MITM)
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    mitmCAPool,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	t.Run("insecure_rewrite_to_tls_upstream", func(t *testing.T) {
+		// Client → HTTPS → CONNECT/MITM → proxy → DialTLSContext (insecure:true) → nginx:443
+		// Upstream cert NOT trusted by proxy, but insecure=true skips verification.
+		resp, err := doGet(ctx, tlsClient, "https://insecure-tls.example.com/")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		t.Logf("insecure rewrite response: %d %s", resp.StatusCode, string(body))
+	})
+
+	t.Run("truststore_rewrite_to_tls_upstream", func(t *testing.T) {
+		// Client → HTTPS → CONNECT/MITM → proxy → DialTLSContext → nginx:443
+		// Upstream cert signed by CA that is in the proxy's PKCS#12 truststore.
+		resp, err := doGet(ctx, tlsClient, "https://truststore-tls.example.com/")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		t.Logf("truststore rewrite response: %d %s", resp.StatusCode, string(body))
 	})
 }

@@ -2,7 +2,14 @@ proxy:
   port: "8080"
   metrics_port: "9090"
   default_policy: "BLOCK"   # Options: ALLOW, BLOCK
-  outgoing_ca_bundle: ""    # Optional: path to CA bundle for upstream TLS verification
+  outgoing_ca_bundle: ""    # Optional: path to PEM CA bundle for upstream TLS verification
+
+  # Optional: PKCS#12 truststore for upstream TLS verification (additive with outgoing_ca_bundle)
+  # outgoing_truststore_path: "certs/upstream-cas.p12"
+  # outgoing_truststore_password: "changeit"
+
+  # Disable upstream TLS certificate verification globally (for dev/test only!)
+  # insecure_skip_verify: false
 
   # MITM CA certificate - provide either PEM cert+key or a PKCS#12 keystore (not both)
 
@@ -41,6 +48,49 @@ rewrites:
     target_host: "internal-gateway.corp.example.com"
     headers:
       X-Routed-Via: "egress-proxy"
+
+  # Rewrite with insecure flag (skip TLS verification for this target only)
+  - domain: "self-signed.internal.com"
+    target_ip: "10.20.30.70"
+    insecure: true
+
+  # Path-based rewrites: route different URL paths on the same domain to different backends.
+  # Rules are evaluated in YAML order (first match wins).
+  # path_pattern is a regex matched against r.URL.Path.
+  - domain: "api.example.com"
+    path_pattern: "^/v1/"
+    target_ip: "10.20.30.80"
+    headers:
+      X-Backend: "v1"
+
+  - domain: "api.example.com"
+    path_pattern: "^/v2/"
+    target_ip: "10.20.30.81"
+    headers:
+      X-Backend: "v2"
+
+  # Catch-all for remaining paths on the same domain (no path_pattern = matches all paths)
+  - domain: "api.example.com"
+    target_ip: "10.20.30.82"
+    headers:
+      X-Backend: "default"
+
+  # Scheme rewrite: forward HTTPS client requests as HTTP to the backend
+  - domain: "legacy-backend.internal.com"
+    target_ip: "10.20.30.90"
+    target_scheme: "http"
+    headers:
+      X-Forwarded-Proto: "https"
+
+  # Drop headers: strip sensitive client headers before forwarding
+  - domain: "sanitized-api.internal.com"
+    target_ip: "10.20.30.91"
+    drop_headers:
+      - "Authorization"
+      - "Cookie"
+      - "X-Internal-Token"
+    headers:
+      X-Proxy-Auth: "service-account"
 
 # Access Control Lists (exact match, wildcards, or ~regex)
 # Evaluated in order: blacklist -> whitelist -> default_policy

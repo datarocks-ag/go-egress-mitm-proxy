@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sebastian Schmelzer / Data Rocks AG.
+// All rights reserved. Use of this source code is governed
+// by a MIT license that can be found in the LICENSE file.
+
 package main
 
 import (
@@ -13,8 +17,10 @@ import (
 	"encoding/pem"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -23,7 +29,6 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy"
-	"golang.org/x/net/http2"
 )
 
 func TestConfigValidate(t *testing.T) {
@@ -172,6 +177,152 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: true,
 			errMsg:  "target_ip and target_host are mutually exclusive",
 		},
+		{
+			name: "valid config with outgoing truststore",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Proxy.OutgoingTruststorePath = "/path/to/truststore.p12"
+				c.Proxy.OutgoingTruststorePassword = "changeit"
+			},
+		},
+		{
+			name: "missing outgoing truststore password",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Proxy.OutgoingTruststorePath = "/path/to/truststore.p12"
+			},
+			wantErr: true,
+			errMsg:  "outgoing_truststore_password is required",
+		},
+		{
+			name: "valid config with both ca_bundle and truststore",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Proxy.OutgoingCABundle = "/path/to/ca-bundle.pem"
+				c.Proxy.OutgoingTruststorePath = "/path/to/truststore.p12"
+				c.Proxy.OutgoingTruststorePassword = "changeit"
+			},
+		},
+		{
+			name: "valid config with insecure_skip_verify",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Proxy.InsecureSkipVerify = true
+			},
+		},
+		{
+			name: "valid rewrite with insecure flag",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "internal.example.com", TargetIP: "10.0.0.1", Insecure: true},
+				}
+			},
+		},
+		{
+			name: "valid rewrite with path_pattern",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+				}
+			},
+		},
+		{
+			name: "invalid rewrite path_pattern regex",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "[invalid"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "invalid path_pattern",
+		},
+		{
+			name: "valid rewrite with target_scheme http",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetScheme: "http"},
+				}
+			},
+		},
+		{
+			name: "valid rewrite with target_scheme https",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetScheme: "https"},
+				}
+			},
+		},
+		{
+			name: "invalid rewrite target_scheme",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetScheme: "ftp"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "invalid target_scheme",
+		},
+		{
+			name: "valid rewrite with drop_headers",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", DropHeaders: []string{"Authorization", "Cookie"}},
+				}
+			},
+		},
+		{
+			name: "duplicate exact domain without path_pattern",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1"},
+					{Domain: "api.example.com", TargetIP: "10.0.0.2"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "duplicate domain",
+		},
+		{
+			name: "same domain with different path_patterns is valid",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+					{Domain: "api.example.com", TargetIP: "10.0.0.2", PathPattern: "^/v2/"},
+				}
+			},
+		},
+		{
+			name: "same domain with path_pattern and catch-all is valid",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+					{Domain: "api.example.com", TargetIP: "10.0.0.2"},
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -198,6 +349,9 @@ func TestConfigApplyEnvOverrides(t *testing.T) {
 	t.Setenv("PROXY_MITM_KEYSTORE_PATH", "/path/to/keystore.p12")
 	t.Setenv("PROXY_MITM_KEYSTORE_PASSWORD", "secret")
 	t.Setenv("PROXY_BLOCKED_LOG_PATH", "/var/log/blocked.json")
+	t.Setenv("PROXY_OUTGOING_TRUSTSTORE_PATH", "/path/to/truststore.p12")
+	t.Setenv("PROXY_OUTGOING_TRUSTSTORE_PASSWORD", "truststorepass")
+	t.Setenv("PROXY_INSECURE_SKIP_VERIFY", "true")
 
 	cfg := Config{}
 	cfg.ApplyEnvOverrides()
@@ -216,6 +370,24 @@ func TestConfigApplyEnvOverrides(t *testing.T) {
 	}
 	if cfg.Proxy.BlockedLogPath != "/var/log/blocked.json" {
 		t.Errorf("ApplyEnvOverrides() BlockedLogPath = %v, want %v", cfg.Proxy.BlockedLogPath, "/var/log/blocked.json")
+	}
+	if cfg.Proxy.OutgoingTruststorePath != "/path/to/truststore.p12" {
+		t.Errorf("ApplyEnvOverrides() OutgoingTruststorePath = %v, want %v", cfg.Proxy.OutgoingTruststorePath, "/path/to/truststore.p12")
+	}
+	if cfg.Proxy.OutgoingTruststorePassword != "truststorepass" {
+		t.Errorf("ApplyEnvOverrides() OutgoingTruststorePassword = %v, want %v", cfg.Proxy.OutgoingTruststorePassword, "truststorepass")
+	}
+	if !cfg.Proxy.InsecureSkipVerify {
+		t.Error("ApplyEnvOverrides() InsecureSkipVerify = false, want true")
+	}
+}
+
+func TestConfigApplyEnvOverridesInsecureNotSet(t *testing.T) {
+	cfg := Config{}
+	cfg.ApplyEnvOverrides()
+
+	if cfg.Proxy.InsecureSkipVerify {
+		t.Error("ApplyEnvOverrides() InsecureSkipVerify = true without env var, want false")
 	}
 }
 
@@ -455,6 +627,24 @@ func TestCompileRewrites(t *testing.T) {
 			wantLen: 0,
 			wantErr: false,
 		},
+		{
+			name: "rules with path_pattern",
+			rules: []RewriteRule{
+				{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+				{Domain: "api.example.com", TargetIP: "10.0.0.2", PathPattern: "^/v2/"},
+				{Domain: "api.example.com", TargetIP: "10.0.0.3"},
+			},
+			wantLen: 3,
+			wantErr: false,
+		},
+		{
+			name: "invalid path_pattern",
+			rules: []RewriteRule{
+				{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "[invalid"},
+			},
+			wantLen: 0,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -468,6 +658,29 @@ func TestCompileRewrites(t *testing.T) {
 				t.Errorf("compileRewrites() returned %d rules, want %d", len(got), tt.wantLen)
 			}
 		})
+	}
+}
+
+func TestCompileRewritesPathPattern(t *testing.T) {
+	rules := []RewriteRule{
+		{Domain: "api.example.com", TargetIP: "10.0.0.1", PathPattern: "^/v1/"},
+		{Domain: "api.example.com", TargetIP: "10.0.0.2"},
+	}
+	compiled, err := compileRewrites(rules)
+	if err != nil {
+		t.Fatalf("compileRewrites() error = %v", err)
+	}
+	if compiled[0].PathPattern == nil {
+		t.Error("compiled[0].PathPattern should be non-nil for rule with path_pattern")
+	}
+	if !compiled[0].PathPattern.MatchString("/v1/users") {
+		t.Error("compiled[0].PathPattern should match /v1/users")
+	}
+	if compiled[0].PathPattern.MatchString("/v2/users") {
+		t.Error("compiled[0].PathPattern should not match /v2/users")
+	}
+	if compiled[1].PathPattern != nil {
+		t.Error("compiled[1].PathPattern should be nil for rule without path_pattern")
 	}
 }
 
@@ -648,27 +861,23 @@ func TestGenerateRequestID(t *testing.T) {
 }
 
 func TestOutboundHTTP2TransportConfiguration(t *testing.T) {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+	baseTLS := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
 	}
-
-	if err := http2.ConfigureTransport(tr); err != nil {
-		t.Fatalf("http2.ConfigureTransport() error = %v", err)
+	tr := &http.Transport{
+		TLSClientConfig:   baseTLS,
+		ForceAttemptHTTP2: true,
 	}
 
 	if tr.TLSClientConfig == nil {
-		t.Fatal("TLSClientConfig should not be nil after ConfigureTransport")
+		t.Fatal("TLSClientConfig should not be nil")
 	}
-
 	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
 		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 should be true")
 	}
 }
 
@@ -1020,6 +1229,921 @@ func writeTestCAPEM(t *testing.T, dir, cn, org string) {
 	if err != nil {
 		t.Fatalf("write key: %v", err)
 	}
+}
+
+func TestCompileRewritesTargetSchemeAndDropHeaders(t *testing.T) {
+	rules := []RewriteRule{
+		{Domain: "legacy.example.com", TargetIP: "10.0.0.1", TargetScheme: "http", DropHeaders: []string{"Authorization", "Cookie"}},
+		{Domain: "plain.example.com", TargetIP: "10.0.0.2"},
+	}
+
+	compiled, err := compileRewrites(rules)
+	if err != nil {
+		t.Fatalf("compileRewrites() error = %v", err)
+	}
+
+	if len(compiled) != 2 {
+		t.Fatalf("compileRewrites() returned %d rules, want 2", len(compiled))
+	}
+	if compiled[0].TargetScheme != "http" {
+		t.Errorf("compiled[0].TargetScheme = %q, want %q", compiled[0].TargetScheme, "http")
+	}
+	if len(compiled[0].DropHeaders) != 2 {
+		t.Errorf("compiled[0].DropHeaders length = %d, want 2", len(compiled[0].DropHeaders))
+	}
+	if compiled[0].DropHeaders[0] != "Authorization" {
+		t.Errorf("compiled[0].DropHeaders[0] = %q, want %q", compiled[0].DropHeaders[0], "Authorization")
+	}
+	if compiled[0].DropHeaders[1] != "Cookie" {
+		t.Errorf("compiled[0].DropHeaders[1] = %q, want %q", compiled[0].DropHeaders[1], "Cookie")
+	}
+	if compiled[1].TargetScheme != "" {
+		t.Errorf("compiled[1].TargetScheme = %q, want empty", compiled[1].TargetScheme)
+	}
+	if len(compiled[1].DropHeaders) != 0 {
+		t.Errorf("compiled[1].DropHeaders length = %d, want 0", len(compiled[1].DropHeaders))
+	}
+}
+
+func TestCompileRewritesInsecure(t *testing.T) {
+	rules := []RewriteRule{
+		{Domain: "secure.example.com", TargetIP: "10.0.0.1", Insecure: false},
+		{Domain: "insecure.internal.com", TargetIP: "10.0.0.2", Insecure: true},
+		{Domain: "*.wild.internal.com", TargetIP: "10.0.0.3", Insecure: true},
+	}
+
+	compiled, err := compileRewrites(rules)
+	if err != nil {
+		t.Fatalf("compileRewrites() error = %v", err)
+	}
+
+	if len(compiled) != 3 {
+		t.Fatalf("compileRewrites() returned %d rules, want 3", len(compiled))
+	}
+	if compiled[0].Insecure {
+		t.Error("compiled[0].Insecure = true, want false")
+	}
+	if !compiled[1].Insecure {
+		t.Error("compiled[1].Insecure = false, want true")
+	}
+	if !compiled[2].Insecure {
+		t.Error("compiled[2].Insecure = false, want true")
+	}
+}
+
+func TestLookupRewrite(t *testing.T) {
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:  regexp.MustCompile(`^.+\.wild\.example\.com$`),
+			TargetIP: "10.0.0.3",
+			Original: "*.wild.example.com",
+			Insecure: true,
+		},
+	}
+	rewriteExact := map[string]*CompiledRewriteRule{
+		"exact.example.com": {
+			Pattern:  regexp.MustCompile(`^exact\.example\.com$`),
+			TargetIP: "10.0.0.1",
+			Original: "exact.example.com",
+			Insecure: false,
+		},
+		"insecure.example.com": {
+			Pattern:    regexp.MustCompile(`^insecure\.example\.com$`),
+			TargetHost: "internal.corp.com",
+			Original:   "insecure.example.com",
+			Insecure:   true,
+		},
+	}
+
+	tests := []struct {
+		name      string
+		host      string
+		wantMatch bool
+		wantIP    string
+		wantHost  string
+		wantInsec bool
+	}{
+		{
+			name:      "exact match with target_ip",
+			host:      "exact.example.com",
+			wantMatch: true,
+			wantIP:    "10.0.0.1",
+		},
+		{
+			name:      "exact match with target_host and insecure",
+			host:      "insecure.example.com",
+			wantMatch: true,
+			wantHost:  "internal.corp.com",
+			wantInsec: true,
+		},
+		{
+			name:      "wildcard pattern match",
+			host:      "sub.wild.example.com",
+			wantMatch: true,
+			wantIP:    "10.0.0.3",
+			wantInsec: true,
+		},
+		{
+			name:      "no match",
+			host:      "unknown.example.com",
+			wantMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := lookupRewrite(tt.host, rewrites, rewriteExact)
+			if result.matched != tt.wantMatch {
+				t.Errorf("lookupRewrite(%q).matched = %v, want %v", tt.host, result.matched, tt.wantMatch)
+			}
+			if result.targetIP != tt.wantIP {
+				t.Errorf("lookupRewrite(%q).targetIP = %v, want %v", tt.host, result.targetIP, tt.wantIP)
+			}
+			if result.targetHost != tt.wantHost {
+				t.Errorf("lookupRewrite(%q).targetHost = %v, want %v", tt.host, result.targetHost, tt.wantHost)
+			}
+			if result.insecure != tt.wantInsec {
+				t.Errorf("lookupRewrite(%q).insecure = %v, want %v", tt.host, result.insecure, tt.wantInsec)
+			}
+		})
+	}
+}
+
+func TestLookupRewriteSkipsPathPatternRules(t *testing.T) {
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+		},
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v2/`),
+			TargetIP:    "10.0.0.2",
+			Original:    "api.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`^other\.example\.com$`),
+			TargetIP: "10.0.0.9",
+			Original: "other.example.com",
+		},
+	}
+	rewriteExact := map[string]*CompiledRewriteRule{}
+
+	// Path-pattern rules should be skipped by lookupRewrite
+	result := lookupRewrite("api.example.com", rewrites, rewriteExact)
+	if result.matched {
+		t.Error("lookupRewrite() should not match api.example.com when all rules have path patterns")
+	}
+
+	// Domain-only rule should still match
+	result = lookupRewrite("other.example.com", rewrites, rewriteExact)
+	if !result.matched {
+		t.Error("lookupRewrite() should match other.example.com (no path pattern)")
+	}
+	if result.targetIP != "10.0.0.9" {
+		t.Errorf("lookupRewrite().targetIP = %v, want 10.0.0.9", result.targetIP)
+	}
+}
+
+func TestRuntimeConfigUpdateExcludesPathDomains(t *testing.T) {
+	rc := &RuntimeConfig{}
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`^api\.example\.com$`),
+			TargetIP: "10.0.0.3",
+			Original: "api.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`^simple\.example\.com$`),
+			TargetIP: "10.0.0.5",
+			Original: "simple.example.com",
+		},
+	}
+
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil)
+	_, _, _, exactMap := rc.Get()
+
+	// api.example.com has at least one path-pattern rule → excluded from exact map
+	if _, ok := exactMap["api.example.com"]; ok {
+		t.Error("api.example.com should be excluded from exact map (has path-pattern rules)")
+	}
+
+	// simple.example.com has no path rules → should be in exact map
+	if _, ok := exactMap["simple.example.com"]; !ok {
+		t.Error("simple.example.com should be in exact map (no path-pattern rules)")
+	}
+}
+
+func TestRuntimeConfigUpdateExactMapFirstMatchWins(t *testing.T) {
+	rc := &RuntimeConfig{}
+
+	// Simulate two rules for the same exact domain (no path patterns).
+	// In practice Validate() rejects this, but Update() should still be
+	// defensive and keep the first rule (YAML order / first-match-wins).
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:  regexp.MustCompile(`^dup\.example\.com$`),
+			TargetIP: "10.0.0.1",
+			Original: "dup.example.com",
+			Headers:  map[string]string{"X-First": "true"},
+		},
+		{
+			Pattern:  regexp.MustCompile(`^dup\.example\.com$`),
+			TargetIP: "10.0.0.2",
+			Original: "dup.example.com",
+			Headers:  map[string]string{"X-Second": "true"},
+		},
+	}
+
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil)
+	_, _, _, exactMap := rc.Get()
+
+	rw, ok := exactMap["dup.example.com"]
+	if !ok {
+		t.Fatal("dup.example.com should be in exact map")
+	}
+	if rw.TargetIP != "10.0.0.1" {
+		t.Errorf("exactMap[dup.example.com].TargetIP = %q, want %q (first rule should win)", rw.TargetIP, "10.0.0.1")
+	}
+	if _, hasFirst := rw.Headers["X-First"]; !hasFirst {
+		t.Error("exactMap should contain the first rule's headers")
+	}
+}
+
+func TestHandleRequestPathRewrite(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.Proxy.MitmCertPath = "/path/to/cert"
+	cfg.Proxy.MitmKeyPath = "/path/to/key"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+			Headers:     map[string]string{"X-Backend": "v1"},
+		},
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v2/`),
+			TargetIP:    "10.0.0.2",
+			Original:    "api.example.com",
+			Headers:     map[string]string{"X-Backend": "v2"},
+		},
+		{
+			Pattern:  regexp.MustCompile(`^api\.example\.com$`),
+			TargetIP: "10.0.0.3",
+			Original: "api.example.com",
+			Headers:  map[string]string{"X-Backend": "default"},
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	tests := []struct {
+		name          string
+		path          string
+		wantHeader    string
+		wantContextIP string
+	}{
+		{
+			name:          "matches /v1/ path rule",
+			path:          "/v1/users",
+			wantHeader:    "v1",
+			wantContextIP: "10.0.0.1",
+		},
+		{
+			name:          "matches /v2/ path rule",
+			path:          "/v2/items",
+			wantHeader:    "v2",
+			wantContextIP: "10.0.0.2",
+		},
+		{
+			name:          "falls through to catch-all",
+			path:          "/v3/other",
+			wantHeader:    "default",
+			wantContextIP: "10.0.0.3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://api.example.com"+tt.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resultReq, resp := handleRequest(req, nil, rc)
+			if resp != nil {
+				resp.Body.Close() //nolint:errcheck // test cleanup
+				t.Fatalf("expected nil response (not blocked), got %d", resp.StatusCode)
+			}
+
+			if got := resultReq.Header.Get("X-Backend"); got != tt.wantHeader {
+				t.Errorf("X-Backend header = %q, want %q", got, tt.wantHeader)
+			}
+
+			// Check context carries the rewrite result
+			rw, ok := resultReq.Context().Value(rewriteCtxKey).(rewriteResult)
+			if !ok {
+				t.Fatal("rewriteResult not found in request context")
+			}
+			if rw.targetIP != tt.wantContextIP {
+				t.Errorf("context rewriteResult.targetIP = %q, want %q", rw.targetIP, tt.wantContextIP)
+			}
+		})
+	}
+}
+
+func TestHandleRequestPathNoMatchBlocked(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	// Only path-based rules, no catch-all
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^api\.example\.com$`),
+			PathPattern: regexp.MustCompile(`^/v1/`),
+			TargetIP:    "10.0.0.1",
+			Original:    "api.example.com",
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://api.example.com/v2/items", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, resp := handleRequest(req, nil, rc)
+	if resp == nil {
+		t.Fatal("expected blocked response, got nil")
+	}
+	defer resp.Body.Close() //nolint:errcheck // test cleanup
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("response status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestHandleRequestDropHeaders(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:     regexp.MustCompile(`^drop\.example\.com$`),
+			TargetIP:    "10.0.0.1",
+			Original:    "drop.example.com",
+			DropHeaders: []string{"Authorization", "Cookie"},
+			Headers:     map[string]string{"X-Injected": "yes"},
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://drop.example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("Cookie", "session=abc123")
+	req.Header.Set("Accept", "application/json")
+
+	resultReq, resp := handleRequest(req, nil, rc)
+	if resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected nil response, got %d", resp.StatusCode)
+	}
+
+	// Dropped headers should be gone
+	if got := resultReq.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization header should be dropped, got %q", got)
+	}
+	if got := resultReq.Header.Get("Cookie"); got != "" {
+		t.Errorf("Cookie header should be dropped, got %q", got)
+	}
+
+	// Non-dropped headers should remain
+	if got := resultReq.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("Accept header = %q, want %q", got, "application/json")
+	}
+
+	// Injected headers should be present
+	if got := resultReq.Header.Get("X-Injected"); got != "yes" {
+		t.Errorf("X-Injected header = %q, want %q", got, "yes")
+	}
+}
+
+func TestHandleRequestTargetScheme(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:      regexp.MustCompile(`^scheme\.example\.com$`),
+			TargetIP:     "10.0.0.1",
+			Original:     "scheme.example.com",
+			TargetScheme: "http",
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://scheme.example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resultReq, resp := handleRequest(req, nil, rc)
+	if resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected nil response, got %d", resp.StatusCode)
+	}
+
+	if resultReq.URL.Scheme != "http" {
+		t.Errorf("URL.Scheme = %q, want %q", resultReq.URL.Scheme, "http")
+	}
+}
+
+func TestHandleRequestTargetSchemeEmpty(t *testing.T) {
+	rc := &RuntimeConfig{}
+	cfg := Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+
+	rewrites := []CompiledRewriteRule{
+		{
+			Pattern:  regexp.MustCompile(`^noscheme\.example\.com$`),
+			TargetIP: "10.0.0.1",
+			Original: "noscheme.example.com",
+		},
+	}
+
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://noscheme.example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resultReq, resp := handleRequest(req, nil, rc)
+	if resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected nil response, got %d", resp.StatusCode)
+	}
+
+	if resultReq.URL.Scheme != "https" {
+		t.Errorf("URL.Scheme = %q, want %q (should be unchanged)", resultReq.URL.Scheme, "https")
+	}
+}
+
+func TestDialerUsesContextRewrite(t *testing.T) {
+	// Start a plain TCP listener to accept the dial
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck // test cleanup
+
+	_, port, splitErr := net.SplitHostPort(ln.Addr().String())
+	if splitErr != nil {
+		t.Fatalf("split host port: %v", splitErr)
+	}
+
+	// Accept one connection in background
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		conn.Close() //nolint:errcheck // test cleanup
+	}()
+
+	rc := &RuntimeConfig{}
+	_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil)
+
+	dial := makeDialer(rc)
+
+	// Put a rewrite result in context pointing to our listener
+	rw := rewriteResult{targetIP: "127.0.0.1", matched: true}
+	ctx := context.WithValue(context.Background(), rewriteCtxKey, rw)
+
+	conn, dialErr := dial(ctx, "tcp", net.JoinHostPort("nonexistent.test", port))
+	if dialErr != nil {
+		t.Fatalf("dial failed: %v", dialErr)
+	}
+	conn.Close() //nolint:errcheck // test cleanup
+}
+
+func TestLoadTruststoreCerts(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not available")
+	}
+
+	dir := t.TempDir()
+	_, p12Path := generateTestP12(t, dir, "Test Truststore CA", "Test Org", "testpass")
+
+	t.Run("loads certificates from valid truststore", func(t *testing.T) {
+		certs, err := loadTruststoreCerts(p12Path, "testpass")
+		if err != nil {
+			t.Fatalf("loadTruststoreCerts() error = %v", err)
+		}
+		if len(certs) == 0 {
+			t.Fatal("loadTruststoreCerts() returned no certificates")
+		}
+		if certs[0].Subject.CommonName != "Test Truststore CA" {
+			t.Errorf("cert CN = %q, want %q", certs[0].Subject.CommonName, "Test Truststore CA")
+		}
+	})
+
+	t.Run("error on wrong password", func(t *testing.T) {
+		_, err := loadTruststoreCerts(p12Path, "wrongpass")
+		if err == nil {
+			t.Fatal("expected error for wrong password")
+		}
+	})
+
+	t.Run("error on nonexistent file", func(t *testing.T) {
+		_, err := loadTruststoreCerts("/nonexistent/truststore.p12", "testpass")
+		if err == nil {
+			t.Fatal("expected error for nonexistent file")
+		}
+	})
+
+	t.Run("error on invalid data", func(t *testing.T) {
+		badPath := filepath.Join(dir, "bad.p12")
+		if err := os.WriteFile(badPath, []byte("not-a-p12"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadTruststoreCerts(badPath, "testpass")
+		if err == nil {
+			t.Fatal("expected error for invalid p12 data")
+		}
+	})
+}
+
+func TestLoadCertPoolWithTruststore(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not available")
+	}
+
+	dir := t.TempDir()
+	certPath, p12Path := generateTestP12(t, dir, "Pool Test CA", "Test Org", "pooltest")
+
+	t.Run("pool with truststore only", func(t *testing.T) {
+		pool := loadCertPool("", p12Path, "pooltest")
+		if pool == nil {
+			t.Fatal("loadCertPool() returned nil")
+		}
+	})
+
+	t.Run("pool with PEM bundle and truststore", func(t *testing.T) {
+		pool := loadCertPool(certPath, p12Path, "pooltest")
+		if pool == nil {
+			t.Fatal("loadCertPool() returned nil")
+		}
+	})
+
+	t.Run("pool with no extra certs", func(t *testing.T) {
+		pool := loadCertPool("", "", "")
+		if pool == nil {
+			t.Fatal("loadCertPool() returned nil")
+		}
+	})
+
+	t.Run("pool with bad truststore path logs warning", func(t *testing.T) {
+		output := captureLogs(t, func() {
+			pool := loadCertPool("", "/nonexistent/truststore.p12", "pass")
+			if pool == nil {
+				t.Fatal("loadCertPool() returned nil")
+			}
+		})
+		if !contains(output, "Failed to load truststore") {
+			t.Errorf("expected warning about failed truststore load, got: %s", output)
+		}
+	})
+}
+
+func TestRunValidateTruststore(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "ca.crt")
+	keyFile := filepath.Join(tmpDir, "ca.key")
+	truststoreFile := filepath.Join(tmpDir, "truststore.p12")
+	if err := os.WriteFile(certFile, []byte("fake-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, []byte("fake-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(truststoreFile, []byte("fake-truststore"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeConfig := func(t *testing.T, content string) string {
+		t.Helper()
+		f := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(f, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("valid config with existing truststore file", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "`+certFile+`"
+  mitm_key_path: "`+keyFile+`"
+  outgoing_truststore_path: "`+truststoreFile+`"
+  outgoing_truststore_password: "changeit"
+  default_policy: BLOCK
+`)
+		if err := runValidate(cfg); err != nil {
+			t.Errorf("runValidate() unexpected error: %v", err)
+		}
+	})
+
+	t.Run("missing truststore file fails validation", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "`+certFile+`"
+  mitm_key_path: "`+keyFile+`"
+  outgoing_truststore_path: "/nonexistent/truststore.p12"
+  outgoing_truststore_password: "changeit"
+  default_policy: BLOCK
+`)
+		err := runValidate(cfg)
+		if err == nil {
+			t.Fatal("runValidate() expected error for missing truststore file, got nil")
+		}
+		if !contains(err.Error(), "outgoing_truststore_path") {
+			t.Errorf("runValidate() error = %v, want error mentioning outgoing_truststore_path", err)
+		}
+	})
+}
+
+func TestOutboundHTTP2TransportWithDialTLSContext(t *testing.T) {
+	baseTLS := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+
+	tr := &http.Transport{
+		TLSClientConfig:   baseTLS,
+		ForceAttemptHTTP2: true,
+		DialTLSContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return nil, nil // stub for test
+		},
+	}
+
+	if tr.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig should not be nil")
+	}
+	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
+		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 should be true")
+	}
+	if tr.DialTLSContext == nil {
+		t.Error("DialTLSContext should be set")
+	}
+}
+
+// startTLSServer creates a TLS server with a self-signed certificate signed by a generated CA.
+// Returns the listener address, CA cert pool (for trusted clients), and the CA cert (for building truststores).
+func startTLSServer(t *testing.T) (addr string, caPool *x509.CertPool, caCertPEM []byte) {
+	t.Helper()
+
+	// Generate CA
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "TLS Test CA", Organization: []string{"Test"}},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(1 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caCertDER)
+	if err != nil {
+		t.Fatalf("parse CA cert: %v", err)
+	}
+	caCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+
+	caPool = x509.NewCertPool()
+	caPool.AddCert(caCert)
+
+	// Generate server cert signed by the CA
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate server key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost", "rewrite-insecure.test", "rewrite-trusted.test"},
+	}
+	srvCertDER, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+	srvCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvCertDER})
+	srvKeyDER, err := x509.MarshalECPrivateKey(srvKey)
+	if err != nil {
+		t.Fatalf("marshal server key: %v", err)
+	}
+	srvKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: srvKeyDER})
+
+	tlsCert, err := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
+	if err != nil {
+		t.Fatalf("load server TLS keypair: %v", err)
+	}
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err != nil {
+		t.Fatalf("start TLS listener: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() }) //nolint:errcheck // test cleanup
+
+	// Serve simple HTTP responses (listener is already TLS-wrapped, use Serve not ServeTLS)
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ok", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		srv.Serve(ln) //nolint:errcheck // background test server
+	}()
+
+	return ln.Addr().String(), caPool, caCertPEM
+}
+
+func TestMakeTLSDialer(t *testing.T) {
+	srvAddr, caPool, _ := startTLSServer(t)
+	srvHost, srvPort, err := net.SplitHostPort(srvAddr)
+	if err != nil {
+		t.Fatalf("split server addr: %v", err)
+	}
+
+	// Helper to create a RuntimeConfig with given settings
+	setupRuntime := func(insecureGlobal bool, rewrites []CompiledRewriteRule) *RuntimeConfig {
+		rc := &RuntimeConfig{}
+		cfg := Config{}
+		cfg.Proxy.InsecureSkipVerify = insecureGlobal
+		_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+		return rc
+	}
+
+	t.Run("per_rewrite_insecure_allows_self_signed", func(t *testing.T) {
+		// Rewrite with insecure=true → TLS handshake succeeds even without CA in pool
+		rewrites := []CompiledRewriteRule{
+			{
+				Pattern:  regexp.MustCompile(`^rewrite-insecure\.test$`),
+				TargetIP: srvHost,
+				Original: "rewrite-insecure.test",
+				Insecure: true,
+			},
+		}
+		rc := setupRuntime(false, rewrites)
+		baseTLS := &tls.Config{MinVersion: tls.VersionTLS12} // empty RootCAs = system pool (won't trust test CA)
+
+		dial := makeTLSDialer(rc, baseTLS)
+		conn, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-insecure.test", srvPort))
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		conn.Close() //nolint:errcheck // test cleanup
+	})
+
+	t.Run("trusted_ca_in_pool_allows_connection", func(t *testing.T) {
+		// No insecure flag, but CA is in pool → handshake succeeds
+		rewrites := []CompiledRewriteRule{
+			{
+				Pattern:  regexp.MustCompile(`^rewrite-trusted\.test$`),
+				TargetIP: srvHost,
+				Original: "rewrite-trusted.test",
+				Insecure: false,
+			},
+		}
+		rc := setupRuntime(false, rewrites)
+		baseTLS := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    caPool,
+		}
+
+		dial := makeTLSDialer(rc, baseTLS)
+		conn, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-trusted.test", srvPort))
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		conn.Close() //nolint:errcheck // test cleanup
+	})
+
+	t.Run("rejects_untrusted_cert", func(t *testing.T) {
+		// No insecure, no CA trust → handshake must fail
+		rewrites := []CompiledRewriteRule{
+			{
+				Pattern:  regexp.MustCompile(`^rewrite-trusted\.test$`),
+				TargetIP: srvHost,
+				Original: "rewrite-trusted.test",
+				Insecure: false,
+			},
+		}
+		rc := setupRuntime(false, rewrites)
+		baseTLS := &tls.Config{MinVersion: tls.VersionTLS12} // empty = system pool, won't trust test CA
+
+		dial := makeTLSDialer(rc, baseTLS)
+		_, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-trusted.test", srvPort))
+		if err == nil {
+			t.Fatal("expected TLS handshake error for untrusted cert")
+		}
+	})
+
+	t.Run("global_insecure_skip_verify", func(t *testing.T) {
+		// Global insecure_skip_verify=true, no per-rewrite flag → succeeds
+		rewrites := []CompiledRewriteRule{
+			{
+				Pattern:  regexp.MustCompile(`^rewrite-trusted\.test$`),
+				TargetIP: srvHost,
+				Original: "rewrite-trusted.test",
+				Insecure: false,
+			},
+		}
+		rc := setupRuntime(true, rewrites) // global insecure
+		baseTLS := &tls.Config{MinVersion: tls.VersionTLS12}
+
+		dial := makeTLSDialer(rc, baseTLS)
+		conn, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-trusted.test", srvPort))
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		conn.Close() //nolint:errcheck // test cleanup
+	})
+}
+
+// generateTestP12 creates a self-signed CA certificate as PEM and PKCS#12 files using openssl.
+// Returns the PEM cert path and the .p12 path.
+func generateTestP12(t *testing.T, dir, cn, org, password string) (certPath, p12Path string) {
+	t.Helper()
+	keyPath := filepath.Join(dir, "ca.key")
+	certPath = filepath.Join(dir, "ca.crt")
+	p12Path = filepath.Join(dir, "truststore.p12")
+
+	ctx := context.Background()
+
+	//nolint:gosec // test helper: all arguments are test-controlled constants
+	cmd := exec.CommandContext(ctx, "openssl", "ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", keyPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("openssl genkey: %v\n%s", err, out)
+	}
+
+	//nolint:gosec // test helper: all arguments are test-controlled constants
+	cmd = exec.CommandContext(ctx, "openssl", "req", "-new", "-x509", "-key", keyPath,
+		"-out", certPath, "-days", "1", "-subj", "/CN="+cn+"/O="+org)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("openssl req: %v\n%s", err, out)
+	}
+
+	//nolint:gosec // test helper: all arguments are test-controlled constants
+	cmd = exec.CommandContext(ctx, "openssl", "pkcs12", "-export",
+		"-in", certPath, "-inkey", keyPath,
+		"-out", p12Path, "-passout", "pass:"+password,
+		"-certpbe", "PBE-SHA1-3DES", "-keypbe", "PBE-SHA1-3DES", "-macalg", "SHA1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("openssl pkcs12: %v\n%s", err, out)
+	}
+
+	return certPath, p12Path
 }
 
 // Helper function

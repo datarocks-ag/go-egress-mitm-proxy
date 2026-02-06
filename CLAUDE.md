@@ -38,10 +38,11 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 **Request Flow:**
 1. Client connects → Proxy presents cert signed by internal CA (MITM)
 2. Request ID generated and injected (`X-Request-ID`)
-3. Rule matching: Check rewrites first (exact then wildcard), then ACL blacklist/whitelist (regex), then default policy
+3. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
 4. Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
 5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
-6. Headers injected on rewritten requests
+6. Headers dropped (`drop_headers`) and injected (`headers`) on rewritten requests
+7. Request scheme optionally changed (`target_scheme`) before forwarding
 
 **Response Status Codes:**
 
@@ -59,14 +60,23 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `loadConfig()` - Loads YAML, applies env overrides, validates
 - `compileACL()` / `compileRewrites()` - Pre-compiles patterns via `wildcardToRegex()`
 - `wildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
-- `handleRequest()` - Request handler with policy evaluation
-- `makeDialer()` - Custom DialContext for split-brain DNS
+- `handleRequest()` - Request handler with policy evaluation; stores matched rewrite in request context for path-based rules
+- `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match); skips path-pattern rules (resolved via context)
+- `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
+- `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
+- `loadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
-- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, etc.
+- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`
 - MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
+- Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
+- Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
+- Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
+- Per-rewrite `target_scheme`: optional `"http"` or `"https"` to change the request scheme before forwarding (e.g., HTTPS client → HTTP backend)
+- Per-rewrite `drop_headers`: list of header names to strip from the request before forwarding (case-insensitive via `r.Header.Del()`)
+- Per-rewrite `path_pattern`: optional regex matched against `r.URL.Path` for path-based routing (rules evaluated in YAML order, first match wins; passed to dialers via request context)
 - Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation
 - Hot reload via SIGHUP signal
 
