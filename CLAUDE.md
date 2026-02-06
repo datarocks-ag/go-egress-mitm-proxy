@@ -27,6 +27,7 @@ go run . validate --config config.yaml
 ```bash
 make test           # Run all tests with race detector
 make test-short     # Run tests without race detector (faster)
+make test-e2e       # Run end-to-end tests (requires Docker)
 go test -v -run TestConfigValidate ./...  # Run specific test
 ```
 
@@ -41,6 +42,17 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 4. Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
 5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
 6. Headers injected on rewritten requests
+
+**Response Status Codes:**
+
+| Code | Meaning | When |
+|------|---------|------|
+| 200 | OK | Request succeeded through to upstream |
+| 403 | Forbidden | Request blocked by ACL (blacklisted or default BLOCK policy) |
+| 502 | Bad Gateway | Upstream unreachable: DNS lookup failed, connection refused, or connection reset |
+| 504 | Gateway Timeout | Upstream accepted the connection but did not respond in time |
+
+The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.DeadlineExceeded`) from all other upstream failures. This applies to both plain HTTP requests (via the `OnResponse` handler) and CONNECT-level failures (via `ConnectionErrHandler`).
 
 **Key Components:**
 - `RuntimeConfig` - Thread-safe config holder with RWMutex for hot reload

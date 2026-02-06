@@ -772,6 +772,125 @@ acl:
 	})
 }
 
+func TestLoadMITMFromPEM(t *testing.T) {
+	// Save and restore the global goproxy CA to avoid test pollution.
+	origCa := goproxy.GoproxyCa
+	t.Cleanup(func() { goproxy.GoproxyCa = origCa })
+
+	// Write a fresh CA cert+key to temp files.
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	writeTestCAPEM(t, dir, "Custom Test CA", "Custom Test Org")
+
+	t.Run("loads custom cert and replaces embedded default", func(t *testing.T) {
+		// Reset to embedded default first.
+		goproxy.GoproxyCa = origCa
+
+		if err := loadMITMFromPEM(certPath, keyPath); err != nil {
+			t.Fatalf("loadMITMFromPEM() error: %v", err)
+		}
+
+		// Parse the loaded certificate.
+		if len(goproxy.GoproxyCa.Certificate) == 0 {
+			t.Fatal("GoproxyCa has no certificate after loading")
+		}
+		leaf, err := x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		if err != nil {
+			t.Fatalf("parse loaded certificate: %v", err)
+		}
+
+		// Verify it's our custom cert, not goproxy's embedded default.
+		if leaf.Subject.CommonName != "Custom Test CA" {
+			t.Errorf("loaded cert CN = %q, want %q", leaf.Subject.CommonName, "Custom Test CA")
+		}
+		if leaf.Issuer.Organization[0] != "Custom Test Org" {
+			t.Errorf("loaded cert Org = %q, want %q", leaf.Issuer.Organization[0], "Custom Test Org")
+		}
+		if !leaf.IsCA {
+			t.Error("loaded cert is not a CA")
+		}
+
+		// Confirm it's different from the embedded goproxy default.
+		origLeaf, parseErr := x509.ParseCertificate(origCa.Certificate[0])
+		if parseErr != nil {
+			t.Fatalf("parse embedded cert: %v", parseErr)
+		}
+		if leaf.Subject.CommonName == origLeaf.Subject.CommonName {
+			t.Error("loaded cert has the same CN as the embedded goproxy default — custom cert not loaded")
+		}
+	})
+
+	t.Run("error on missing cert file", func(t *testing.T) {
+		err := loadMITMFromPEM("/nonexistent/ca.crt", keyPath)
+		if err == nil {
+			t.Fatal("expected error for missing cert file")
+		}
+	})
+
+	t.Run("error on missing key file", func(t *testing.T) {
+		err := loadMITMFromPEM(certPath, "/nonexistent/ca.key")
+		if err == nil {
+			t.Fatal("expected error for missing key file")
+		}
+	})
+
+	t.Run("error on invalid PEM content", func(t *testing.T) {
+		badCert := filepath.Join(t.TempDir(), "bad.crt")
+		if err := os.WriteFile(badCert, []byte("not-a-cert"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := loadMITMFromPEM(badCert, keyPath)
+		if err == nil {
+			t.Fatal("expected error for invalid PEM content")
+		}
+	})
+}
+
+// writeTestCAPEM generates a CA certificate and key as PEM files in dir.
+func writeTestCAPEM(t *testing.T, dir, cn, org string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName:   cn,
+			Organization: []string{org},
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	err = os.WriteFile(filepath.Join(dir, "ca.crt"), certPEM, 0o600)
+	if err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	err = os.WriteFile(filepath.Join(dir, "ca.key"), keyPEM, 0o600)
+	if err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+}
+
 // Helper function
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))

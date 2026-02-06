@@ -27,6 +27,10 @@ test:
 test-short:
 	$(GO) test -v -coverprofile=coverage.out ./...
 
+## test-e2e: Run end-to-end tests (requires Docker)
+test-e2e:
+	$(GO) test -v -tags e2e -count=1 -timeout 120s ./...
+
 ## lint: Run golangci-lint
 lint:
 	$(GO) mod download

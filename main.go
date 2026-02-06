@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -351,13 +352,41 @@ func main() {
 		return handleRequest(r, ctx, runtimeCfg)
 	})
 
-	// Register response handler for metrics
+	// Register response handler for metrics and upstream error handling
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp != nil {
 			recordResponseMetrics(resp)
+			return resp
+		}
+		if ctx.Error != nil {
+			status, reason := upstreamErrorResponse(ctx.Error)
+			slog.Warn("Upstream connection error",
+				"host", ctx.Req.URL.Host,
+				"status", status,
+				"err", ctx.Error)
+			return goproxy.NewResponse(ctx.Req,
+				goproxy.ContentTypeText,
+				status,
+				reason)
 		}
 		return resp
 	})
+
+	// Handle CONNECT-level upstream errors with proper status codes instead of default 502
+	proxy.ConnectionErrHandler = func(w io.Writer, ctx *goproxy.ProxyCtx, err error) {
+		status, reason := upstreamErrorResponse(err)
+		slog.Warn("Upstream connection error",
+			"host", ctx.Req.Host,
+			"status", status,
+			"err", err)
+		errStr := fmt.Sprintf(
+			"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s",
+			status, reason,
+			len(reason),
+			reason,
+		)
+		io.WriteString(w, errStr) //nolint:errcheck // best-effort response to client
+	}
 
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
 	// ForceAttemptHTTP2 is required because we set a custom TLSClientConfig and DialContext.
@@ -643,6 +672,19 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 	}
 
 	return r, nil
+}
+
+// upstreamErrorResponse returns the HTTP status code and reason text for an upstream error.
+// Timeouts yield 504 Gateway Timeout; all other failures (DNS, refused, reset) yield 502 Bad Gateway.
+func upstreamErrorResponse(err error) (int, string) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return http.StatusGatewayTimeout, "Gateway Timeout"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout, "Gateway Timeout"
+	}
+	return http.StatusBadGateway, "Bad Gateway"
 }
 
 // recordResponseMetrics records metrics from the response.
