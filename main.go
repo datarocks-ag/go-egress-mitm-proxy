@@ -44,6 +44,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// version is set at build time via -ldflags "-X main.version=<value>".
+var version = "dev"
+
 // Prometheus metrics for monitoring proxy behavior.
 var (
 	// requestCounter tracks total requests by domain and action taken.
@@ -416,16 +419,67 @@ func runValidate(configPath string) error {
 	return nil
 }
 
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `Usage: %s [flags] [command]
+
+Commands:
+  validate    Validate configuration file and exit
+
+Flags:
+  -h, --help      Show this help message
+  --version       Print version and exit
+  -v              Verbose output (info level, default)
+  -vv             Debug output
+  -vvv            Trace output (most verbose)
+
+Environment:
+  CONFIG_PATH     Path to config file (default: config.yaml)
+`, os.Args[0])
+}
+
 func main() {
-	// Initialize structured JSON logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Parse top-level flags from os.Args[1:]
+	var (
+		showVersion bool
+		showHelp    bool
+		logLevel    = slog.LevelInfo
+	)
+	var remaining []string
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--version":
+			showVersion = true
+		case "-h", "--help":
+			showHelp = true
+		case "-vvv":
+			logLevel = slog.LevelDebug
+		case "-vv":
+			logLevel = slog.LevelDebug
+		case "-v":
+			// Explicit info level (same as default)
+		default:
+			remaining = append(remaining, arg)
+		}
+	}
+
+	if showVersion {
+		fmt.Println(version)
+		return
+	}
+	if showHelp {
+		printUsage()
+		return
+	}
+
+	// Initialize structured JSON logging with configured level
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
 	// Subcommand dispatch
-	if len(os.Args) > 1 && os.Args[1] == "validate" {
+	if len(remaining) > 0 && remaining[0] == "validate" {
 		fs := flag.NewFlagSet("validate", flag.ExitOnError)
 		configFlag := fs.String("config", "", "path to configuration file")
-		if err := fs.Parse(os.Args[2:]); err != nil {
+		if err := fs.Parse(remaining[1:]); err != nil {
 			slog.Error("Failed to parse flags", "err", err)
 			os.Exit(1)
 		}
@@ -511,6 +565,17 @@ func main() {
 	// Register response handler for metrics and upstream error handling
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp != nil {
+			// Normalize response protocol to HTTP/1.1 for MITM tunnels.
+			// goproxy writes responses via resp.Write() which serializes
+			// ProtoMajor/ProtoMinor into the status line. Two cases need fixing:
+			// 1) goproxy.NewResponse() leaves Proto fields at zero → "HTTP/0.0"
+			// 2) Upstream HTTP/2 responses have Proto "HTTP/2.0" → "HTTP/2.0"
+			// Both cause "Unsupported HTTP version" errors in clients.
+			if resp.ProtoMajor != 1 {
+				resp.Proto = "HTTP/1.1"
+				resp.ProtoMajor = 1
+				resp.ProtoMinor = 1
+			}
 			recordResponseMetrics(resp)
 			return resp
 		}

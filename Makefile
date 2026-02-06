@@ -3,7 +3,8 @@
 # Build variables
 BINARY_NAME := mitm-proxy
 GO := go
-GOFLAGS := -ldflags="-s -w"
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+GOFLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 
 # Default target
 all: lint test build

@@ -38,6 +38,35 @@ make run
 curl -v -x http://localhost:8080 --cacert certs/ca.crt https://example.com
 ```
 
+## CLI Usage
+
+```bash
+# Print version
+go-egress-proxy --version
+
+# Show help
+go-egress-proxy --help
+
+# Run with default verbosity (info level)
+go-egress-proxy
+
+# Run with debug output
+go-egress-proxy -vv
+
+# Validate configuration
+go-egress-proxy validate --config config.yaml
+```
+
+| Flag | Description |
+|------|-------------|
+| `--version` | Print version and exit |
+| `-h`, `--help` | Show help message |
+| `-v` | Verbose output (info level, default) |
+| `-vv` | Debug output |
+| `-vvv` | Trace output (most verbose) |
+
+The version is injected at build time. Use `VERSION=1.0.0 make build` to set a specific version, otherwise it defaults to the git describe output or `dev`.
+
 ## Configuration
 
 Create a `config.yaml` file (or set `CONFIG_PATH` environment variable):

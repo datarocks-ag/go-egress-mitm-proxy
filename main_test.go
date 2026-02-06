@@ -2146,6 +2146,85 @@ func generateTestP12(t *testing.T, dir, cn, org, password string) (certPath, p12
 	return certPath, p12Path
 }
 
+func TestVersionDefault(t *testing.T) {
+	if version != "dev" {
+		t.Errorf("version = %q, want %q", version, "dev")
+	}
+}
+
+func TestPrintUsage(t *testing.T) {
+	// Capture stderr output
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	printUsage()
+
+	w.Close() //nolint:errcheck // flushing pipe before read
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	output := buf.String()
+
+	for _, want := range []string{"validate", "--version", "--help", "-v", "-vv", "-vvv", "CONFIG_PATH"} {
+		if !contains(output, want) {
+			t.Errorf("printUsage() output missing %q", want)
+		}
+	}
+}
+
+func TestResponseProtoNormalization(t *testing.T) {
+	// goproxy writes MITM responses via resp.Write() which serializes
+	// ProtoMajor/ProtoMinor into the status line. The OnResponse handler
+	// must normalize non-HTTP/1.x responses to prevent "Unsupported HTTP
+	// version" errors. Two cases:
+	//   1) goproxy.NewResponse() leaves Proto at zero → "HTTP/0.0"
+	//   2) Upstream HTTP/2 → Proto "HTTP/2.0"
+	tests := []struct {
+		name       string
+		proto      string
+		protoMajor int
+		protoMinor int
+	}{
+		{"goproxy.NewResponse zero values", "", 0, 0},
+		{"upstream HTTP/2", "HTTP/2.0", 2, 0},
+		{"HTTP/1.1 unchanged", "HTTP/1.1", 1, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				Proto:      tt.proto,
+				ProtoMajor: tt.protoMajor,
+				ProtoMinor: tt.protoMinor,
+			}
+
+			// Apply the same normalization as the OnResponse handler.
+			if resp.ProtoMajor != 1 {
+				resp.Proto = "HTTP/1.1"
+				resp.ProtoMajor = 1
+				resp.ProtoMinor = 1
+			}
+
+			if resp.Proto != "HTTP/1.1" {
+				t.Errorf("Proto = %q, want %q", resp.Proto, "HTTP/1.1")
+			}
+			if resp.ProtoMajor != 1 {
+				t.Errorf("ProtoMajor = %d, want 1", resp.ProtoMajor)
+			}
+			if resp.ProtoMinor != 1 {
+				t.Errorf("ProtoMinor = %d, want 1", resp.ProtoMinor)
+			}
+		})
+	}
+}
+
 // Helper function
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))

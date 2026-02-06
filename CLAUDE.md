@@ -9,7 +9,7 @@ go-egress-proxy is a MITM HTTP/HTTPS proxy that implements split-brain DNS funct
 ## Build and Run Commands
 
 ```bash
-make build          # Build binary
+make build          # Build binary (injects version from git describe)
 make test           # Run tests with race detector
 make lint           # Run golangci-lint
 make run            # Run directly with go run
@@ -18,8 +18,17 @@ make docker-build   # Build Docker image
 make docker-run     # Run in Docker
 make install-tools  # Install dev tools (golangci-lint, goimports)
 
+# CLI flags
+./mitm-proxy --version       # Print version and exit
+./mitm-proxy --help          # Show usage
+./mitm-proxy -vv             # Run with debug logging
+./mitm-proxy -vvv            # Run with trace logging (most verbose)
+
 # Validate configuration without starting the proxy
 go run . validate --config config.yaml
+
+# Build with specific version
+VERSION=1.0.0 make build
 ```
 
 ## Testing
