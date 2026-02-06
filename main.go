@@ -123,6 +123,7 @@ type Config struct {
 		MitmKeyPath          string `yaml:"mitm_key_path"`          // Path to MITM CA private key
 		MitmKeystorePath     string `yaml:"mitm_keystore_path"`     // Path to PKCS#12 keystore (.p12) containing cert and key
 		MitmKeystorePassword string `yaml:"mitm_keystore_password"` // Password for PKCS#12 keystore
+		BlockedLogPath       string `yaml:"blocked_log_path"`       // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -139,15 +140,19 @@ type CompiledACL struct {
 
 // RuntimeConfig holds the compiled, thread-safe runtime configuration.
 type RuntimeConfig struct {
-	mu           sync.RWMutex
-	config       Config
-	acl          CompiledACL
-	rewrites     []CompiledRewriteRule
-	rewriteExact map[string]*CompiledRewriteRule // Fast path for exact matches
+	mu            sync.RWMutex
+	config        Config
+	acl           CompiledACL
+	rewrites      []CompiledRewriteRule
+	rewriteExact  map[string]*CompiledRewriteRule // Fast path for exact matches
+	blockedLogger *slog.Logger                    // nil when blocked log feature disabled
+	blockedFile   *os.File                        // underlying file handle for Close()
 }
 
 // Update atomically updates the runtime configuration.
-func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule) {
+// It returns the previous blocked log file (if any) so the caller can close it after releasing the lock.
+func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule,
+	blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
 	exactMap := make(map[string]*CompiledRewriteRule)
 	for i := range rewrites {
 		if !strings.Contains(rewrites[i].Original, "*") {
@@ -156,11 +161,16 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 	}
 
 	rc.mu.Lock()
+	oldFile := rc.blockedFile
 	rc.config = cfg
 	rc.acl = acl
 	rc.rewrites = rewrites
 	rc.rewriteExact = exactMap
+	rc.blockedLogger = blockedLogger
+	rc.blockedFile = blockedFile
 	rc.mu.Unlock()
+
+	return oldFile
 }
 
 // Get returns the current configuration (read-locked).
@@ -168,6 +178,38 @@ func (rc *RuntimeConfig) Get() (Config, CompiledACL, []CompiledRewriteRule, map[
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 	return rc.config, rc.acl, rc.rewrites, rc.rewriteExact
+}
+
+// GetBlockedLogger returns the blocked request logger, or nil if disabled.
+func (rc *RuntimeConfig) GetBlockedLogger() *slog.Logger {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.blockedLogger
+}
+
+// CloseBlockedLog closes the blocked log file handle, if open.
+func (rc *RuntimeConfig) CloseBlockedLog() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.blockedFile != nil {
+		rc.blockedFile.Close() //nolint:errcheck // best-effort close on shutdown
+		rc.blockedFile = nil
+		rc.blockedLogger = nil
+	}
+}
+
+// openBlockedLog opens (or creates) the blocked request log file and returns a JSON logger writing to it.
+// If path is empty, the feature is disabled and nil values are returned.
+func openBlockedLog(path string) (*slog.Logger, *os.File, error) {
+	if path == "" {
+		return nil, nil, nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open blocked log: %w", err)
+	}
+	logger := slog.New(slog.NewJSONHandler(f, nil))
+	return logger, f, nil
 }
 
 // Validate checks the configuration for required fields and valid values.
@@ -258,6 +300,9 @@ func (c *Config) ApplyEnvOverrides() {
 	if v := os.Getenv("PROXY_MITM_KEYSTORE_PASSWORD"); v != "" {
 		c.Proxy.MitmKeystorePassword = v
 	}
+	if v := os.Getenv("PROXY_BLOCKED_LOG_PATH"); v != "" {
+		c.Proxy.BlockedLogPath = v
+	}
 }
 
 // runValidate loads and validates the configuration without starting the proxy.
@@ -330,9 +375,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Open blocked request log (optional)
+	blockedLogger, blockedFile, err := openBlockedLog(cfg.Proxy.BlockedLogPath)
+	if err != nil {
+		slog.Error("Failed to open blocked log", "path", cfg.Proxy.BlockedLogPath, "err", err)
+		os.Exit(1)
+	}
+
 	// Initialize runtime config (thread-safe, reloadable)
 	runtimeCfg := &RuntimeConfig{}
-	runtimeCfg.Update(cfg, acl, rewrites)
+	_ = runtimeCfg.Update(cfg, acl, rewrites, blockedLogger, blockedFile)
 
 	// Load MITM CA certificate and key for TLS interception
 	if err := loadMITMCertificate(cfg); err != nil {
@@ -452,7 +504,16 @@ func main() {
 				configLoadErrors.Inc()
 				continue
 			}
-			runtimeCfg.Update(newCfg, newACL, newRewrites)
+			newBlockedLogger, newBlockedFile, blErr := openBlockedLog(newCfg.Proxy.BlockedLogPath)
+			if blErr != nil {
+				slog.Error("Failed to open blocked log on reload", "path", newCfg.Proxy.BlockedLogPath, "err", blErr)
+				configLoadErrors.Inc()
+				continue
+			}
+			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newBlockedLogger, newBlockedFile)
+			if oldFile != nil {
+				oldFile.Close() //nolint:errcheck // best-effort close of rotated log
+			}
 			configReloads.Inc()
 			slog.Info("Configuration reloaded successfully",
 				"rewrites", len(newRewrites),
@@ -475,6 +536,7 @@ func main() {
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 			slog.Error("Metrics server shutdown error", "err", err)
 		}
+		runtimeCfg.CloseBlockedLog()
 	}()
 
 	// Start the proxy server
@@ -485,7 +547,8 @@ func main() {
 		"rewrites", len(rewrites),
 		"whitelist_rules", len(acl.Whitelist),
 		"blacklist_rules", len(acl.Blacklist),
-		"outgoing_ca_bundle", cfg.Proxy.OutgoingCABundle)
+		"outgoing_ca_bundle", cfg.Proxy.OutgoingCABundle,
+		"blocked_log_path", cfg.Proxy.BlockedLogPath)
 
 	if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("Proxy server error", "err", err)
@@ -661,6 +724,16 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 
 	// Block denied requests
 	if action == "BLACK-LISTED" || action == "BLOCKED" {
+		if bl := runtimeCfg.GetBlockedLogger(); bl != nil {
+			bl.LogAttrs(context.Background(), slog.LevelInfo, "blocked",
+				slog.String("request_id", requestID),
+				slog.String("client", r.RemoteAddr),
+				slog.String("host", host),
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("action", action),
+			)
+		}
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
 	}
 

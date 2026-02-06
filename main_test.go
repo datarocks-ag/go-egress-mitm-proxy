@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"log/slog"
 	"math/big"
@@ -194,6 +196,7 @@ func TestConfigApplyEnvOverrides(t *testing.T) {
 	t.Setenv("PROXY_DEFAULT_POLICY", "ALLOW")
 	t.Setenv("PROXY_MITM_KEYSTORE_PATH", "/path/to/keystore.p12")
 	t.Setenv("PROXY_MITM_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("PROXY_BLOCKED_LOG_PATH", "/var/log/blocked.json")
 
 	cfg := Config{}
 	cfg.ApplyEnvOverrides()
@@ -209,6 +212,9 @@ func TestConfigApplyEnvOverrides(t *testing.T) {
 	}
 	if cfg.Proxy.MitmKeystorePassword != "secret" {
 		t.Errorf("ApplyEnvOverrides() MitmKeystorePassword = %v, want %v", cfg.Proxy.MitmKeystorePassword, "secret")
+	}
+	if cfg.Proxy.BlockedLogPath != "/var/log/blocked.json" {
+		t.Errorf("ApplyEnvOverrides() BlockedLogPath = %v, want %v", cfg.Proxy.BlockedLogPath, "/var/log/blocked.json")
 	}
 }
 
@@ -483,7 +489,7 @@ func TestRuntimeConfigUpdateAndGet(t *testing.T) {
 		},
 	}
 
-	rc.Update(cfg, acl, rewrites)
+	_ = rc.Update(cfg, acl, rewrites, nil, nil)
 
 	gotCfg, gotACL, gotRewrites, gotExact := rc.Get()
 
@@ -499,6 +505,128 @@ func TestRuntimeConfigUpdateAndGet(t *testing.T) {
 	if _, ok := gotExact["api.example.com"]; !ok {
 		t.Error("Get() exactMap should contain api.example.com")
 	}
+}
+
+func TestOpenBlockedLog(t *testing.T) {
+	t.Run("empty path returns nil", func(t *testing.T) {
+		logger, f, err := openBlockedLog("")
+		if err != nil {
+			t.Fatalf("openBlockedLog(\"\") error = %v", err)
+		}
+		if logger != nil {
+			t.Error("expected nil logger for empty path")
+		}
+		if f != nil {
+			t.Error("expected nil file for empty path")
+		}
+	})
+
+	t.Run("valid path creates file with 0600", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "blocked.log")
+		logger, f, err := openBlockedLog(path)
+		if err != nil {
+			t.Fatalf("openBlockedLog() error = %v", err)
+		}
+		t.Cleanup(func() { f.Close() }) //nolint:errcheck // test cleanup
+
+		if logger == nil {
+			t.Fatal("expected non-nil logger")
+		}
+		if f == nil {
+			t.Fatal("expected non-nil file")
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat blocked log: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("file permissions = %o, want 0600", perm)
+		}
+	})
+
+	t.Run("invalid directory returns error", func(t *testing.T) {
+		_, _, err := openBlockedLog("/nonexistent/dir/blocked.log")
+		if err == nil {
+			t.Fatal("expected error for invalid directory")
+		}
+	})
+}
+
+func TestBlockedLoggerWritesJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.log")
+	logger, f, err := openBlockedLog(path)
+	if err != nil {
+		t.Fatalf("openBlockedLog() error = %v", err)
+	}
+
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "blocked",
+		slog.String("request_id", "abc123"),
+		slog.String("client", "127.0.0.1:9999"),
+		slog.String("host", "evil.com"),
+		slog.String("method", "GET"),
+		slog.String("path", "/malware"),
+		slog.String("action", "BLACK-LISTED"),
+	)
+	f.Close() //nolint:errcheck // flush before read
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read blocked log: %v", err)
+	}
+
+	var entry map[string]interface{}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("unmarshal JSON log entry: %v (raw: %s)", err, data)
+	}
+
+	wantKeys := []string{"request_id", "client", "host", "method", "path", "action", "msg", "level", "time"}
+	for _, key := range wantKeys {
+		if _, ok := entry[key]; !ok {
+			t.Errorf("missing key %q in JSON log entry", key)
+		}
+	}
+	if entry["request_id"] != "abc123" {
+		t.Errorf("request_id = %v, want %q", entry["request_id"], "abc123")
+	}
+	if entry["action"] != "BLACK-LISTED" {
+		t.Errorf("action = %v, want %q", entry["action"], "BLACK-LISTED")
+	}
+	if entry["msg"] != "blocked" {
+		t.Errorf("msg = %v, want %q", entry["msg"], "blocked")
+	}
+}
+
+func TestRuntimeConfigBlockedLogger(t *testing.T) {
+	t.Run("nil when disabled", func(t *testing.T) {
+		rc := &RuntimeConfig{}
+		_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil)
+
+		if got := rc.GetBlockedLogger(); got != nil {
+			t.Error("GetBlockedLogger() should return nil when disabled")
+		}
+	})
+
+	t.Run("returns logger when enabled", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "blocked.log")
+		logger, f, err := openBlockedLog(path)
+		if err != nil {
+			t.Fatalf("openBlockedLog() error = %v", err)
+		}
+
+		rc := &RuntimeConfig{}
+		_ = rc.Update(Config{}, CompiledACL{}, nil, logger, f)
+
+		if got := rc.GetBlockedLogger(); got == nil {
+			t.Error("GetBlockedLogger() should return non-nil logger when enabled")
+		}
+
+		rc.CloseBlockedLog()
+
+		if got := rc.GetBlockedLogger(); got != nil {
+			t.Error("GetBlockedLogger() should return nil after CloseBlockedLog()")
+		}
+	})
 }
 
 func TestGenerateRequestID(t *testing.T) {
