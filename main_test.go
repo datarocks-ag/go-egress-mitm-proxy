@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -540,13 +541,15 @@ func TestOpenBlockedLog(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat blocked log: %v", err)
 		}
-		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Errorf("file permissions = %o, want 0600", perm)
+		if runtime.GOOS != "windows" {
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("file permissions = %o, want 0600", perm)
+			}
 		}
 	})
 
 	t.Run("invalid directory returns error", func(t *testing.T) {
-		_, _, err := openBlockedLog("/nonexistent/dir/blocked.log")
+		_, _, err := openBlockedLog(filepath.Join(t.TempDir(), "does-not-exist", "blocked.log"))
 		if err == nil {
 			t.Fatal("expected error for invalid directory")
 		}

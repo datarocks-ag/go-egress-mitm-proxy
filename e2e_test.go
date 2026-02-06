@@ -93,8 +93,6 @@ rewrites:
 acl:
   whitelist:
     - "whitelisted.example.com"
-    - "*.google.com"
-    - "google.com"
   blacklist:
     - "blacklisted.example.com"
 `, httpbinIP)
@@ -357,30 +355,28 @@ func TestE2E(t *testing.T) {
 		checkHeader("X-Custom-Header", "proxy-injected")
 	})
 
-	t.Run("https_whitelisted_google", func(t *testing.T) {
-		// HTTPS to google.com through the MITM proxy. The proxy does AlwaysMitm,
-		// so CONNECT is accepted, then handleRequest allows it (whitelisted).
-		// The proxy forwards the request to the real google.com.
-		resp, err := doGet(ctx, tlsClient, "https://google.com/")
+	t.Run("https_whitelisted_not_blocked", func(t *testing.T) {
+		// HTTPS to whitelisted.example.com through the MITM proxy.
+		// CONNECT is accepted, TLS established with custom CA, handleRequest
+		// allows it (whitelisted). DNS fails → 502, proving it was NOT policy-blocked (403).
+		resp, err := doGet(ctx, tlsClient, "https://whitelisted.example.com/")
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}
 		defer resp.Body.Close()
 
-		// Google returns 200 or 301 — critically NOT 403
 		if resp.StatusCode == http.StatusForbidden {
-			t.Fatal("whitelisted google.com should not be blocked with 403")
+			t.Fatal("whitelisted domain should not be blocked with 403")
 		}
-		if resp.StatusCode >= 500 {
-			t.Errorf("unexpected server error: %d", resp.StatusCode)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("expected 502 for unresolvable whitelisted domain, got %d", resp.StatusCode)
 		}
-		t.Logf("https://google.com returned status %d", resp.StatusCode)
 	})
 
-	t.Run("mitm_uses_custom_ca_not_embedded_default", func(t *testing.T) {
+	t.Run("mitm_uses_custom_ca", func(t *testing.T) {
 		// Verify the MITM-presented certificate is signed by our test CA,
 		// not goproxy's embedded default (CN=goproxy.github.io, O=GoProxy).
-		resp, err := doGet(ctx, tlsClient, "https://google.com/")
+		resp, err := doGet(ctx, tlsClient, "https://whitelisted.example.com/")
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}

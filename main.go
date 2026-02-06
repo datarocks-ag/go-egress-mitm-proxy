@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -192,7 +193,9 @@ func (rc *RuntimeConfig) CloseBlockedLog() {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 	if rc.blockedFile != nil {
-		rc.blockedFile.Close() //nolint:errcheck // best-effort close on shutdown
+		if err := rc.blockedFile.Close(); err != nil {
+			slog.Warn("Failed to close blocked log file", "err", err)
+		}
 		rc.blockedFile = nil
 		rc.blockedLogger = nil
 	}
@@ -324,8 +327,20 @@ func runValidate(configPath string) error {
 		if path == "" {
 			continue
 		}
-		if _, err := os.Stat(path); err != nil {
+		f, err := os.Open(path)
+		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("%s: close: %w", name, err)
+		}
+	}
+
+	// Validate blocked_log_path parent directory exists
+	if cfg.Proxy.BlockedLogPath != "" {
+		dir := filepath.Dir(cfg.Proxy.BlockedLogPath)
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("blocked_log_path: parent directory: %w", err)
 		}
 	}
 
@@ -512,7 +527,9 @@ func main() {
 			}
 			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newBlockedLogger, newBlockedFile)
 			if oldFile != nil {
-				oldFile.Close() //nolint:errcheck // best-effort close of rotated log
+				if err := oldFile.Close(); err != nil {
+					slog.Warn("Failed to close rotated blocked log file", "err", err)
+				}
 			}
 			configReloads.Inc()
 			slog.Info("Configuration reloaded successfully",
