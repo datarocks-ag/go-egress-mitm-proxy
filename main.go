@@ -91,20 +91,23 @@ var (
 )
 
 // RewriteRule defines a domain rewrite configuration.
-// When a request matches the Domain pattern, it will be routed to TargetIP
+// When a request matches the Domain pattern, it will be routed to TargetIP or TargetHost
 // and the specified Headers will be injected.
+// Exactly one of TargetIP or TargetHost must be set.
 type RewriteRule struct {
-	Domain   string            `yaml:"domain"`    // Domain pattern (exact or wildcard like "*.example.com")
-	TargetIP string            `yaml:"target_ip"` // IP address to route to (e.g., "10.0.0.1")
-	Headers  map[string]string `yaml:"headers"`   // Headers to inject into the request
+	Domain     string            `yaml:"domain"`      // Domain pattern (exact or wildcard like "*.example.com")
+	TargetIP   string            `yaml:"target_ip"`   // IP address to route to (e.g., "10.0.0.1")
+	TargetHost string            `yaml:"target_host"` // Hostname to route to (resolved via DNS at dial time)
+	Headers    map[string]string `yaml:"headers"`     // Headers to inject into the request
 }
 
 // CompiledRewriteRule holds a rewrite rule with its compiled pattern.
 type CompiledRewriteRule struct {
-	Pattern  *regexp.Regexp
-	TargetIP string
-	Headers  map[string]string
-	Original string // Original domain string for exact match optimization
+	Pattern    *regexp.Regexp
+	TargetIP   string
+	TargetHost string
+	Headers    map[string]string
+	Original   string // Original domain string for exact match optimization
 }
 
 // Config holds the complete proxy configuration loaded from YAML.
@@ -210,10 +213,15 @@ func (c *Config) Validate() error {
 		if rw.Domain == "" {
 			return fmt.Errorf("rewrites[%d]: domain is required", i)
 		}
-		if rw.TargetIP == "" {
-			return fmt.Errorf("rewrites[%d]: target_ip is required", i)
+		hasIP := rw.TargetIP != ""
+		hasHost := rw.TargetHost != ""
+		if hasIP && hasHost {
+			return fmt.Errorf("rewrites[%d]: target_ip and target_host are mutually exclusive", i)
 		}
-		if net.ParseIP(rw.TargetIP) == nil {
+		if !hasIP && !hasHost {
+			return fmt.Errorf("rewrites[%d]: target_ip or target_host is required", i)
+		}
+		if hasIP && net.ParseIP(rw.TargetIP) == nil {
 			return fmt.Errorf("rewrites[%d]: invalid target_ip %q", i, rw.TargetIP)
 		}
 	}
@@ -574,13 +582,15 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		_, _, rewrites, rewriteExact := runtimeCfg.Get()
 
 		// Check for rewrite (fast path first)
-		var targetIP string
+		var targetIP, targetHost string
 		if rw, ok := rewriteExact[host]; ok {
 			targetIP = rw.TargetIP
+			targetHost = rw.TargetHost
 		} else {
 			for i := range rewrites {
 				if rewrites[i].Pattern.MatchString(host) {
 					targetIP = rewrites[i].TargetIP
+					targetHost = rewrites[i].TargetHost
 					break
 				}
 			}
@@ -589,6 +599,9 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		if targetIP != "" {
 			addr = net.JoinHostPort(targetIP, port)
 			slog.Debug("Rewriting dial", "original", host, "target", targetIP)
+		} else if targetHost != "" {
+			addr = net.JoinHostPort(targetHost, port)
+			slog.Debug("Rewriting dial", "original", host, "target", targetHost)
 		}
 
 		conn, err := (&net.Dialer{
@@ -720,10 +733,11 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 			return nil, fmt.Errorf("invalid rewrite domain[%d] %q: %w", i, rule.Domain, err)
 		}
 		compiled = append(compiled, CompiledRewriteRule{
-			Pattern:  pattern,
-			TargetIP: rule.TargetIP,
-			Headers:  rule.Headers,
-			Original: rule.Domain,
+			Pattern:    pattern,
+			TargetIP:   rule.TargetIP,
+			TargetHost: rule.TargetHost,
+			Headers:    rule.Headers,
+			Original:   rule.Domain,
 		})
 	}
 	return compiled, nil

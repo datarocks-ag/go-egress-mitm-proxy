@@ -17,19 +17,26 @@ proxy:
 # Domain rewrite rules
 # Supports exact match and wildcards (*.example.com)
 # Rewrite rules bypass ACL checks
+# Each rule must specify either target_ip or target_host (not both)
 rewrites:
-  # Exact domain match
+  # Exact domain match with target IP
   - domain: "api.production.com"
     target_ip: "10.20.30.40"
     headers:
       X-Proxy-Source: "egress-gateway"
       X-Environment: "production"
 
-  # Wildcard match (matches any subdomain depth)
+  # Wildcard match (matches any subdomain depth) with target IP
   - domain: "*.internal.example.com"
     target_ip: "10.20.30.50"
     headers:
       X-Internal: "true"
+
+  # Rewrite using target_host (resolved via DNS at dial time)
+  - domain: "external-api.partner.com"
+    target_host: "internal-gateway.corp.example.com"
+    headers:
+      X-Routed-Via: "egress-proxy"
 
 # Access Control Lists (regex patterns)
 # Evaluated in order: blacklist -> whitelist -> default_policy

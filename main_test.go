@@ -114,7 +114,7 @@ func TestConfigValidate(t *testing.T) {
 			errMsg:  "invalid target_ip",
 		},
 		{
-			name: "valid rewrite rule",
+			name: "valid rewrite rule with target_ip",
 			modify: func(c *Config) {
 				c.Proxy.MitmCertPath = "/path/to/cert"
 				c.Proxy.MitmKeyPath = "/path/to/key"
@@ -122,6 +122,40 @@ func TestConfigValidate(t *testing.T) {
 					{Domain: "example.com", TargetIP: "10.0.0.1"},
 				}
 			},
+		},
+		{
+			name: "valid rewrite rule with target_host",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetHost: "internal.example.com"},
+				}
+			},
+		},
+		{
+			name: "rewrite missing both target_ip and target_host",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "target_ip or target_host is required",
+		},
+		{
+			name: "rewrite with both target_ip and target_host",
+			modify: func(c *Config) {
+				c.Proxy.MitmCertPath = "/path/to/cert"
+				c.Proxy.MitmKeyPath = "/path/to/key"
+				c.Rewrites = []RewriteRule{
+					{Domain: "example.com", TargetIP: "10.0.0.1", TargetHost: "internal.example.com"},
+				}
+			},
+			wantErr: true,
+			errMsg:  "target_ip and target_host are mutually exclusive",
 		},
 	}
 
@@ -366,6 +400,15 @@ func TestCompileRewrites(t *testing.T) {
 			name: "exact and wildcard rules",
 			rules: []RewriteRule{
 				{Domain: "api.example.com", TargetIP: "10.0.0.1"},
+				{Domain: "*.internal.com", TargetIP: "10.0.0.2"},
+			},
+			wantLen: 2,
+			wantErr: false,
+		},
+		{
+			name: "rules with target_host",
+			rules: []RewriteRule{
+				{Domain: "api.example.com", TargetHost: "internal.example.com"},
 				{Domain: "*.internal.com", TargetIP: "10.0.0.2"},
 			},
 			wantLen: 2,
