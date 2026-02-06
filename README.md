@@ -72,6 +72,29 @@ acl:
 
 See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.
 
+### Configuration Validation
+
+Validate your configuration file without starting the proxy:
+
+```bash
+# Use --config flag
+go-egress-proxy validate --config config.yaml
+
+# Or use CONFIG_PATH environment variable
+CONFIG_PATH=config.yaml go-egress-proxy validate
+
+# Default: reads config.yaml from current directory
+go-egress-proxy validate
+```
+
+The `validate` subcommand checks:
+- YAML syntax and structure
+- Required fields and valid values
+- ACL and rewrite pattern compilation
+- Referenced files exist and are readable (certificates, CA bundles)
+
+Exits with code 0 on success, 1 on failure.
+
 ### Environment Variable Overrides
 
 All config options can be overridden via environment variables:

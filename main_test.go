@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/tls"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"testing"
@@ -527,6 +529,92 @@ func TestOutboundHTTP2TransportConfiguration(t *testing.T) {
 	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
 		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
 	}
+}
+
+func TestRunValidate(t *testing.T) {
+	// Create temp dir with cert/key files for valid tests
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "ca.crt")
+	keyFile := filepath.Join(tmpDir, "ca.key")
+	if err := os.WriteFile(certFile, []byte("fake-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, []byte("fake-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeConfig := func(t *testing.T, content string) string {
+		t.Helper()
+		f := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(f, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("valid config with existing cert files", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "`+certFile+`"
+  mitm_key_path: "`+keyFile+`"
+  default_policy: BLOCK
+acl:
+  whitelist:
+    - "*.google.com"
+rewrites:
+  - domain: "api.example.com"
+    target_ip: "10.0.0.1"
+`)
+		if err := runValidate(cfg); err != nil {
+			t.Errorf("runValidate() unexpected error: %v", err)
+		}
+	})
+
+	t.Run("valid config with missing cert file", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "/nonexistent/ca.crt"
+  mitm_key_path: "`+keyFile+`"
+  default_policy: BLOCK
+`)
+		err := runValidate(cfg)
+		if err == nil {
+			t.Fatal("runValidate() expected error for missing cert file, got nil")
+		}
+		if !contains(err.Error(), "mitm_cert_path") {
+			t.Errorf("runValidate() error = %v, want error mentioning mitm_cert_path", err)
+		}
+	})
+
+	t.Run("invalid YAML", func(t *testing.T) {
+		cfg := writeConfig(t, `{{{invalid yaml`)
+		err := runValidate(cfg)
+		if err == nil {
+			t.Fatal("runValidate() expected error for invalid YAML, got nil")
+		}
+	})
+
+	t.Run("invalid ACL pattern", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "`+certFile+`"
+  mitm_key_path: "`+keyFile+`"
+acl:
+  whitelist:
+    - "~[invalid"
+`)
+		err := runValidate(cfg)
+		if err == nil {
+			t.Fatal("runValidate() expected error for invalid pattern, got nil")
+		}
+	})
+
+	t.Run("nonexistent config file", func(t *testing.T) {
+		err := runValidate("/nonexistent/config.yaml")
+		if err == nil {
+			t.Fatal("runValidate() expected error for nonexistent config, got nil")
+		}
+	})
 }
 
 // Helper function

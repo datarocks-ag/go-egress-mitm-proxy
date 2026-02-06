@@ -16,6 +16,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -258,10 +259,62 @@ func (c *Config) ApplyEnvOverrides() {
 	}
 }
 
+// runValidate loads and validates the configuration without starting the proxy.
+// It checks YAML parsing, pattern compilation, and file existence for referenced paths.
+func runValidate(configPath string) error {
+	cfg, _, _, err := loadAndCompileConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	// Check that all referenced files exist and are readable
+	filesToCheck := map[string]string{
+		"mitm_cert_path":     cfg.Proxy.MitmCertPath,
+		"mitm_key_path":      cfg.Proxy.MitmKeyPath,
+		"mitm_keystore_path": cfg.Proxy.MitmKeystorePath,
+		"outgoing_ca_bundle": cfg.Proxy.OutgoingCABundle,
+	}
+	for name, path := range filesToCheck {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	// Initialize structured JSON logging
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+
+	// Subcommand dispatch
+	if len(os.Args) > 1 && os.Args[1] == "validate" {
+		fs := flag.NewFlagSet("validate", flag.ExitOnError)
+		configFlag := fs.String("config", "", "path to configuration file")
+		if err := fs.Parse(os.Args[2:]); err != nil {
+			slog.Error("Failed to parse flags", "err", err)
+			os.Exit(1)
+		}
+
+		configPath := *configFlag
+		if configPath == "" {
+			configPath = os.Getenv("CONFIG_PATH")
+		}
+		if configPath == "" {
+			configPath = "config.yaml"
+		}
+
+		if err := runValidate(configPath); err != nil {
+			slog.Error("Configuration validation failed", "path", configPath, "err", err)
+			os.Exit(1)
+		}
+		slog.Info("Configuration is valid", "path", configPath)
+		return
+	}
 
 	// Load configuration from file (path configurable via CONFIG_PATH env var)
 	configPath := os.Getenv("CONFIG_PATH")

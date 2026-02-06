@@ -17,6 +17,9 @@ make certs          # Generate CA certificates
 make docker-build   # Build Docker image
 make docker-run     # Run in Docker
 make install-tools  # Install dev tools (golangci-lint, goimports)
+
+# Validate configuration without starting the proxy
+go run . validate --config config.yaml
 ```
 
 ## Testing
