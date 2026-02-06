@@ -175,6 +175,8 @@ graph LR
 
 ## Trust Chain Summary
 
+Two independent trust chains are at play. On the **client side**, the MITM CA must be installed as a trusted root so clients accept the per-domain certificates the proxy generates on the fly. On the **proxy side**, upstream server certificates are verified against the system CA store plus any custom CAs provided via `outgoing_ca_bundle` or `outgoing_ca`. These two chains are completely separate — compromising or changing one does not affect the other.
+
 ```mermaid
 graph TB
     subgraph client_store["Client Trust Store"]
