@@ -804,7 +804,7 @@ func loadMITMFromPEM(certPath, keyPath string) error {
 		return fmt.Errorf("parse keypair: %w", err)
 	}
 
-	return nil
+	return validateMITMCA()
 }
 
 func loadMITMFromKeystore(keystorePath, password string) error {
@@ -824,6 +824,24 @@ func loadMITMFromKeystore(keystorePath, password string) error {
 		Leaf:        cert,
 	}
 
+	return validateMITMCA()
+}
+
+// validateMITMCA checks that the loaded MITM certificate is actually a CA certificate.
+// A non-CA certificate would silently produce per-domain certs that clients reject.
+func validateMITMCA() error {
+	leaf := goproxy.GoproxyCa.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("parse MITM certificate for validation: %w", err)
+		}
+	}
+	if !leaf.IsCA {
+		return errors.New("MITM certificate is not a CA certificate (BasicConstraints CA:TRUE is required); " +
+			"per-domain certificates signed by a non-CA will be rejected by clients")
+	}
 	return nil
 }
 
