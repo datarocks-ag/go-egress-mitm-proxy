@@ -5,8 +5,8 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 ## Features
 
 - **Split-brain DNS** via TCP dial interception (not DNS-level)
-- **Regex-based ACL** with whitelist/blacklist support
-- **Domain rewriting** with wildcard support (`*.example.com`)
+- **ACL** with whitelist/blacklist support (exact match, wildcards, regex)
+- **Domain rewriting** with wildcard (`*.example.com`) and regex (`~<pattern>`) support
 - **Header injection** including automatic `X-Request-ID` for tracing
 - **Hot reload** via SIGHUP signal (no restart required)
 - **Environment variable overrides** for 12-factor app compatibility
@@ -59,16 +59,41 @@ rewrites:
       X-Proxy-Source: "egress-gateway"
   - domain: "*.internal.example.com"  # Wildcard match
     target_ip: "10.20.30.50"
+  - domain: "~^api[0-9]+\\.example\\.com$"  # Regex match
+    target_ip: "10.20.30.60"
 
 acl:
   whitelist:
-    - "^.*\\.google\\.com$"
+    - "*.google.com"
     - "github.com"
   blacklist:
-    - "^.*\\.tiktok\\.com$"
+    - "*.tiktok.com"
 ```
 
 See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.
+
+### Configuration Validation
+
+Validate your configuration file without starting the proxy:
+
+```bash
+# Use --config flag
+go-egress-proxy validate --config config.yaml
+
+# Or use CONFIG_PATH environment variable
+CONFIG_PATH=config.yaml go-egress-proxy validate
+
+# Default: reads config.yaml from current directory
+go-egress-proxy validate
+```
+
+The `validate` subcommand checks:
+- YAML syntax and structure
+- Required fields and valid values
+- ACL and rewrite pattern compilation
+- Referenced files exist and are readable (certificates, CA bundles)
+
+Exits with code 0 on success, 1 on failure.
 
 ### Environment Variable Overrides
 

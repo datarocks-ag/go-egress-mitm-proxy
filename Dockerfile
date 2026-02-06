@@ -12,8 +12,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /mitm-proxy .
 
 FROM alpine:3.19
 
-# Install ca-certificates for outbound TLS verification
-RUN apk --no-cache add ca-certificates && \
+# Upgrade all packages to pick up security fixes, then install ca-certificates
+RUN apk --no-cache upgrade && \
+    apk --no-cache add ca-certificates && \
     adduser -D -u 1000 proxy
 
 WORKDIR /app

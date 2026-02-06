@@ -17,6 +17,9 @@ make certs          # Generate CA certificates
 make docker-build   # Build Docker image
 make docker-run     # Run in Docker
 make install-tools  # Install dev tools (golangci-lint, goimports)
+
+# Validate configuration without starting the proxy
+go run . validate --config config.yaml
 ```
 
 ## Testing
@@ -24,6 +27,7 @@ make install-tools  # Install dev tools (golangci-lint, goimports)
 ```bash
 make test           # Run all tests with race detector
 make test-short     # Run tests without race detector (faster)
+make test-e2e       # Run end-to-end tests (requires Docker)
 go test -v -run TestConfigValidate ./...  # Run specific test
 ```
 
@@ -39,19 +43,31 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
 6. Headers injected on rewritten requests
 
+**Response Status Codes:**
+
+| Code | Meaning | When |
+|------|---------|------|
+| 200 | OK | Request succeeded through to upstream |
+| 403 | Forbidden | Request blocked by ACL (blacklisted or default BLOCK policy) |
+| 502 | Bad Gateway | Upstream unreachable: DNS lookup failed, connection refused, or connection reset |
+| 504 | Gateway Timeout | Upstream accepted the connection but did not respond in time |
+
+The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.DeadlineExceeded`) from all other upstream failures. This applies to both plain HTTP requests (via the `OnResponse` handler) and CONNECT-level failures (via `ConnectionErrHandler`).
+
 **Key Components:**
 - `RuntimeConfig` - Thread-safe config holder with RWMutex for hot reload
 - `loadConfig()` - Loads YAML, applies env overrides, validates
-- `compileACL()` / `compileRewrites()` - Pre-compiles regex patterns
-- `wildcardToRegex()` - Converts `*.example.com` to regex
+- `compileACL()` / `compileRewrites()` - Pre-compiles patterns via `wildcardToRegex()`
+- `wildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
 - `handleRequest()` - Request handler with policy evaluation
 - `makeDialer()` - Custom DialContext for split-brain DNS
 - `normalizeDomainForMetrics()` - Bounds metrics cardinality
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
-- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, etc.
+- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, etc.
 - MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
+- Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation
 - Hot reload via SIGHUP signal
 
 **Metrics:** Prometheus metrics on `:9090/metrics`:

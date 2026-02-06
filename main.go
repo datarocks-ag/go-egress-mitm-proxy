@@ -16,12 +16,15 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -91,20 +94,23 @@ var (
 )
 
 // RewriteRule defines a domain rewrite configuration.
-// When a request matches the Domain pattern, it will be routed to TargetIP
+// When a request matches the Domain pattern, it will be routed to TargetIP or TargetHost
 // and the specified Headers will be injected.
+// Exactly one of TargetIP or TargetHost must be set.
 type RewriteRule struct {
-	Domain   string            `yaml:"domain"`    // Domain pattern (exact or wildcard like "*.example.com")
-	TargetIP string            `yaml:"target_ip"` // IP address to route to (e.g., "10.0.0.1")
-	Headers  map[string]string `yaml:"headers"`   // Headers to inject into the request
+	Domain     string            `yaml:"domain"`      // Domain pattern (exact or wildcard like "*.example.com")
+	TargetIP   string            `yaml:"target_ip"`   // IP address to route to (e.g., "10.0.0.1")
+	TargetHost string            `yaml:"target_host"` // Hostname to route to (resolved via DNS at dial time)
+	Headers    map[string]string `yaml:"headers"`     // Headers to inject into the request
 }
 
 // CompiledRewriteRule holds a rewrite rule with its compiled pattern.
 type CompiledRewriteRule struct {
-	Pattern  *regexp.Regexp
-	TargetIP string
-	Headers  map[string]string
-	Original string // Original domain string for exact match optimization
+	Pattern    *regexp.Regexp
+	TargetIP   string
+	TargetHost string
+	Headers    map[string]string
+	Original   string // Original domain string for exact match optimization
 }
 
 // Config holds the complete proxy configuration loaded from YAML.
@@ -118,6 +124,7 @@ type Config struct {
 		MitmKeyPath          string `yaml:"mitm_key_path"`          // Path to MITM CA private key
 		MitmKeystorePath     string `yaml:"mitm_keystore_path"`     // Path to PKCS#12 keystore (.p12) containing cert and key
 		MitmKeystorePassword string `yaml:"mitm_keystore_password"` // Password for PKCS#12 keystore
+		BlockedLogPath       string `yaml:"blocked_log_path"`       // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -134,15 +141,19 @@ type CompiledACL struct {
 
 // RuntimeConfig holds the compiled, thread-safe runtime configuration.
 type RuntimeConfig struct {
-	mu           sync.RWMutex
-	config       Config
-	acl          CompiledACL
-	rewrites     []CompiledRewriteRule
-	rewriteExact map[string]*CompiledRewriteRule // Fast path for exact matches
+	mu            sync.RWMutex
+	config        Config
+	acl           CompiledACL
+	rewrites      []CompiledRewriteRule
+	rewriteExact  map[string]*CompiledRewriteRule // Fast path for exact matches
+	blockedLogger *slog.Logger                    // nil when blocked log feature disabled
+	blockedFile   *os.File                        // underlying file handle for Close()
 }
 
 // Update atomically updates the runtime configuration.
-func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule) {
+// It returns the previous blocked log file (if any) so the caller can close it after releasing the lock.
+func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule,
+	blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
 	exactMap := make(map[string]*CompiledRewriteRule)
 	for i := range rewrites {
 		if !strings.Contains(rewrites[i].Original, "*") {
@@ -151,11 +162,16 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 	}
 
 	rc.mu.Lock()
+	oldFile := rc.blockedFile
 	rc.config = cfg
 	rc.acl = acl
 	rc.rewrites = rewrites
 	rc.rewriteExact = exactMap
+	rc.blockedLogger = blockedLogger
+	rc.blockedFile = blockedFile
 	rc.mu.Unlock()
+
+	return oldFile
 }
 
 // Get returns the current configuration (read-locked).
@@ -163,6 +179,40 @@ func (rc *RuntimeConfig) Get() (Config, CompiledACL, []CompiledRewriteRule, map[
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 	return rc.config, rc.acl, rc.rewrites, rc.rewriteExact
+}
+
+// GetBlockedLogger returns the blocked request logger, or nil if disabled.
+func (rc *RuntimeConfig) GetBlockedLogger() *slog.Logger {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.blockedLogger
+}
+
+// CloseBlockedLog closes the blocked log file handle, if open.
+func (rc *RuntimeConfig) CloseBlockedLog() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.blockedFile != nil {
+		if err := rc.blockedFile.Close(); err != nil {
+			slog.Warn("Failed to close blocked log file", "err", err)
+		}
+		rc.blockedFile = nil
+		rc.blockedLogger = nil
+	}
+}
+
+// openBlockedLog opens (or creates) the blocked request log file and returns a JSON logger writing to it.
+// If path is empty, the feature is disabled and nil values are returned.
+func openBlockedLog(path string) (*slog.Logger, *os.File, error) {
+	if path == "" {
+		return nil, nil, nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open blocked log: %w", err)
+	}
+	logger := slog.New(slog.NewJSONHandler(f, nil))
+	return logger, f, nil
 }
 
 // Validate checks the configuration for required fields and valid values.
@@ -210,10 +260,15 @@ func (c *Config) Validate() error {
 		if rw.Domain == "" {
 			return fmt.Errorf("rewrites[%d]: domain is required", i)
 		}
-		if rw.TargetIP == "" {
-			return fmt.Errorf("rewrites[%d]: target_ip is required", i)
+		hasIP := rw.TargetIP != ""
+		hasHost := rw.TargetHost != ""
+		if hasIP && hasHost {
+			return fmt.Errorf("rewrites[%d]: target_ip and target_host are mutually exclusive", i)
 		}
-		if net.ParseIP(rw.TargetIP) == nil {
+		if !hasIP && !hasHost {
+			return fmt.Errorf("rewrites[%d]: target_ip or target_host is required", i)
+		}
+		if hasIP && net.ParseIP(rw.TargetIP) == nil {
 			return fmt.Errorf("rewrites[%d]: invalid target_ip %q", i, rw.TargetIP)
 		}
 	}
@@ -248,12 +303,79 @@ func (c *Config) ApplyEnvOverrides() {
 	if v := os.Getenv("PROXY_MITM_KEYSTORE_PASSWORD"); v != "" {
 		c.Proxy.MitmKeystorePassword = v
 	}
+	if v := os.Getenv("PROXY_BLOCKED_LOG_PATH"); v != "" {
+		c.Proxy.BlockedLogPath = v
+	}
+}
+
+// runValidate loads and validates the configuration without starting the proxy.
+// It checks YAML parsing, pattern compilation, and file existence for referenced paths.
+func runValidate(configPath string) error {
+	cfg, _, _, err := loadAndCompileConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	// Check that all referenced files exist and are readable
+	filesToCheck := map[string]string{
+		"mitm_cert_path":     cfg.Proxy.MitmCertPath,
+		"mitm_key_path":      cfg.Proxy.MitmKeyPath,
+		"mitm_keystore_path": cfg.Proxy.MitmKeystorePath,
+		"outgoing_ca_bundle": cfg.Proxy.OutgoingCABundle,
+	}
+	for name, path := range filesToCheck {
+		if path == "" {
+			continue
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("%s: close: %w", name, err)
+		}
+	}
+
+	// Validate blocked_log_path parent directory exists
+	if cfg.Proxy.BlockedLogPath != "" {
+		dir := filepath.Dir(cfg.Proxy.BlockedLogPath)
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("blocked_log_path: parent directory: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func main() {
 	// Initialize structured JSON logging
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+
+	// Subcommand dispatch
+	if len(os.Args) > 1 && os.Args[1] == "validate" {
+		fs := flag.NewFlagSet("validate", flag.ExitOnError)
+		configFlag := fs.String("config", "", "path to configuration file")
+		if err := fs.Parse(os.Args[2:]); err != nil {
+			slog.Error("Failed to parse flags", "err", err)
+			os.Exit(1)
+		}
+
+		configPath := *configFlag
+		if configPath == "" {
+			configPath = os.Getenv("CONFIG_PATH")
+		}
+		if configPath == "" {
+			configPath = "config.yaml"
+		}
+
+		if err := runValidate(configPath); err != nil {
+			slog.Error("Configuration validation failed", "path", configPath, "err", err)
+			os.Exit(1)
+		}
+		slog.Info("Configuration is valid", "path", configPath)
+		return
+	}
 
 	// Load configuration from file (path configurable via CONFIG_PATH env var)
 	configPath := os.Getenv("CONFIG_PATH")
@@ -268,15 +390,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Open blocked request log (optional)
+	blockedLogger, blockedFile, err := openBlockedLog(cfg.Proxy.BlockedLogPath)
+	if err != nil {
+		slog.Error("Failed to open blocked log", "path", cfg.Proxy.BlockedLogPath, "err", err)
+		os.Exit(1)
+	}
+
 	// Initialize runtime config (thread-safe, reloadable)
 	runtimeCfg := &RuntimeConfig{}
-	runtimeCfg.Update(cfg, acl, rewrites)
+	_ = runtimeCfg.Update(cfg, acl, rewrites, blockedLogger, blockedFile)
 
 	// Load MITM CA certificate and key for TLS interception
 	if err := loadMITMCertificate(cfg); err != nil {
 		slog.Error("Failed to load MITM certificate", "err", err)
 		os.Exit(1)
 	}
+
+	// Log MITM CA certificate details
+	logMITMCertInfo()
 
 	// Initialize the proxy server
 	proxy := goproxy.NewProxyHttpServer()
@@ -287,13 +419,41 @@ func main() {
 		return handleRequest(r, ctx, runtimeCfg)
 	})
 
-	// Register response handler for metrics
+	// Register response handler for metrics and upstream error handling
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp != nil {
 			recordResponseMetrics(resp)
+			return resp
+		}
+		if ctx.Error != nil {
+			status, reason := upstreamErrorResponse(ctx.Error)
+			slog.Warn("Upstream connection error",
+				"host", ctx.Req.URL.Host,
+				"status", status,
+				"err", ctx.Error)
+			return goproxy.NewResponse(ctx.Req,
+				goproxy.ContentTypeText,
+				status,
+				reason)
 		}
 		return resp
 	})
+
+	// Handle CONNECT-level upstream errors with proper status codes instead of default 502
+	proxy.ConnectionErrHandler = func(w io.Writer, ctx *goproxy.ProxyCtx, err error) {
+		status, reason := upstreamErrorResponse(err)
+		slog.Warn("Upstream connection error",
+			"host", ctx.Req.Host,
+			"status", status,
+			"err", err)
+		errStr := fmt.Sprintf(
+			"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s",
+			status, reason,
+			len(reason),
+			reason,
+		)
+		io.WriteString(w, errStr) //nolint:errcheck // best-effort response to client
+	}
 
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
 	// ForceAttemptHTTP2 is required because we set a custom TLSClientConfig and DialContext.
@@ -359,7 +519,18 @@ func main() {
 				configLoadErrors.Inc()
 				continue
 			}
-			runtimeCfg.Update(newCfg, newACL, newRewrites)
+			newBlockedLogger, newBlockedFile, blErr := openBlockedLog(newCfg.Proxy.BlockedLogPath)
+			if blErr != nil {
+				slog.Error("Failed to open blocked log on reload", "path", newCfg.Proxy.BlockedLogPath, "err", blErr)
+				configLoadErrors.Inc()
+				continue
+			}
+			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newBlockedLogger, newBlockedFile)
+			if oldFile != nil {
+				if err := oldFile.Close(); err != nil {
+					slog.Warn("Failed to close rotated blocked log file", "err", err)
+				}
+			}
 			configReloads.Inc()
 			slog.Info("Configuration reloaded successfully",
 				"rewrites", len(newRewrites),
@@ -382,6 +553,7 @@ func main() {
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 			slog.Error("Metrics server shutdown error", "err", err)
 		}
+		runtimeCfg.CloseBlockedLog()
 	}()
 
 	// Start the proxy server
@@ -391,7 +563,9 @@ func main() {
 		"default_policy", cfg.Proxy.DefaultPolicy,
 		"rewrites", len(rewrites),
 		"whitelist_rules", len(acl.Whitelist),
-		"blacklist_rules", len(acl.Blacklist))
+		"blacklist_rules", len(acl.Blacklist),
+		"outgoing_ca_bundle", cfg.Proxy.OutgoingCABundle,
+		"blocked_log_path", cfg.Proxy.BlockedLogPath)
 
 	if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("Proxy server error", "err", err)
@@ -468,6 +642,37 @@ func loadMITMFromKeystore(keystorePath, password string) error {
 	return nil
 }
 
+// logMITMCertInfo parses the loaded MITM CA certificate and logs its details.
+func logMITMCertInfo() {
+	if len(goproxy.GoproxyCa.Certificate) == 0 {
+		return
+	}
+
+	leaf := goproxy.GoproxyCa.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		if err != nil {
+			slog.Warn("Failed to parse MITM CA certificate for logging", "err", err)
+			return
+		}
+	}
+
+	slog.Info("MITM CA certificate loaded",
+		"subject", leaf.Subject.String(),
+		"issuer", leaf.Issuer.String(),
+		"serial", leaf.SerialNumber.String(),
+		"not_before", leaf.NotBefore.Format(time.RFC3339),
+		"not_after", leaf.NotAfter.Format(time.RFC3339),
+		"is_ca", leaf.IsCA)
+
+	if time.Now().After(leaf.NotAfter) {
+		slog.Warn("MITM CA certificate has EXPIRED", "expired_at", leaf.NotAfter.Format(time.RFC3339))
+	} else if time.Until(leaf.NotAfter) < 30*24*time.Hour {
+		slog.Warn("MITM CA certificate expires soon", "expires_in_days", int(time.Until(leaf.NotAfter).Hours()/24))
+	}
+}
+
 // handleRequest processes each incoming request through the policy engine.
 // It evaluates rules in order: rewrites -> blacklist -> whitelist -> default policy.
 func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConfig) (*http.Request, *http.Response) {
@@ -536,6 +741,16 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 
 	// Block denied requests
 	if action == "BLACK-LISTED" || action == "BLOCKED" {
+		if bl := runtimeCfg.GetBlockedLogger(); bl != nil {
+			bl.LogAttrs(context.Background(), slog.LevelInfo, "blocked",
+				slog.String("request_id", requestID),
+				slog.String("client", r.RemoteAddr),
+				slog.String("host", host),
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("action", action),
+			)
+		}
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
 	}
 
@@ -547,6 +762,19 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 	}
 
 	return r, nil
+}
+
+// upstreamErrorResponse returns the HTTP status code and reason text for an upstream error.
+// Timeouts yield 504 Gateway Timeout; all other failures (DNS, refused, reset) yield 502 Bad Gateway.
+func upstreamErrorResponse(err error) (int, string) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return http.StatusGatewayTimeout, "Gateway Timeout"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout, "Gateway Timeout"
+	}
+	return http.StatusBadGateway, "Bad Gateway"
 }
 
 // recordResponseMetrics records metrics from the response.
@@ -574,13 +802,15 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		_, _, rewrites, rewriteExact := runtimeCfg.Get()
 
 		// Check for rewrite (fast path first)
-		var targetIP string
+		var targetIP, targetHost string
 		if rw, ok := rewriteExact[host]; ok {
 			targetIP = rw.TargetIP
+			targetHost = rw.TargetHost
 		} else {
 			for i := range rewrites {
 				if rewrites[i].Pattern.MatchString(host) {
 					targetIP = rewrites[i].TargetIP
+					targetHost = rewrites[i].TargetHost
 					break
 				}
 			}
@@ -589,6 +819,9 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		if targetIP != "" {
 			addr = net.JoinHostPort(targetIP, port)
 			slog.Debug("Rewriting dial", "original", host, "target", targetIP)
+		} else if targetHost != "" {
+			addr = net.JoinHostPort(targetHost, port)
+			slog.Debug("Rewriting dial", "original", host, "target", targetHost)
 		}
 
 		conn, err := (&net.Dialer{
@@ -690,19 +923,20 @@ func matches(host string, patterns []*regexp.Regexp) bool {
 	return false
 }
 
-// compileACL compiles all regex patterns in the configuration.
+// compileACL compiles all patterns in the configuration using wildcardToRegex.
+// Patterns support exact match, wildcards (*.example.com), and raw regex (~<pattern>).
 // Returns an error if any pattern is invalid.
 func compileACL(cfg Config) (CompiledACL, error) {
 	c := CompiledACL{}
 	for i, p := range cfg.ACL.Whitelist {
-		re, err := regexp.Compile(p)
+		re, err := wildcardToRegex(p)
 		if err != nil {
 			return CompiledACL{}, fmt.Errorf("invalid whitelist pattern[%d] %q: %w", i, p, err)
 		}
 		c.Whitelist = append(c.Whitelist, re)
 	}
 	for i, p := range cfg.ACL.Blacklist {
-		re, err := regexp.Compile(p)
+		re, err := wildcardToRegex(p)
 		if err != nil {
 			return CompiledACL{}, fmt.Errorf("invalid blacklist pattern[%d] %q: %w", i, p, err)
 		}
@@ -720,10 +954,11 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 			return nil, fmt.Errorf("invalid rewrite domain[%d] %q: %w", i, rule.Domain, err)
 		}
 		compiled = append(compiled, CompiledRewriteRule{
-			Pattern:  pattern,
-			TargetIP: rule.TargetIP,
-			Headers:  rule.Headers,
-			Original: rule.Domain,
+			Pattern:    pattern,
+			TargetIP:   rule.TargetIP,
+			TargetHost: rule.TargetHost,
+			Headers:    rule.Headers,
+			Original:   rule.Domain,
 		})
 	}
 	return compiled, nil
@@ -734,7 +969,12 @@ func compileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 //   - Exact match: "example.com" -> "^example\.com$"
 //   - Wildcard: "*.example.com" -> "^.+\.example\.com$" (matches any subdomain depth)
 //   - Full wildcard: "*" -> ".*"
+//   - Raw regex: "~<regex>" -> compiled as-is (no escaping/anchoring)
 func wildcardToRegex(pattern string) (*regexp.Regexp, error) {
+	if strings.HasPrefix(pattern, "~") {
+		return regexp.Compile(pattern[1:])
+	}
+
 	if pattern == "*" {
 		return regexp.Compile(".*")
 	}
