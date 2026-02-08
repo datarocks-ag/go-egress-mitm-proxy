@@ -177,6 +177,7 @@ type RuntimeConfig struct {
 	acl           CompiledACL
 	rewrites      []CompiledRewriteRule
 	rewriteExact  map[string]*CompiledRewriteRule // Fast path for exact matches
+	tlsConfig     *tls.Config                     // Outbound TLS config (rebuilt on reload)
 	blockedLogger *slog.Logger                    // nil when blocked log feature disabled
 	blockedFile   *os.File                        // underlying file handle for Close()
 }
@@ -184,7 +185,7 @@ type RuntimeConfig struct {
 // Update atomically updates the runtime configuration.
 // It returns the previous blocked log file (if any) so the caller can close it after releasing the lock.
 func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule,
-	blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
+	tlsConfig *tls.Config, blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
 	// Collect domains that have at least one path-based rule.
 	// These domains must be excluded from the exact map so that all their rules
 	// are evaluated sequentially (preserving YAML order / first-match-wins).
@@ -210,6 +211,7 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 	rc.acl = acl
 	rc.rewrites = rewrites
 	rc.rewriteExact = exactMap
+	rc.tlsConfig = tlsConfig
 	rc.blockedLogger = blockedLogger
 	rc.blockedFile = blockedFile
 	rc.mu.Unlock()
@@ -218,10 +220,10 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 }
 
 // Get returns the current configuration (read-locked).
-func (rc *RuntimeConfig) Get() (Config, CompiledACL, []CompiledRewriteRule, map[string]*CompiledRewriteRule) {
+func (rc *RuntimeConfig) Get() (Config, CompiledACL, []CompiledRewriteRule, map[string]*CompiledRewriteRule, *tls.Config) {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	return rc.config, rc.acl, rc.rewrites, rc.rewriteExact
+	return rc.config, rc.acl, rc.rewrites, rc.rewriteExact, rc.tlsConfig
 }
 
 // GetBlockedLogger returns the blocked request logger, or nil if disabled.
@@ -418,6 +420,15 @@ func runValidate(configPath string) error {
 			return fmt.Errorf("%s: close: %w", name, err)
 		}
 	}
+	for i, path := range cfg.Proxy.OutgoingCA {
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("outgoing_ca[%d]: %w", i, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("outgoing_ca[%d]: close: %w", i, err)
+		}
+	}
 
 	// Validate blocked_log_path parent directory exists
 	if cfg.Proxy.BlockedLogPath != "" {
@@ -531,9 +542,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build base TLS configuration for outbound connections.
+	baseTLSConfig := buildOutboundTLSConfig(cfg)
+
 	// Initialize runtime config (thread-safe, reloadable)
 	runtimeCfg := &RuntimeConfig{}
-	_ = runtimeCfg.Update(cfg, acl, rewrites, blockedLogger, blockedFile)
+	_ = runtimeCfg.Update(cfg, acl, rewrites, baseTLSConfig, blockedLogger, blockedFile)
 
 	// Load MITM CA certificate and key for TLS interception
 	if err := loadMITMCertificate(cfg); err != nil {
@@ -631,18 +645,6 @@ func main() {
 		io.WriteString(w, errStr) //nolint:errcheck // best-effort response to client
 	}
 
-	// Build base TLS configuration for outbound connections.
-	baseTLSConfig := &tls.Config{
-		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingCA, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
-	}
-
-	if cfg.Proxy.InsecureSkipVerify {
-		slog.Warn("Global insecure_skip_verify is ENABLED — upstream TLS certificate verification is disabled")
-		baseTLSConfig.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured global insecure for dev/test
-	}
-
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
 	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
 	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
@@ -654,7 +656,7 @@ func main() {
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DialContext:           makeDialer(runtimeCfg),
-		DialTLSContext:        makeTLSDialer(runtimeCfg, baseTLSConfig),
+		DialTLSContext:        makeTLSDialer(runtimeCfg),
 	}
 
 	// Setup metrics and health endpoints
@@ -709,7 +711,8 @@ func main() {
 				configLoadErrors.Inc()
 				continue
 			}
-			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newBlockedLogger, newBlockedFile)
+			newTLSConfig := buildOutboundTLSConfig(newCfg)
+			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newTLSConfig, newBlockedLogger, newBlockedFile)
 			if oldFile != nil {
 				if err := oldFile.Close(); err != nil {
 					slog.Warn("Failed to close rotated blocked log file", "err", err)
@@ -995,7 +998,7 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 	requestID := generateRequestID()
 	r.Header.Set("X-Request-ID", requestID)
 
-	cfg, acl, rewrites, rewriteExact := runtimeCfg.Get()
+	cfg, acl, rewrites, rewriteExact, _ := runtimeCfg.Get()
 
 	host := r.URL.Hostname()
 	action := "BLOCKED"
@@ -1172,7 +1175,7 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		// Check context first (set by handleRequest for path-based rewrites)
 		rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
 		if !ok {
-			_, _, rewrites, rewriteExact := runtimeCfg.Get()
+			_, _, rewrites, rewriteExact, _ := runtimeCfg.Get()
 			rw = lookupRewrite(host, rewrites, rewriteExact)
 		}
 
@@ -1202,7 +1205,7 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 // rewrite IP substitution followed by a TLS handshake with per-connection configuration.
 // This enables per-rewrite InsecureSkipVerify without affecting other connections.
 // Path-based rewrites are passed via request context from handleRequest.
-func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func makeTLSDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -1210,7 +1213,7 @@ func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ct
 			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 		}
 
-		cfg, _, rewrites, rewriteExact := runtimeCfg.Get()
+		cfg, _, rewrites, rewriteExact, baseTLSConfig := runtimeCfg.Get()
 
 		// Check context first (set by handleRequest for path-based rewrites)
 		rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
@@ -1346,6 +1349,20 @@ func loadCertPool(caBundle string, certPaths []string, truststorePath, truststor
 		}
 	}
 	return pool
+}
+
+// buildOutboundTLSConfig builds a tls.Config for outbound connections from the given proxy config.
+func buildOutboundTLSConfig(cfg Config) *tls.Config {
+	tlsCfg := &tls.Config{
+		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingCA, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+	if cfg.Proxy.InsecureSkipVerify {
+		slog.Warn("Global insecure_skip_verify is ENABLED — upstream TLS certificate verification is disabled")
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured global insecure for dev/test
+	}
+	return tlsCfg
 }
 
 // loadTruststoreCerts extracts CA certificates from a PKCS#12 (.p12) truststore.

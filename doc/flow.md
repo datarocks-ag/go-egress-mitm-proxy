@@ -7,11 +7,11 @@ This document describes the complete flow of an HTTPS request through the MITM p
 There are **four** certificate/key artifacts involved in a proxied HTTPS connection:
 
 | # | Artifact | Who holds it | Purpose |
-|---|----------|-------------|---------|
+|---|----------|--------------|---------|
 | 1 | **MITM CA Certificate** (`ca.crt`) | Proxy + all clients (trust store) | Root of trust for intercepted connections |
 | 2 | **MITM CA Private Key** (`ca.key`) | Proxy only | Signs per-domain certificates on the fly |
 | 3 | **Per-domain certificate** | Generated in memory by proxy | Presented to the client, impersonates the real server |
-| 4 | **Upstream server's real certificate** | Origin server | Verified by the proxy using system CAs (+ optional `outgoing_ca_bundle`) |
+| 4 | **Upstream server's real certificate** | Origin server | Verified by the proxy using system CAs (+ optional `outgoing_ca_bundle`, `outgoing_ca`, `outgoing_truststore_*`) |
 
 ### Certificate Generation
 
@@ -21,8 +21,12 @@ The MITM CA is generated once and distributed ahead of time:
 # scripts/gen-ca.sh
 openssl genrsa -out certs/ca.key 4096
 openssl req -x509 -new -nodes -key certs/ca.key -sha256 -days 3650 -out certs/ca.crt \
-  -subj "/C=US/ST=State/L=City/O=ProxyCorp/OU=Security/CN=Internal-MITM-CA"
+  -subj "/C=US/ST=State/L=City/O=ProxyCorp/OU=Security/CN=Internal-MITM-CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
 ```
+
+> **Note:** The `-addext` flags are required so the generated certificate has `CA:TRUE` set in its Basic Constraints extension. The proxy validates this at startup and will refuse to start if the MITM certificate is not a CA.
 
 Alternatively, the CA can be provided as a PKCS#12 keystore (`.p12`) instead of separate PEM files.
 
@@ -61,7 +65,9 @@ When the proxy intercepts a CONNECT tunnel, `goproxy` dynamically generates a TL
 
 7. **Upstream TLS handshake** -- The proxy acts as a TLS client toward the origin server. It verifies the server's real certificate against:
    - System CA trust store
-   - Optional `outgoing_ca_bundle` (for internal/corporate CAs)
+   - Optional `outgoing_ca_bundle` (PEM bundle file)
+   - Optional `outgoing_ca` (list of individual PEM cert files)
+   - Optional `outgoing_truststore_*` (PKCS#12 truststore)
 
 8. **Request forwarded** -- The proxy forwards the (potentially modified) request to the upstream server. For rewritten domains, custom headers are injected.
 
@@ -121,7 +127,7 @@ sequenceDiagram
             P->>U: TCP connect to target_ip:443
             P->>U: ClientHello (SNI: api.example.com)
             U->>P: ServerHello + Certificate (real cert)
-            note left of P: Proxy verifies real cert against<br/>system CAs + outgoing_ca_bundle
+            note left of P: Proxy verifies real cert against<br/>system CAs + custom CA config
             P->>U: Finished
             U->>P: Finished
         end
@@ -135,7 +141,7 @@ sequenceDiagram
             P->>U: TCP connect to api.example.com:443 (via DNS)
             P->>U: ClientHello (SNI: api.example.com)
             U->>P: ServerHello + Certificate (real cert)
-            note left of P: Proxy verifies real cert against<br/>system CAs + outgoing_ca_bundle
+            note left of P: Proxy verifies real cert against<br/>system CAs + custom CA config
             P->>U: Finished
             U->>P: Finished
         end
@@ -175,7 +181,7 @@ graph LR
 
 ## Trust Chain Summary
 
-Two independent trust chains are at play. On the **client side**, the MITM CA must be installed as a trusted root so clients accept the per-domain certificates the proxy generates on the fly. On the **proxy side**, upstream server certificates are verified against the system CA store plus any custom CAs provided via `outgoing_ca_bundle` or `outgoing_ca`. These two chains are completely separate — compromising or changing one does not affect the other.
+Two independent trust chains are at play. On the **client side**, the MITM CA must be installed as a trusted root so clients accept the per-domain certificates the proxy generates on the fly. On the **proxy side**, upstream server certificates are verified against the system CA store plus any custom CAs provided via `outgoing_ca_bundle`, `outgoing_ca`, or `outgoing_truststore_*`. These two chains are completely separate — compromising or changing one does not affect the other.
 
 ```mermaid
 graph TB
@@ -186,7 +192,7 @@ graph TB
 
     subgraph proxy_store["Proxy Trust Store"]
         SysCA2["System CAs<br/>(DigiCert, Let's Encrypt, ...)"]
-        CustomCA["outgoing_ca_bundle<br/>(optional, for internal CAs)"]
+        CustomCA["outgoing_ca_bundle / outgoing_ca<br/>outgoing_truststore_*<br/>(optional, for internal CAs)"]
     end
 
     subgraph tls1["TLS Session #1: Client ↔ Proxy"]
