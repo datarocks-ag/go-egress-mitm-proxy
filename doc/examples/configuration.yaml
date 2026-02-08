@@ -3,6 +3,10 @@ proxy:
   metrics_port: "9090"
   default_policy: "BLOCK"   # Options: ALLOW, BLOCK
   outgoing_ca_bundle: ""    # Optional: path to PEM CA bundle for upstream TLS verification
+  outgoing_ca: []           # Optional: list of individual CA cert files (can be combined with bundle)
+  # outgoing_ca:
+  #   - "certs/internal-ca.crt"
+  #   - "certs/partner-ca.crt"
 
   # Optional: PKCS#12 truststore for upstream TLS verification (additive with outgoing_ca_bundle)
   # outgoing_truststore_path: "certs/upstream-cas.p12"

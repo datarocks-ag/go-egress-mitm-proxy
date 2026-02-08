@@ -704,9 +704,9 @@ func TestRuntimeConfigUpdateAndGet(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(cfg, acl, rewrites, nil, nil)
+	_ = rc.Update(cfg, acl, rewrites, nil, nil, nil)
 
-	gotCfg, gotACL, gotRewrites, gotExact := rc.Get()
+	gotCfg, gotACL, gotRewrites, gotExact, _ := rc.Get()
 
 	if gotCfg.Proxy.Port != "8080" {
 		t.Errorf("Get() config.Port = %v, want %v", gotCfg.Proxy.Port, "8080")
@@ -817,7 +817,7 @@ func TestBlockedLoggerWritesJSON(t *testing.T) {
 func TestRuntimeConfigBlockedLogger(t *testing.T) {
 	t.Run("nil when disabled", func(t *testing.T) {
 		rc := &RuntimeConfig{}
-		_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil)
+		_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil, nil)
 
 		if got := rc.GetBlockedLogger(); got != nil {
 			t.Error("GetBlockedLogger() should return nil when disabled")
@@ -832,7 +832,7 @@ func TestRuntimeConfigBlockedLogger(t *testing.T) {
 		}
 
 		rc := &RuntimeConfig{}
-		_ = rc.Update(Config{}, CompiledACL{}, nil, logger, f)
+		_ = rc.Update(Config{}, CompiledACL{}, nil, nil, logger, f)
 
 		if got := rc.GetBlockedLogger(); got == nil {
 			t.Error("GetBlockedLogger() should return non-nil logger when enabled")
@@ -1429,8 +1429,8 @@ func TestRuntimeConfigUpdateExcludesPathDomains(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil)
-	_, _, _, exactMap := rc.Get()
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil, nil)
+	_, _, _, exactMap, _ := rc.Get()
 
 	// api.example.com has at least one path-pattern rule → excluded from exact map
 	if _, ok := exactMap["api.example.com"]; ok {
@@ -1464,8 +1464,8 @@ func TestRuntimeConfigUpdateExactMapFirstMatchWins(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil)
-	_, _, _, exactMap := rc.Get()
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil, nil)
+	_, _, _, exactMap, _ := rc.Get()
 
 	rw, ok := exactMap["dup.example.com"]
 	if !ok {
@@ -1509,7 +1509,7 @@ func TestHandleRequestPathRewrite(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil, nil)
 
 	tests := []struct {
 		name          string
@@ -1581,7 +1581,7 @@ func TestHandleRequestPathNoMatchBlocked(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil, nil)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://api.example.com/v2/items", nil)
 	if err != nil {
@@ -1613,7 +1613,7 @@ func TestHandleRequestDropHeaders(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil, nil)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://drop.example.com/test", nil)
 	if err != nil {
@@ -1662,7 +1662,7 @@ func TestHandleRequestTargetScheme(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil, nil)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://scheme.example.com/test", nil)
 	if err != nil {
@@ -1693,7 +1693,7 @@ func TestHandleRequestTargetSchemeEmpty(t *testing.T) {
 		},
 	}
 
-	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+	_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil, nil)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://noscheme.example.com/test", nil)
 	if err != nil {
@@ -1735,7 +1735,7 @@ func TestDialerUsesContextRewrite(t *testing.T) {
 	}()
 
 	rc := &RuntimeConfig{}
-	_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil)
+	_ = rc.Update(Config{}, CompiledACL{}, nil, nil, nil, nil)
 
 	dial := makeDialer(rc)
 
@@ -1806,21 +1806,21 @@ func TestLoadCertPoolWithTruststore(t *testing.T) {
 	certPath, p12Path := generateTestP12(t, dir, "Pool Test CA", "Test Org", "pooltest")
 
 	t.Run("pool with truststore only", func(t *testing.T) {
-		pool := loadCertPool("", p12Path, "pooltest")
+		pool := loadCertPool("", nil, p12Path, "pooltest")
 		if pool == nil {
 			t.Fatal("loadCertPool() returned nil")
 		}
 	})
 
 	t.Run("pool with PEM bundle and truststore", func(t *testing.T) {
-		pool := loadCertPool(certPath, p12Path, "pooltest")
+		pool := loadCertPool(certPath, nil, p12Path, "pooltest")
 		if pool == nil {
 			t.Fatal("loadCertPool() returned nil")
 		}
 	})
 
 	t.Run("pool with no extra certs", func(t *testing.T) {
-		pool := loadCertPool("", "", "")
+		pool := loadCertPool("", nil, "", "")
 		if pool == nil {
 			t.Fatal("loadCertPool() returned nil")
 		}
@@ -1828,13 +1828,89 @@ func TestLoadCertPoolWithTruststore(t *testing.T) {
 
 	t.Run("pool with bad truststore path logs warning", func(t *testing.T) {
 		output := captureLogs(t, func() {
-			pool := loadCertPool("", "/nonexistent/truststore.p12", "pass")
+			pool := loadCertPool("", nil, "/nonexistent/truststore.p12", "pass")
 			if pool == nil {
 				t.Fatal("loadCertPool() returned nil")
 			}
 		})
 		if !contains(output, "Failed to load truststore") {
 			t.Errorf("expected warning about failed truststore load, got: %s", output)
+		}
+	})
+}
+
+func TestLoadCertPoolWithCertPaths(t *testing.T) {
+	// Helper: generate a self-signed CA cert PEM and write to file
+	writePEMCert := func(t *testing.T, dir, name string) string {
+		t.Helper()
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		template := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: name},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		path := filepath.Join(dir, name+".crt")
+		if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	dir := t.TempDir()
+	cert1 := writePEMCert(t, dir, "ca1")
+	cert2 := writePEMCert(t, dir, "ca2")
+
+	t.Run("individual cert files appended", func(t *testing.T) {
+		pool := loadCertPool("", []string{cert1, cert2}, "", "")
+		if pool == nil {
+			t.Fatal("loadCertPool() returned nil")
+		}
+	})
+
+	t.Run("combined bundle and cert files", func(t *testing.T) {
+		pool := loadCertPool(cert1, []string{cert2}, "", "")
+		if pool == nil {
+			t.Fatal("loadCertPool() returned nil")
+		}
+	})
+
+	t.Run("unreadable cert path logs warning", func(t *testing.T) {
+		output := captureLogs(t, func() {
+			pool := loadCertPool("", []string{"/nonexistent/cert.crt"}, "", "")
+			if pool == nil {
+				t.Fatal("loadCertPool() returned nil")
+			}
+		})
+		if !contains(output, "Failed to read CA cert") {
+			t.Errorf("expected warning about unreadable cert, got: %s", output)
+		}
+	})
+
+	t.Run("invalid PEM content logs warning", func(t *testing.T) {
+		badPath := filepath.Join(dir, "bad.crt")
+		if err := os.WriteFile(badPath, []byte("not-a-pem"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		output := captureLogs(t, func() {
+			pool := loadCertPool("", []string{badPath}, "", "")
+			if pool == nil {
+				t.Fatal("loadCertPool() returned nil")
+			}
+		})
+		if !contains(output, "Failed to parse CA cert") {
+			t.Errorf("expected warning about invalid PEM, got: %s", output)
 		}
 	})
 }
@@ -1892,6 +1968,60 @@ proxy:
 		}
 		if !contains(err.Error(), "outgoing_truststore_path") {
 			t.Errorf("runValidate() error = %v, want error mentioning outgoing_truststore_path", err)
+		}
+	})
+}
+
+func TestRunValidateOutgoingCA(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "ca.crt")
+	keyFile := filepath.Join(tmpDir, "ca.key")
+	caFile := filepath.Join(tmpDir, "extra-ca.crt")
+	for _, f := range []string{certFile, keyFile, caFile} {
+		if err := os.WriteFile(f, []byte("fake"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeConfig := func(t *testing.T, content string) string {
+		t.Helper()
+		f := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(f, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("valid outgoing_ca files pass validation", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "`+certFile+`"
+  mitm_key_path: "`+keyFile+`"
+  default_policy: BLOCK
+  outgoing_ca:
+    - "`+caFile+`"
+`)
+		if err := runValidate(cfg); err != nil {
+			t.Errorf("runValidate() unexpected error: %v", err)
+		}
+	})
+
+	t.Run("missing outgoing_ca file fails validation", func(t *testing.T) {
+		cfg := writeConfig(t, `
+proxy:
+  mitm_cert_path: "`+certFile+`"
+  mitm_key_path: "`+keyFile+`"
+  default_policy: BLOCK
+  outgoing_ca:
+    - "`+caFile+`"
+    - "/nonexistent/missing-ca.crt"
+`)
+		err := runValidate(cfg)
+		if err == nil {
+			t.Fatal("runValidate() expected error for missing outgoing_ca file, got nil")
+		}
+		if !contains(err.Error(), "outgoing_ca[1]") {
+			t.Errorf("runValidate() error = %v, want error mentioning outgoing_ca[1]", err)
 		}
 	})
 }
@@ -2017,11 +2147,11 @@ func TestMakeTLSDialer(t *testing.T) {
 	}
 
 	// Helper to create a RuntimeConfig with given settings
-	setupRuntime := func(insecureGlobal bool, rewrites []CompiledRewriteRule) *RuntimeConfig {
+	setupRuntime := func(insecureGlobal bool, rewrites []CompiledRewriteRule, tlsConfig *tls.Config) *RuntimeConfig {
 		rc := &RuntimeConfig{}
 		cfg := Config{}
 		cfg.Proxy.InsecureSkipVerify = insecureGlobal
-		_ = rc.Update(cfg, CompiledACL{}, rewrites, nil, nil)
+		_ = rc.Update(cfg, CompiledACL{}, rewrites, tlsConfig, nil, nil)
 		return rc
 	}
 
@@ -2035,10 +2165,10 @@ func TestMakeTLSDialer(t *testing.T) {
 				Insecure: true,
 			},
 		}
-		rc := setupRuntime(false, rewrites)
 		baseTLS := &tls.Config{MinVersion: tls.VersionTLS12} // empty RootCAs = system pool (won't trust test CA)
+		rc := setupRuntime(false, rewrites, baseTLS)
 
-		dial := makeTLSDialer(rc, baseTLS)
+		dial := makeTLSDialer(rc)
 		conn, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-insecure.test", srvPort))
 		if err != nil {
 			t.Fatalf("dial failed: %v", err)
@@ -2056,13 +2186,13 @@ func TestMakeTLSDialer(t *testing.T) {
 				Insecure: false,
 			},
 		}
-		rc := setupRuntime(false, rewrites)
 		baseTLS := &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    caPool,
 		}
+		rc := setupRuntime(false, rewrites, baseTLS)
 
-		dial := makeTLSDialer(rc, baseTLS)
+		dial := makeTLSDialer(rc)
 		conn, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-trusted.test", srvPort))
 		if err != nil {
 			t.Fatalf("dial failed: %v", err)
@@ -2080,10 +2210,10 @@ func TestMakeTLSDialer(t *testing.T) {
 				Insecure: false,
 			},
 		}
-		rc := setupRuntime(false, rewrites)
 		baseTLS := &tls.Config{MinVersion: tls.VersionTLS12} // empty = system pool, won't trust test CA
+		rc := setupRuntime(false, rewrites, baseTLS)
 
-		dial := makeTLSDialer(rc, baseTLS)
+		dial := makeTLSDialer(rc)
 		_, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-trusted.test", srvPort))
 		if err == nil {
 			t.Fatal("expected TLS handshake error for untrusted cert")
@@ -2100,10 +2230,10 @@ func TestMakeTLSDialer(t *testing.T) {
 				Insecure: false,
 			},
 		}
-		rc := setupRuntime(true, rewrites) // global insecure
 		baseTLS := &tls.Config{MinVersion: tls.VersionTLS12}
+		rc := setupRuntime(true, rewrites, baseTLS) // global insecure
 
-		dial := makeTLSDialer(rc, baseTLS)
+		dial := makeTLSDialer(rc)
 		conn, err := dial(context.Background(), "tcp", net.JoinHostPort("rewrite-trusted.test", srvPort))
 		if err != nil {
 			t.Fatalf("dial failed: %v", err)

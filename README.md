@@ -77,6 +77,9 @@ proxy:
   metrics_port: "9090"      # Metrics/health endpoint port
   default_policy: "BLOCK"   # ALLOW or BLOCK unmatched hosts
   outgoing_ca_bundle: ""    # Optional: PEM CA bundle for upstream TLS
+  outgoing_ca:              # Optional: list of individual CA cert files
+    - "certs/internal-ca.crt"
+    - "certs/partner-ca.crt"
   blocked_log_path: ""      # Optional: JSON log file for blocked requests
 
   # Optional: PKCS#12 truststore for upstream TLS (additive with outgoing_ca_bundle)
@@ -224,6 +227,8 @@ All config options can be overridden via environment variables:
 | `PROXY_BLOCKED_LOG_PATH` | Path to JSON log file for blocked requests |
 
 > **Note:** Provide either `PROXY_MITM_CERT_PATH`/`PROXY_MITM_KEY_PATH` **or** `PROXY_MITM_KEYSTORE_PATH`, not both.
+>
+> **Note:** `outgoing_ca` (list of individual CA cert files) is YAML-only and has no environment variable override. It can be used alongside `outgoing_ca_bundle` — all certificates are merged into one trust pool.
 
 ## Development
 

@@ -142,19 +142,20 @@ var rewriteCtxKey = rewriteCtxKeyType{}
 // Config holds the complete proxy configuration loaded from YAML.
 type Config struct {
 	Proxy struct {
-		Port                       string `yaml:"port"`                         // Proxy listen port (default: "8080")
-		MetricsPort                string `yaml:"metrics_port"`                 // Metrics/health endpoint port (default: "9090")
-		DefaultPolicy              string `yaml:"default_policy"`               // "ALLOW" or "BLOCK" for unmatched domains
-		OutgoingCABundle           string `yaml:"outgoing_ca_bundle"`           // Optional CA bundle for upstream TLS
-		OutgoingTruststorePath     string `yaml:"outgoing_truststore_path"`     // Optional PKCS#12 truststore for upstream TLS
-		OutgoingTruststorePassword string `yaml:"outgoing_truststore_password"` // Password for outgoing truststore
-		InsecureSkipVerify         bool   `yaml:"insecure_skip_verify"`         // Disable TLS verification globally
-		MitmCertPath               string `yaml:"mitm_cert_path"`               // Path to MITM CA certificate
-		MitmKeyPath                string `yaml:"mitm_key_path"`                // Path to MITM CA private key
-		MitmKeystorePath           string `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
-		MitmKeystorePassword       string `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
-		MitmOrg                    string `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
-		BlockedLogPath             string `yaml:"blocked_log_path"`             // Optional path for blocked request log
+		Port                       string   `yaml:"port"`                         // Proxy listen port (default: "8080")
+		MetricsPort                string   `yaml:"metrics_port"`                 // Metrics/health endpoint port (default: "9090")
+		DefaultPolicy              string   `yaml:"default_policy"`               // "ALLOW" or "BLOCK" for unmatched domains
+		OutgoingCABundle           string   `yaml:"outgoing_ca_bundle"`           // Optional CA bundle for upstream TLS
+		OutgoingCA                 []string `yaml:"outgoing_ca"`                  // Optional list of individual CA cert files
+		OutgoingTruststorePath     string   `yaml:"outgoing_truststore_path"`     // Optional PKCS#12 truststore for upstream TLS
+		OutgoingTruststorePassword string   `yaml:"outgoing_truststore_password"` // Password for outgoing truststore
+		InsecureSkipVerify         bool     `yaml:"insecure_skip_verify"`         // Disable TLS verification globally
+		MitmCertPath               string   `yaml:"mitm_cert_path"`               // Path to MITM CA certificate
+		MitmKeyPath                string   `yaml:"mitm_key_path"`                // Path to MITM CA private key
+		MitmKeystorePath           string   `yaml:"mitm_keystore_path"`           // Path to PKCS#12 keystore (.p12) containing cert and key
+		MitmKeystorePassword       string   `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
+		MitmOrg                    string   `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
+		BlockedLogPath             string   `yaml:"blocked_log_path"`             // Optional path for blocked request log
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -176,6 +177,7 @@ type RuntimeConfig struct {
 	acl           CompiledACL
 	rewrites      []CompiledRewriteRule
 	rewriteExact  map[string]*CompiledRewriteRule // Fast path for exact matches
+	tlsConfig     *tls.Config                     // Outbound TLS config (rebuilt on reload)
 	blockedLogger *slog.Logger                    // nil when blocked log feature disabled
 	blockedFile   *os.File                        // underlying file handle for Close()
 }
@@ -183,7 +185,7 @@ type RuntimeConfig struct {
 // Update atomically updates the runtime configuration.
 // It returns the previous blocked log file (if any) so the caller can close it after releasing the lock.
 func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []CompiledRewriteRule,
-	blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
+	tlsConfig *tls.Config, blockedLogger *slog.Logger, blockedFile *os.File) *os.File {
 	// Collect domains that have at least one path-based rule.
 	// These domains must be excluded from the exact map so that all their rules
 	// are evaluated sequentially (preserving YAML order / first-match-wins).
@@ -209,6 +211,7 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 	rc.acl = acl
 	rc.rewrites = rewrites
 	rc.rewriteExact = exactMap
+	rc.tlsConfig = tlsConfig
 	rc.blockedLogger = blockedLogger
 	rc.blockedFile = blockedFile
 	rc.mu.Unlock()
@@ -217,10 +220,10 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 }
 
 // Get returns the current configuration (read-locked).
-func (rc *RuntimeConfig) Get() (Config, CompiledACL, []CompiledRewriteRule, map[string]*CompiledRewriteRule) {
+func (rc *RuntimeConfig) Get() (Config, CompiledACL, []CompiledRewriteRule, map[string]*CompiledRewriteRule, *tls.Config) {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	return rc.config, rc.acl, rc.rewrites, rc.rewriteExact
+	return rc.config, rc.acl, rc.rewrites, rc.rewriteExact, rc.tlsConfig
 }
 
 // GetBlockedLogger returns the blocked request logger, or nil if disabled.
@@ -417,6 +420,18 @@ func runValidate(configPath string) error {
 			return fmt.Errorf("%s: close: %w", name, err)
 		}
 	}
+	for i, path := range cfg.Proxy.OutgoingCA {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("outgoing_ca[%d]: %w", i, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("outgoing_ca[%d]: close: %w", i, err)
+		}
+	}
 
 	// Validate blocked_log_path parent directory exists
 	if cfg.Proxy.BlockedLogPath != "" {
@@ -530,9 +545,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build base TLS configuration for outbound connections.
+	baseTLSConfig := buildOutboundTLSConfig(cfg)
+
 	// Initialize runtime config (thread-safe, reloadable)
 	runtimeCfg := &RuntimeConfig{}
-	_ = runtimeCfg.Update(cfg, acl, rewrites, blockedLogger, blockedFile)
+	_ = runtimeCfg.Update(cfg, acl, rewrites, baseTLSConfig, blockedLogger, blockedFile)
 
 	// Load MITM CA certificate and key for TLS interception
 	if err := loadMITMCertificate(cfg); err != nil {
@@ -630,18 +648,6 @@ func main() {
 		io.WriteString(w, errStr) //nolint:errcheck // best-effort response to client
 	}
 
-	// Build base TLS configuration for outbound connections.
-	baseTLSConfig := &tls.Config{
-		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
-	}
-
-	if cfg.Proxy.InsecureSkipVerify {
-		slog.Warn("Global insecure_skip_verify is ENABLED — upstream TLS certificate verification is disabled")
-		baseTLSConfig.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured global insecure for dev/test
-	}
-
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
 	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
 	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
@@ -653,7 +659,7 @@ func main() {
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DialContext:           makeDialer(runtimeCfg),
-		DialTLSContext:        makeTLSDialer(runtimeCfg, baseTLSConfig),
+		DialTLSContext:        makeTLSDialer(runtimeCfg),
 	}
 
 	// Setup metrics and health endpoints
@@ -708,7 +714,8 @@ func main() {
 				configLoadErrors.Inc()
 				continue
 			}
-			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newBlockedLogger, newBlockedFile)
+			newTLSConfig := buildOutboundTLSConfig(newCfg)
+			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newTLSConfig, newBlockedLogger, newBlockedFile)
 			if oldFile != nil {
 				if err := oldFile.Close(); err != nil {
 					slog.Warn("Failed to close rotated blocked log file", "err", err)
@@ -804,7 +811,7 @@ func loadMITMFromPEM(certPath, keyPath string) error {
 		return fmt.Errorf("parse keypair: %w", err)
 	}
 
-	return nil
+	return validateMITMCA()
 }
 
 func loadMITMFromKeystore(keystorePath, password string) error {
@@ -824,6 +831,24 @@ func loadMITMFromKeystore(keystorePath, password string) error {
 		Leaf:        cert,
 	}
 
+	return validateMITMCA()
+}
+
+// validateMITMCA checks that the loaded MITM certificate is actually a CA certificate.
+// A non-CA certificate would silently produce per-domain certs that clients reject.
+func validateMITMCA() error {
+	leaf := goproxy.GoproxyCa.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("parse MITM certificate for validation: %w", err)
+		}
+	}
+	if !leaf.IsCA {
+		return errors.New("MITM certificate is not a CA certificate (BasicConstraints CA:TRUE is required); " +
+			"per-domain certificates signed by a non-CA will be rejected by clients")
+	}
 	return nil
 }
 
@@ -976,7 +1001,7 @@ func handleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *RuntimeConf
 	requestID := generateRequestID()
 	r.Header.Set("X-Request-ID", requestID)
 
-	cfg, acl, rewrites, rewriteExact := runtimeCfg.Get()
+	cfg, acl, rewrites, rewriteExact, _ := runtimeCfg.Get()
 
 	host := r.URL.Hostname()
 	action := "BLOCKED"
@@ -1153,7 +1178,7 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 		// Check context first (set by handleRequest for path-based rewrites)
 		rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
 		if !ok {
-			_, _, rewrites, rewriteExact := runtimeCfg.Get()
+			_, _, rewrites, rewriteExact, _ := runtimeCfg.Get()
 			rw = lookupRewrite(host, rewrites, rewriteExact)
 		}
 
@@ -1183,7 +1208,7 @@ func makeDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, ad
 // rewrite IP substitution followed by a TLS handshake with per-connection configuration.
 // This enables per-rewrite InsecureSkipVerify without affecting other connections.
 // Path-based rewrites are passed via request context from handleRequest.
-func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func makeTLSDialer(runtimeCfg *RuntimeConfig) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -1191,7 +1216,7 @@ func makeTLSDialer(runtimeCfg *RuntimeConfig, baseTLSConfig *tls.Config) func(ct
 			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 		}
 
-		cfg, _, rewrites, rewriteExact := runtimeCfg.Get()
+		cfg, _, rewrites, rewriteExact, baseTLSConfig := runtimeCfg.Get()
 
 		// Check context first (set by handleRequest for path-based rewrites)
 		rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
@@ -1289,9 +1314,9 @@ func extractBaseDomain(host string) string {
 	return strings.Join(parts[len(parts)-2:], ".")
 }
 
-// loadCertPool loads the system CA pool, optionally appends a PEM CA bundle, and optionally
-// appends certificates from a PKCS#12 truststore. Both sources are additive.
-func loadCertPool(caBundle, truststorePath, truststorePassword string) *x509.CertPool {
+// loadCertPool loads the system CA pool, optionally appends a PEM CA bundle, individual CA cert
+// files, and/or certificates from a PKCS#12 truststore. All sources are additive.
+func loadCertPool(caBundle string, certPaths []string, truststorePath, truststorePassword string) *x509.CertPool {
 	pool, err := x509.SystemCertPool()
 	if err != nil {
 		slog.Warn("Failed to load system cert pool, using empty pool", "err", err)
@@ -1303,6 +1328,19 @@ func loadCertPool(caBundle, truststorePath, truststorePassword string) *x509.Cer
 			slog.Warn("Failed to read CA bundle", "path", caBundle, "err", readErr)
 		} else if !pool.AppendCertsFromPEM(ca) {
 			slog.Warn("Failed to parse CA bundle", "path", caBundle)
+		}
+	}
+	for _, p := range certPaths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		ca, readErr := os.ReadFile(p)
+		if readErr != nil {
+			slog.Warn("Failed to read CA cert", "path", p, "err", readErr)
+			continue
+		}
+		if !pool.AppendCertsFromPEM(ca) {
+			slog.Warn("Failed to parse CA cert", "path", p)
 		}
 	}
 	if truststorePath != "" {
@@ -1317,6 +1355,20 @@ func loadCertPool(caBundle, truststorePath, truststorePassword string) *x509.Cer
 		}
 	}
 	return pool
+}
+
+// buildOutboundTLSConfig builds a tls.Config for outbound connections from the given proxy config.
+func buildOutboundTLSConfig(cfg Config) *tls.Config {
+	tlsCfg := &tls.Config{
+		RootCAs:    loadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingCA, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+	if cfg.Proxy.InsecureSkipVerify {
+		slog.Warn("Global insecure_skip_verify is ENABLED — upstream TLS certificate verification is disabled")
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured global insecure for dev/test
+	}
+	return tlsCfg
 }
 
 // loadTruststoreCerts extracts CA certificates from a PKCS#12 (.p12) truststore.
