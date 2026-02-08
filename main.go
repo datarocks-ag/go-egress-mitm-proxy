@@ -421,6 +421,9 @@ func runValidate(configPath string) error {
 		}
 	}
 	for i, path := range cfg.Proxy.OutgoingCA {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			return fmt.Errorf("outgoing_ca[%d]: %w", i, err)
@@ -1328,6 +1331,9 @@ func loadCertPool(caBundle string, certPaths []string, truststorePath, truststor
 		}
 	}
 	for _, p := range certPaths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
 		ca, readErr := os.ReadFile(p)
 		if readErr != nil {
 			slog.Warn("Failed to read CA cert", "path", p, "err", readErr)
