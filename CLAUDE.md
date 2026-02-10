@@ -214,6 +214,5 @@ docker-compose.yaml            # Local dev environment
 
 - `github.com/elazarl/goproxy` - HTTP proxy with MITM support
 - `github.com/prometheus/client_golang` - Prometheus metrics
-- `golang.org/x/crypto/pkcs12` - PKCS#12 keystore decoding
-- `software.sslmate.com/src/go-pkcs12` - PKCS#12 keystore/truststore encoding (for `gencert`)
+- `software.sslmate.com/src/go-pkcs12` - PKCS#12 keystore/truststore encoding and decoding
 - `gopkg.in/yaml.v3` - Config parsing

@@ -46,11 +46,11 @@ type CompiledRewriteRule struct {
 	Insecure     bool     // Skip TLS verification for this rewrite only
 }
 
-// RewriteCtxKeyType is an unexported type for context keys to avoid collisions.
-type RewriteCtxKeyType struct{}
+// rewriteCtxKeyType is an unexported type for context keys to avoid collisions.
+type rewriteCtxKeyType struct{}
 
 // RewriteCtxKey is used to pass a matched rewrite result from handleRequest to the dialers.
-var RewriteCtxKey = RewriteCtxKeyType{}
+var RewriteCtxKey = rewriteCtxKeyType{}
 
 // Config holds the complete proxy configuration loaded from YAML.
 type Config struct {

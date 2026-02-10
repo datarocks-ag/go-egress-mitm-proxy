@@ -25,7 +25,8 @@ import (
 
 // RunGencert generates a root or intermediate CA certificate with optional client trust bundles.
 func RunGencert(args []string) error {
-	fs := flag.NewFlagSet("gencert", flag.ExitOnError)
+	fs := flag.NewFlagSet("gencert", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: %s gencert [flags]
 

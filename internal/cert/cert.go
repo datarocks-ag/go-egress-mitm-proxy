@@ -21,9 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/pkcs12"
-
 	"github.com/elazarl/goproxy"
+	gopkcs12 "software.sslmate.com/src/go-pkcs12"
 
 	"go-egress-proxy/internal/config"
 )
@@ -61,7 +60,7 @@ func loadMITMFromKeystore(keystorePath, password string) error {
 		return fmt.Errorf("read keystore: %w", err)
 	}
 
-	privateKey, cert, err := pkcs12.Decode(data, password)
+	privateKey, cert, err := gopkcs12.Decode(data, password)
 	if err != nil {
 		return fmt.Errorf("decode keystore: %w", err)
 	}
@@ -295,21 +294,16 @@ func LoadTruststoreCerts(path, password string) ([]*x509.Certificate, error) {
 		return nil, fmt.Errorf("read truststore: %w", err)
 	}
 
-	pemBlocks, err := pkcs12.ToPEM(data, password)
+	// Try truststore format first (cert-only bags), then fall back to keystore
+	// format (cert+key bags) since users may provide either type.
+	certs, err := gopkcs12.DecodeTrustStore(data, password)
 	if err != nil {
-		return nil, fmt.Errorf("decode truststore: %w", err)
-	}
-
-	var certs []*x509.Certificate
-	for _, block := range pemBlocks {
-		if block.Type != "CERTIFICATE" {
-			continue
+		// Fall back to keystore format: extract the leaf cert
+		_, cert, decodeErr := gopkcs12.Decode(data, password)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode truststore: %w", err)
 		}
-		cert, parseErr := x509.ParseCertificate(block.Bytes)
-		if parseErr != nil {
-			return nil, fmt.Errorf("parse truststore certificate: %w", parseErr)
-		}
-		certs = append(certs, cert)
+		certs = []*x509.Certificate{cert}
 	}
 
 	if len(certs) == 0 {
