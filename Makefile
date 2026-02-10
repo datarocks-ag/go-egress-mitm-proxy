@@ -18,7 +18,7 @@ help:
 
 ## build: Build the binary
 build:
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BINARY_NAME) .
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BINARY_NAME) ./cmd/mitm-proxy
 
 ## test: Run tests with coverage
 test:
@@ -52,7 +52,7 @@ clean:
 
 ## run: Run the proxy locally
 run:
-	$(GO) run .
+	$(GO) run ./cmd/mitm-proxy
 
 ## deps: Download dependencies
 deps:

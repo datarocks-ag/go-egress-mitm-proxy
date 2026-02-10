@@ -24,7 +24,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 
 ```bash
 # 1. Generate internal CA certificates
-make certs
+mitm-proxy gencert --type root --cn "My MITM CA" --out-cert certs/ca.crt --out-key certs/ca.key
 
 # 2. Create config.yaml (copy from example)
 cp doc/examples/configuration.yaml config.yaml
@@ -55,6 +55,9 @@ mitm-proxy -vv
 
 # Validate configuration
 mitm-proxy validate --config config.yaml
+
+# Generate certificates (see Certificate Generation section below)
+mitm-proxy gencert --help
 ```
 
 | Flag | Description |
@@ -64,6 +67,11 @@ mitm-proxy validate --config config.yaml
 | `-v` | Verbose output (info level, default) |
 | `-vv` | Debug output |
 | `-vvv` | Trace output (most verbose) |
+
+| Subcommand | Description |
+|------------|-------------|
+| `validate` | Validate configuration file and exit |
+| `gencert` | Generate CA certificates (root or intermediate) |
 
 The version is injected at build time. Use `VERSION=1.0.0 make build` to set a specific version, otherwise it defaults to the git describe output or `dev`.
 
@@ -206,6 +214,90 @@ The `validate` subcommand checks:
 
 Exits with code 0 on success, 1 on failure.
 
+### Certificate Generation
+
+The `gencert` subcommand generates root and intermediate CA certificates with optional client trust bundles. It replaces the need for OpenSSL and the `make certs` script.
+
+```bash
+# Generate a root CA (self-signed, ECDSA P-256, 10-year validity)
+mitm-proxy gencert --type root \
+  --cn "My Root CA" --org "ACME Corp" --country CH \
+  --out-cert certs/root-ca.crt --out-key certs/root-ca.key
+
+# Generate an intermediate CA signed by the root (leaf-signing only)
+mitm-proxy gencert --type intermediate \
+  --signing-cert certs/root-ca.crt --signing-key certs/root-ca.key \
+  --cn "MITM Proxy CA" --org "ACME Corp" \
+  --max-path-len 0 --validity 365 \
+  --out-cert certs/mitm-ca.crt --out-key certs/mitm-ca.key \
+  --out-chain certs/mitm-chain.crt
+
+# Generate a root CA with client trust bundles
+mitm-proxy gencert --type root --cn "My Root CA" \
+  --out-client-bundle certs/trust.pem \
+  --out-client-p12 certs/truststore.p12 --client-p12-password changeit
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--type` | `root` | `root` (self-signed) or `intermediate` (signed by parent) |
+| `--key-algo` | `ecdsa-p256` | `rsa-2048`, `rsa-4096`, `ecdsa-p256`, `ecdsa-p384`, `ed25519` |
+| `--cn` | `MITM Proxy CA` | Certificate CommonName |
+| `--org` | `MITM Proxy` | Certificate Organization |
+| `--country` | *(empty)* | Country code (e.g. `CH`) |
+| `--validity` | `3650` | Validity in days |
+| `--max-path-len` | `-1` | BasicConstraints PathLen (`-1` unlimited, `0` leaf-signing only) |
+| `--signing-cert` | | Parent CA certificate (required for `intermediate`) |
+| `--signing-key` | | Parent CA private key (required for `intermediate`) |
+| `--out-cert` | `ca.crt` | Output certificate (PEM) |
+| `--out-key` | `ca.key` | Output private key (PEM, 0600 permissions) |
+| `--out-chain` | | Output full chain: cert + parent certs (PEM) |
+| `--out-p12` | | Output PKCS#12 keystore with cert+key (for `mitm_keystore_path`) |
+| `--p12-password` | | Password for `--out-p12` |
+| `--out-client-bundle` | | Output client trust bundle (PEM, for distribution to clients) |
+| `--out-client-p12` | | Output client PKCS#12 truststore (for Java keystore import) |
+| `--client-p12-password` | `changeit` | Password for `--out-client-p12` |
+
+**Production workflow with intermediate CA:**
+
+```bash
+# 1. Generate root CA (store offline / in vault)
+mitm-proxy gencert --type root --cn "Corp Root CA" --org "Corp" \
+  --out-cert root-ca.crt --out-key root-ca.key \
+  --out-client-p12 client-truststore.p12 --client-p12-password changeit
+
+# 2. Generate intermediate CA for the proxy
+mitm-proxy gencert --type intermediate \
+  --signing-cert root-ca.crt --signing-key root-ca.key \
+  --cn "Corp MITM Proxy CA" --org "Corp" \
+  --max-path-len 0 --validity 365 \
+  --out-cert mitm-ca.crt --out-key mitm-ca.key \
+  --out-chain mitm-chain.crt
+
+# 3. Configure proxy with the intermediate chain
+#    mitm_cert_path: mitm-chain.crt   (intermediate + root)
+#    mitm_key_path:  mitm-ca.key
+
+# 4. Distribute root CA to clients:
+#    - PEM: trust.pem (for curl --cacert, system trust stores)
+#    - PKCS#12: client-truststore.p12 (for Java applications)
+```
+
+**Java client trust store usage:**
+
+```bash
+# Use directly as Java truststore
+java -Djavax.net.ssl.trustStore=client-truststore.p12 \
+     -Djavax.net.ssl.trustStoreType=PKCS12 \
+     -Djavax.net.ssl.trustStorePassword=changeit \
+     -jar myapp.jar
+
+# Or import into an existing JKS keystore
+keytool -importkeystore \
+  -srckeystore client-truststore.p12 -srcstoretype PKCS12 -srcstorepass changeit \
+  -destkeystore truststore.jks -deststorepass changeit
+```
+
 ### Environment Variable Overrides
 
 All config options can be overridden via environment variables:
@@ -324,7 +416,7 @@ The proxy automatically injects an `X-Request-ID` header into all forwarded requ
 
 ## Client Setup
 
-Clients must trust the internal CA certificate. Install `certs/ca.crt` as a trusted root CA:
+Clients must trust the MITM root CA certificate. You can generate a client trust bundle with `gencert` (see [Certificate Generation](#certificate-generation)) or distribute the CA cert manually:
 
 ```bash
 # Linux (system-wide)
@@ -336,6 +428,12 @@ sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keyc
 
 # curl (per-request)
 curl --cacert certs/ca.crt -x http://localhost:8080 https://example.com
+
+# Java (using PKCS#12 truststore from gencert --out-client-p12)
+java -Djavax.net.ssl.trustStore=truststore.p12 \
+     -Djavax.net.ssl.trustStoreType=PKCS12 \
+     -Djavax.net.ssl.trustStorePassword=changeit \
+     -jar myapp.jar
 ```
 
 ## Architecture

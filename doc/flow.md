@@ -15,20 +15,34 @@ There are **four** certificate/key artifacts involved in a proxied HTTPS connect
 
 ### Certificate Generation
 
-The MITM CA is generated once and distributed ahead of time:
+The MITM CA is generated once and distributed ahead of time. The built-in `gencert` subcommand handles this without requiring OpenSSL:
 
 ```bash
-# scripts/gen-ca.sh
-openssl genrsa -out certs/ca.key 4096
-openssl req -x509 -new -nodes -key certs/ca.key -sha256 -days 3650 -out certs/ca.crt \
-  -subj "/C=US/ST=State/L=City/O=ProxyCorp/OU=Security/CN=Internal-MITM-CA" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign"
+# Simple root CA (self-signed, ECDSA P-256, 10-year validity)
+mitm-proxy gencert --type root \
+  --cn "Internal-MITM-CA" --org "ProxyCorp" --country US \
+  --out-cert certs/ca.crt --out-key certs/ca.key
+
+# Production setup with intermediate CA
+mitm-proxy gencert --type root --cn "Corp Root CA" --org "Corp" \
+  --out-cert certs/root-ca.crt --out-key certs/root-ca.key
+
+mitm-proxy gencert --type intermediate \
+  --signing-cert certs/root-ca.crt --signing-key certs/root-ca.key \
+  --cn "MITM Proxy CA" --org "Corp" --max-path-len 0 --validity 365 \
+  --out-cert certs/mitm-ca.crt --out-key certs/mitm-ca.key \
+  --out-chain certs/mitm-chain.crt
+
+# Generate client trust bundles for distribution
+mitm-proxy gencert --type root --cn "Corp Root CA" \
+  --out-cert certs/root-ca.crt --out-key certs/root-ca.key \
+  --out-client-bundle certs/trust.pem \
+  --out-client-p12 certs/truststore.p12 --client-p12-password changeit
 ```
 
-> **Note:** The `-addext` flags are required so the generated certificate has `CA:TRUE` set in its Basic Constraints extension. The proxy validates this at startup and will refuse to start if the MITM certificate is not a CA.
+> **Note:** The `gencert` command always sets `CA:TRUE` in BasicConstraints and `KeyUsageCertSign | KeyUsageCRLSign` in KeyUsage. The proxy validates this at startup and will refuse to start if the MITM certificate is not a CA.
 
-Alternatively, the CA can be provided as a PKCS#12 keystore (`.p12`) instead of separate PEM files.
+Alternatively, you can use OpenSSL (`scripts/gen-ca.sh`) or provide the CA as a PKCS#12 keystore (`.p12`) instead of separate PEM files. The `gencert` command can also output PKCS#12 keystores via `--out-p12`.
 
 **Deployment requirements:**
 - `ca.crt` + `ca.key` (or `.p12`) must be available to the proxy at startup.
@@ -182,6 +196,8 @@ graph LR
 ## Trust Chain Summary
 
 Two independent trust chains are at play. On the **client side**, the MITM CA must be installed as a trusted root so clients accept the per-domain certificates the proxy generates on the fly. On the **proxy side**, upstream server certificates are verified against the system CA store plus any custom CAs provided via `outgoing_ca_bundle`, `outgoing_ca`, or `outgoing_truststore_*`. These two chains are completely separate — compromising or changing one does not affect the other.
+
+The `gencert` subcommand can produce client trust bundles in both PEM (`--out-client-bundle`) and PKCS#12 (`--out-client-p12`) formats to simplify distribution. The PKCS#12 truststore can be used directly by Java applications (`-Djavax.net.ssl.trustStore=...`) or imported into existing keystores via `keytool`.
 
 ```mermaid
 graph TB
