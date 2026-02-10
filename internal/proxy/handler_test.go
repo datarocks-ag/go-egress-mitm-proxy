@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -755,5 +756,121 @@ func TestResponseProtoNormalization(t *testing.T) {
 				t.Errorf("ProtoMinor = %d, want 1", resp.ProtoMinor)
 			}
 		})
+	}
+}
+
+// timeoutError implements net.Error with Timeout() == true.
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "i/o timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return false }
+
+func TestUpstreamErrorResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantCode   int
+		wantReason string
+	}{
+		{"net timeout error", &timeoutError{}, http.StatusGatewayTimeout, "Gateway Timeout"},
+		{"context deadline exceeded", context.DeadlineExceeded, http.StatusGatewayTimeout, "Gateway Timeout"},
+		{"connection refused", errors.New("connection refused"), http.StatusBadGateway, "Bad Gateway"},
+		{"dns error", errors.New("no such host"), http.StatusBadGateway, "Bad Gateway"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, reason := UpstreamErrorResponse(tt.err)
+			if code != tt.wantCode {
+				t.Errorf("code = %d, want %d", code, tt.wantCode)
+			}
+			if reason != tt.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestRecordResponseMetrics(t *testing.T) {
+	tests := []struct {
+		name          string
+		statusCode    int
+		contentLength int64
+	}{
+		{"200 with body", 200, 1024},
+		{"404 no body", 404, -1},
+		{"500 zero body", 500, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode:    tt.statusCode,
+				ContentLength: tt.contentLength,
+			}
+			// Should not panic
+			RecordResponseMetrics(resp)
+		})
+	}
+}
+
+func TestRecordDialError(t *testing.T) {
+	// Should not panic for either error type
+	RecordDialError(&timeoutError{})
+	RecordDialError(errors.New("connection refused"))
+}
+
+func TestMakeDialerInvalidAddress(t *testing.T) {
+	rc := &config.RuntimeConfig{}
+	var cfg config.Config
+	cfg.Proxy.DefaultPolicy = "ALLOW"
+	_ = rc.Update(cfg, config.CompiledACL{}, nil, nil, nil, nil)
+
+	dialer := MakeDialer(rc)
+	_, err := dialer(context.Background(), "tcp", "no-port")
+	if err == nil {
+		t.Fatal("expected error for invalid address")
+	}
+}
+
+func TestMakeDialerTargetHost(t *testing.T) {
+	// Start a TCP listener to accept the connection
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close() //nolint:errcheck // test cleanup
+
+	rc := &config.RuntimeConfig{}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.WithValue(context.Background(), config.RewriteCtxKey, RewriteResult{
+		TargetHost: "127.0.0.1",
+		Matched:    true,
+	})
+
+	dialer := MakeDialer(rc)
+	conn, err := dialer(ctx, "tcp", "example.com:"+port)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	conn.Close() //nolint:errcheck // test cleanup
+}
+
+func TestMakeTLSDialerInvalidAddress(t *testing.T) {
+	rc := &config.RuntimeConfig{}
+	var cfg config.Config
+	cfg.Proxy.DefaultPolicy = "ALLOW"
+	_ = rc.Update(cfg, config.CompiledACL{}, nil, nil, nil, nil)
+
+	dialer := MakeTLSDialer(rc)
+	_, err := dialer(context.Background(), "tcp", "no-port")
+	if err == nil {
+		t.Fatal("expected error for invalid address")
 	}
 }
