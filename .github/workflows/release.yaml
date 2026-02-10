@@ -98,7 +98,7 @@ jobs:
       - name: Build binary
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
-          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o mitm-proxy .
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o mitm-proxy ./cmd/mitm-proxy
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -214,19 +214,19 @@ jobs:
           LDFLAGS="-s -w -X main.version=${VERSION}"
 
           # Linux AMD64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-linux-amd64 ./cmd/mitm-proxy
 
           # Linux ARM64
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-linux-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-linux-arm64 ./cmd/mitm-proxy
 
           # macOS AMD64
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-darwin-amd64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-darwin-amd64 ./cmd/mitm-proxy
 
           # macOS ARM64 (Apple Silicon)
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-darwin-arm64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-darwin-arm64 ./cmd/mitm-proxy
 
           # Windows AMD64
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/mitm-proxy-windows-amd64.exe ./cmd/mitm-proxy
 
       - name: Create checksums
         run: |

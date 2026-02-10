@@ -16,12 +16,14 @@ proxy:
   # insecure_skip_verify: false
 
   # MITM CA certificate - provide either PEM cert+key or a PKCS#12 keystore (not both)
+  # Generate with: mitm-proxy gencert --type root --cn "My CA" --out-cert certs/ca.crt --out-key certs/ca.key
+  # Or for intermediate CA: mitm-proxy gencert --type intermediate --signing-cert root.crt --signing-key root.key --out-chain certs/chain.crt --out-key certs/ca.key
 
-  # Option A: PEM files
+  # Option A: PEM files (use --out-chain for intermediate CA setup)
   mitm_cert_path: "certs/ca.crt"
   mitm_key_path: "certs/ca.key"
 
-  # Option B: PKCS#12 keystore (.p12 bundle containing cert and key)
+  # Option B: PKCS#12 keystore (generate with: mitm-proxy gencert --out-p12 certs/ca.p12 --p12-password changeit)
   # mitm_keystore_path: "certs/ca.p12"
   # mitm_keystore_password: "changeit"
 

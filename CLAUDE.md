@@ -25,7 +25,10 @@ make install-tools  # Install dev tools (golangci-lint, goimports)
 ./mitm-proxy -vvv            # Run with trace logging (most verbose)
 
 # Validate configuration without starting the proxy
-go run . validate --config config.yaml
+go run ./cmd/mitm-proxy validate --config config.yaml
+
+# Generate CA certificates (replaces make certs / OpenSSL)
+go run ./cmd/mitm-proxy gencert --help
 
 # Build with specific version
 VERSION=1.0.0 make build
@@ -42,7 +45,29 @@ go test -v -run TestConfigValidate ./...  # Run specific test
 
 ## Architecture
 
-Single-file application (`main.go`) using goproxy library with thread-safe hot-reloadable configuration.
+Multi-package application using goproxy library with thread-safe hot-reloadable configuration.
+
+**Package Layout:**
+```
+cmd/mitm-proxy/main.go        # CLI entrypoint: arg parsing, signal handling, wiring
+internal/config/config.go      # Types, YAML loading, validation, env overrides, ACL/rewrite compilation
+internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
+internal/cert/gencert.go       # gencert subcommand + key pair generation
+internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, domain metrics
+internal/metrics/metrics.go    # Prometheus metric vars (promauto registrations)
+internal/health/health.go      # Health and readiness HTTP handlers
+e2e_test.go                    # End-to-end tests (build tag: e2e, uses testcontainers)
+```
+
+**Package Dependency Graph (no cycles):**
+```
+metrics     → (none)
+health      → (none)
+config      → metrics
+cert        → config
+proxy       → config, metrics, cert
+cmd/main    → config, cert, proxy, metrics, health
+```
 
 **Request Flow:**
 1. Client connects → Proxy presents cert signed by internal CA (MITM)
@@ -65,18 +90,33 @@ Single-file application (`main.go`) using goproxy library with thread-safe hot-r
 The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.DeadlineExceeded`) from all other upstream failures. This applies to both plain HTTP requests (via the `OnResponse` handler) and CONNECT-level failures (via `ConnectionErrHandler`).
 
 **Key Components:**
+
+`internal/config`:
 - `RuntimeConfig` - Thread-safe config holder with RWMutex for hot reload
-- `loadConfig()` - Loads YAML, applies env overrides, validates
-- `compileACL()` / `compileRewrites()` - Pre-compiles patterns via `wildcardToRegex()`
-- `wildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
-- `handleRequest()` - Request handler with policy evaluation; stores matched rewrite in request context for path-based rules
-- `lookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match); skips path-pattern rules (resolved via context)
-- `makeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
-- `makeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
-- `signHost()` - Generates MITM leaf certificates with custom Organization (key type matches CA)
-- `mitmTLSConfigFromCA()` - TLS config factory for custom MITM certs with sync.Map cache
-- `loadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
-- `normalizeDomainForMetrics()` - Bounds metrics cardinality
+- `LoadConfig()` - Loads YAML, applies env overrides, validates
+- `CompileACL()` / `CompileRewrites()` - Pre-compiles patterns via `WildcardToRegex()`
+- `WildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
+- `RunValidate()` - CLI subcommand: validates config file without starting the proxy
+
+`internal/cert`:
+- `LoadMITMCertificate()` - Loads MITM CA from PEM or PKCS#12
+- `SignHost()` - Generates MITM leaf certificates with custom Organization (key type matches CA)
+- `MitmTLSConfigFromCA()` - TLS config factory for custom MITM certs with sync.Map cache
+- `BuildOutboundTLSConfig()` - Builds outbound TLS config with custom CA pool
+- `LoadCertPool()` - Loads CA certificates from PEM bundle and/or PKCS#12 truststore
+- `LoadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
+- `RunGencert()` - CLI subcommand: generates root/intermediate CA certs with optional client trust bundles
+
+`internal/proxy`:
+- `HandleRequest()` - Request handler with policy evaluation; stores matched rewrite in request context for path-based rules
+- `LookupRewrite()` - Shared rewrite rule lookup (exact map → pattern match); skips path-pattern rules (resolved via context)
+- `MakeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
+- `MakeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
+- `NormalizeDomainForMetrics()` - Bounds metrics cardinality
+
+`internal/metrics`: All Prometheus metric vars (`TrafficTotal`, `RequestDuration`, etc.)
+
+`internal/health`: `HealthHandler()`, `ReadyHandler()`
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
@@ -107,19 +147,73 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 
 **Hot Reload:** SIGHUP reloads config without restart
 
+**Certificate Generation (`gencert` subcommand):**
+
+Generates root or intermediate CA certificates with optional client trust bundles. No OpenSSL dependency required.
+
+```bash
+# Root CA (self-signed)
+./mitm-proxy gencert --type root --key-algo ecdsa-p256 \
+  --cn "My Root CA" --org "ACME Corp" --country CH --validity 3650 \
+  --out-cert root-ca.crt --out-key root-ca.key
+
+# Intermediate CA (signed by root, leaf-signing only)
+./mitm-proxy gencert --type intermediate \
+  --signing-cert root-ca.crt --signing-key root-ca.key \
+  --key-algo ecdsa-p256 --cn "MITM Proxy CA" --org "ACME Corp" \
+  --max-path-len 0 --validity 365 \
+  --out-cert mitm-ca.crt --out-key mitm-ca.key --out-chain mitm-chain.crt
+
+# With client trust bundles (PEM + PKCS#12 truststore for Java)
+./mitm-proxy gencert --type root --cn "My Root CA" \
+  --out-client-bundle trust.pem \
+  --out-client-p12 truststore.p12 --client-p12-password changeit
+```
+
+Key flags:
+- `--type`: `root` (self-signed) or `intermediate` (signed by `--signing-cert`/`--signing-key`)
+- `--key-algo`: `rsa-2048`, `rsa-4096`, `ecdsa-p256` (default), `ecdsa-p384`, `ed25519`
+- `--max-path-len`: BasicConstraints PathLen (`-1` unlimited, `0` leaf-signing only)
+- `--out-chain`: PEM chain file (intermediate + parent certs) for use as `mitm_cert_path`
+- `--out-p12` / `--p12-password`: PKCS#12 keystore (cert+key) for use as `mitm_keystore_path`
+- `--out-client-bundle`: PEM trust bundle containing the root CA for client distribution
+- `--out-client-p12` / `--client-p12-password`: PKCS#12 truststore for Java (`-Djavax.net.ssl.trustStore=... -Djavax.net.ssl.trustStoreType=PKCS12`)
+
+Typical production workflow: generate root CA (store offline) → generate intermediate CA signed by root → configure proxy with `mitm_cert_path: mitm-chain.crt` + `mitm_key_path: mitm-ca.key` → distribute root CA to clients via `--out-client-p12` or `--out-client-bundle`.
+
 ## Code Organization
 
-- `main.go` - All application code
-- `main_test.go` - Unit tests
-- `Makefile` - Build and dev commands
-- `.golangci.yml` - Linter configuration
-- `.github/workflows/ci.yaml` - CI pipeline
-- `.github/dependabot.yml` - Dependency updates
-- `docker-compose.yaml` - Local dev environment
+```
+cmd/mitm-proxy/
+  main.go                      # CLI entrypoint, signal handling, wiring
+  main_test.go                 # Version and usage tests
+internal/config/
+  config.go                    # Config types, loading, validation, ACL/rewrite compilation
+  config_test.go               # Config, ACL, rewrite, runtime, validate tests
+internal/cert/
+  cert.go                      # MITM cert loading, signing, TLS pool building
+  gencert.go                   # gencert subcommand, key pair generation
+  cert_test.go                 # Cert, signing, gencert, truststore tests
+internal/proxy/
+  handler.go                   # Request handling, dialers, rewrite lookup, metrics recording
+  handler_test.go              # Handler, dialer, rewrite, metrics tests
+internal/metrics/
+  metrics.go                   # Prometheus metric var registrations
+internal/health/
+  health.go                    # Health and readiness HTTP handlers
+e2e_test.go                    # End-to-end tests (build tag: e2e, Docker-based)
+Makefile                       # Build and dev commands
+.golangci.yml                  # Linter configuration
+.github/workflows/ci.yaml     # CI pipeline (feature branches)
+.github/workflows/release.yaml # Release pipeline (develop/tags)
+.github/dependabot.yml         # Dependency updates
+docker-compose.yaml            # Local dev environment
+```
 
 ## Dependencies
 
 - `github.com/elazarl/goproxy` - HTTP proxy with MITM support
 - `github.com/prometheus/client_golang` - Prometheus metrics
-- `golang.org/x/crypto/pkcs12` - PKCS#12 keystore support
+- `golang.org/x/crypto/pkcs12` - PKCS#12 keystore decoding
+- `software.sslmate.com/src/go-pkcs12` - PKCS#12 keystore/truststore encoding (for `gencert`)
 - `gopkg.in/yaml.v3` - Config parsing

@@ -71,6 +71,18 @@ type RuntimeConfig struct {
 - `GetBlockedLogger()` returns the blocked request logger (nil when disabled)
 - `CloseBlockedLog()` closes the log file handle on shutdown
 
+### Certificate Generator (`gencert`)
+
+Built-in CLI subcommand for generating root and intermediate CA certificates:
+
+- Supports RSA (2048/4096), ECDSA (P-256/P-384), and Ed25519 key algorithms
+- Root CA: self-signed with configurable subject and validity
+- Intermediate CA: signed by a parent CA, with `MaxPathLen` control
+- Output formats: PEM cert+key, PEM chain, PKCS#12 keystore (cert+key)
+- Client trust bundles: PEM trust bundle, PKCS#12 truststore (for Java keystore import)
+- `generateKeyPair()` creates keys by algorithm name
+- `runGencert()` orchestrates flag parsing, key generation, cert creation, and file output
+
 ### Configuration Loader
 
 Loads and validates YAML configuration at startup and on SIGHUP:
@@ -270,6 +282,7 @@ flowchart LR
 ### Configuration Security
 
 - Certificate paths validated at startup and on `validate` subcommand
+- `gencert` writes private keys with 0600 permissions; certificates and trust bundles with 0644
 - Invalid regex patterns cause startup failure (fail-fast)
 - `target_ip`/`target_host` and `target_scheme` validated at load time
 - Environment overrides allow secrets management integration
