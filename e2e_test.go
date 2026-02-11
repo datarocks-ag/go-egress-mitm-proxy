@@ -1068,3 +1068,238 @@ rewrites:
 		t.Logf("truststore rewrite response: %d %s", resp.StatusCode, string(body))
 	})
 }
+
+func TestE2EPassthrough(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// --- Certificates ---
+
+	// MITM CA (proxy client-facing, NOT trusted by the passthrough client)
+	mitmCertsDir := filepath.Join(tmpDir, "mitm-certs")
+	if err := os.Mkdir(mitmCertsDir, 0o750); err != nil {
+		t.Fatalf("create mitm certs dir: %v", err)
+	}
+	generateE2ECerts(t, mitmCertsDir) // we don't need the pool; passthrough client trusts upstream CA instead
+
+	// Upstream CA + server cert (for nginx TLS)
+	upstreamDir := filepath.Join(tmpDir, "upstream-certs")
+	if err := os.Mkdir(upstreamDir, 0o750); err != nil {
+		t.Fatalf("create upstream certs dir: %v", err)
+	}
+	generateUpstreamTLSCerts(t, upstreamDir, []string{"passthrough-tls.example.com"})
+
+	// Build upstream CA pool for client trust
+	upstreamCAPEM, err := os.ReadFile(filepath.Join(upstreamDir, "ca.crt"))
+	if err != nil {
+		t.Fatalf("read upstream CA: %v", err)
+	}
+	upstreamCAPool := x509.NewCertPool()
+	if !upstreamCAPool.AppendCertsFromPEM(upstreamCAPEM) {
+		t.Fatal("failed to parse upstream CA PEM")
+	}
+
+	// --- Docker network ---
+	nw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create docker network: %v", err)
+	}
+	t.Cleanup(func() {
+		if rmErr := nw.Remove(ctx); rmErr != nil {
+			t.Logf("remove network: %v", rmErr)
+		}
+	})
+
+	// --- nginx TLS container ---
+	nginxConf := filepath.Join(tmpDir, "nginx.conf")
+	nginxConfContent := `events {
+    worker_connections 64;
+}
+
+http {
+    server {
+        listen 443 ssl;
+        ssl_certificate /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+
+        location / {
+            return 200 'passthrough-ok';
+            default_type text/plain;
+        }
+    }
+}
+`
+	if writeErr := os.WriteFile(nginxConf, []byte(nginxConfContent), 0o600); writeErr != nil {
+		t.Fatalf("write nginx.conf: %v", writeErr)
+	}
+
+	nginxCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:          "nginx:1.27-alpine",
+			ExposedPorts:   []string{"443/tcp"},
+			Networks:       []string{nw.Name},
+			NetworkAliases: map[string][]string{nw.Name: {"passthrough-tls.example.com"}},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.crt"),
+					ContainerFilePath: "/etc/nginx/certs/server.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.key"),
+					ContainerFilePath: "/etc/nginx/certs/server.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      nginxConf,
+					ContainerFilePath: "/etc/nginx/nginx.conf",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForListeningPort("443/tcp").WithStartupTimeout(30 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start nginx container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(nginxCtr); termErr != nil {
+			t.Logf("terminate nginx: %v", termErr)
+		}
+	})
+
+	t.Logf("nginx passthrough container started")
+
+	// --- Proxy config: passthrough for the nginx domain ---
+	proxyConfig := `proxy:
+  port: "8080"
+  metrics_port: "9090"
+  default_policy: "BLOCK"
+  mitm_cert_path: "/app/certs/ca.crt"
+  mitm_key_path: "/app/certs/ca.key"
+acl:
+  passthrough:
+    - "passthrough-tls.example.com"
+`
+	if writeErr := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(proxyConfig), 0o600); writeErr != nil {
+		t.Fatalf("write proxy config: %v", writeErr)
+	}
+
+	// --- Start proxy container ---
+	proxyCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
+			Networks:     []string{nw.Name},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
+					ContainerFilePath: "/app/certs/ca.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.key"),
+					ContainerFilePath: "/app/certs/ca.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(tmpDir, "config.yaml"),
+					ContainerFilePath: "/app/config.yaml",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForHTTP("/healthz").WithPort("9090/tcp").WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start proxy container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(proxyCtr); termErr != nil {
+			t.Logf("terminate proxy: %v", termErr)
+		}
+	})
+
+	proxyPort, err := proxyCtr.MappedPort(ctx, "8080/tcp")
+	if err != nil {
+		t.Fatalf("get proxy port: %v", err)
+	}
+	proxyHost, err := proxyCtr.Host(ctx)
+	if err != nil {
+		t.Fatalf("get proxy host: %v", err)
+	}
+
+	proxyURL, err := url.Parse(fmt.Sprintf("http://%s:%s", proxyHost, proxyPort.Port()))
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	t.Logf("proxy at %s", proxyURL)
+
+	// Client trusts the UPSTREAM CA (not the MITM CA).
+	// If the proxy were doing MITM, the TLS handshake would fail because
+	// the MITM cert is not trusted by this client.
+	passthroughClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    upstreamCAPool,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	t.Run("passthrough_tunnels_without_mitm", func(t *testing.T) {
+		// The client trusts only the upstream CA. If MITM were active,
+		// the proxy would present a cert signed by the MITM CA and the
+		// handshake would fail. Success proves the tunnel is passthrough.
+		resp, err := doGet(ctx, passthroughClient, "https://passthrough-tls.example.com/")
+		if err != nil {
+			t.Fatalf("request failed (if TLS error, passthrough is broken): %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		t.Logf("passthrough response: %d %s", resp.StatusCode, string(body))
+	})
+
+	t.Run("passthrough_cert_is_upstream_not_mitm", func(t *testing.T) {
+		// Verify that the TLS certificate seen by the client is from the
+		// upstream server, NOT from the proxy's MITM CA.
+		resp, err := doGet(ctx, passthroughClient, "https://passthrough-tls.example.com/")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.TLS == nil {
+			t.Fatal("response has no TLS connection state")
+		}
+		if len(resp.TLS.PeerCertificates) == 0 {
+			t.Fatal("no peer certificates in TLS handshake")
+		}
+
+		leaf := resp.TLS.PeerCertificates[0]
+		issuer := leaf.Issuer
+
+		// The cert must be signed by the upstream CA, not the MITM CA
+		if issuer.CommonName == "E2E Test CA" {
+			t.Fatal("passthrough cert is signed by MITM CA — tunnel is NOT passthrough")
+		}
+		if issuer.CommonName != "E2E Upstream CA" {
+			t.Errorf("passthrough cert issuer CN = %q, want %q", issuer.CommonName, "E2E Upstream CA")
+		}
+		t.Logf("passthrough cert issuer: CN=%s, O=%v (verified upstream CA, not MITM)", issuer.CommonName, issuer.Organization)
+	})
+}

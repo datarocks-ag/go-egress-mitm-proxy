@@ -43,7 +43,9 @@ var version = "dev"
 type slogProxyLogger struct{}
 
 func (l *slogProxyLogger) Printf(format string, v ...any) {
-	slog.Debug(fmt.Sprintf(format, v...), "source", "goproxy")
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		slog.Debug(fmt.Sprintf(format, v...), "source", "goproxy")
+	}
 }
 
 func printUsage() {
@@ -198,7 +200,7 @@ func main() {
 			)
 
 			// Check passthrough ACL: tunnel without MITM interception
-			_, currentACL, _, _, _ := runtimeCfg.Get()
+			_, currentACL, _, rewriteExact, _ := runtimeCfg.Get()
 			hostname := host
 			if h, _, err := net.SplitHostPort(host); err == nil {
 				hostname = h
@@ -207,7 +209,8 @@ func main() {
 				slog.Info("PASSTHROUGH",
 					"host", hostname,
 					"client", ctx.Req.RemoteAddr)
-				metrics.TrafficTotal.WithLabelValues(hostname, "PASSTHROUGH").Inc()
+				metricDomain := proxy.NormalizeDomainForMetrics(hostname, rewriteExact, currentACL)
+				metrics.TrafficTotal.WithLabelValues(metricDomain, "PASSTHROUGH").Inc()
 				return passthroughAction, host
 			}
 
