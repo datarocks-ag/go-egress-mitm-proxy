@@ -713,6 +713,44 @@ func TestMakeTLSDialer(t *testing.T) {
 	})
 }
 
+func TestHandleRequestWhitelistWildcardHTTPAndHTTPS(t *testing.T) {
+	rc := &config.RuntimeConfig{}
+	cfg := config.Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.Proxy.MitmCertPath = "/path/to/cert"
+	cfg.Proxy.MitmKeyPath = "/path/to/key"
+
+	acl := config.CompiledACL{
+		Whitelist: []*regexp.Regexp{regexp.MustCompile(`^subdomain\..*`)},
+	}
+	_ = rc.Update(cfg, acl, nil, nil, nil, nil)
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"http request", "http://subdomain.example.com/test"},
+		{"https request", "https://subdomain.example.com/test"},
+		{"http different tld", "http://subdomain.other.org/path"},
+		{"https different tld", "https://subdomain.other.org/path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tt.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, resp := HandleRequest(req, nil, rc)
+			if resp != nil {
+				resp.Body.Close() //nolint:errcheck // test cleanup
+				t.Fatalf("expected request to be whitelisted (nil response), got status %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestResponseProtoNormalization(t *testing.T) {
 	// goproxy writes MITM responses via resp.Write() which serializes
 	// ProtoMajor/ProtoMinor into the status line. The OnResponse handler
