@@ -98,6 +98,42 @@ func HandleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *config.Runt
 		"method", r.Method,
 		"path", r.URL.Path)
 
+	// Debug: log full request details for troubleshooting
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		attrs := []slog.Attr{
+			slog.String("request_id", requestID),
+			slog.String("scheme", r.URL.Scheme),
+			slog.String("host", host),
+			slog.String("method", r.Method),
+			slog.String("url", r.URL.String()),
+			slog.String("proto", r.Proto),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.Int64("content_length", r.ContentLength),
+		}
+		if ua := r.Header.Get("User-Agent"); ua != "" {
+			attrs = append(attrs, slog.String("user_agent", ua))
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			attrs = append(attrs, slog.String("content_type", ct))
+		}
+		if matchedRewrite != nil {
+			attrs = append(attrs,
+				slog.String("rewrite_target_ip", matchedRewrite.TargetIP),
+				slog.String("rewrite_target_host", matchedRewrite.TargetHost),
+				slog.String("rewrite_original", matchedRewrite.Original),
+			)
+		}
+		// Log all request headers at trace level
+		if slog.Default().Enabled(context.Background(), slog.Level(-8)) {
+			hdrs := make([]string, 0, len(r.Header))
+			for k, v := range r.Header {
+				hdrs = append(hdrs, k+"="+strings.Join(v, ","))
+			}
+			attrs = append(attrs, slog.String("headers", strings.Join(hdrs, "; ")))
+		}
+		slog.LogAttrs(context.Background(), slog.LevelDebug, "REQUEST_DETAIL", attrs...)
+	}
+
 	// Record metrics with bounded cardinality
 	metricDomain := NormalizeDomainForMetrics(host, rewriteExact, acl)
 	metrics.TrafficTotal.WithLabelValues(metricDomain, action).Inc()

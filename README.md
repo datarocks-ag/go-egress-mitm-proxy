@@ -64,9 +64,9 @@ mitm-proxy gencert --help
 |------|-------------|
 | `--version` | Print version and exit |
 | `-h`, `--help` | Show help message |
-| `-v` | Verbose output (info level, default) |
-| `-vv` | Debug output |
-| `-vvv` | Trace output (most verbose) |
+| `-v` | Info level (default) — ACCESS log per request (host, action, method, path) |
+| `-vv` | Debug — adds `REQUEST_DETAIL` per request (scheme, full URL, proto, remote addr, content-length, user-agent, content-type, rewrite target) |
+| `-vvv` | Trace — adds full request headers to `REQUEST_DETAIL` |
 
 | Subcommand | Description |
 |------------|-------------|
@@ -383,6 +383,18 @@ kill -HUP <pid>
 ```
 
 The proxy will log successful reloads and any errors. SIGHUP also reopens the blocked request log file, enabling log rotation.
+
+## Logging
+
+All log output is structured JSON via `slog`. The verbosity flag controls which log levels are emitted:
+
+| Level | Flag | What is logged |
+|-------|------|----------------|
+| Info | `-v` (default) | `ACCESS` line per request: request_id, client, host, action, method, path |
+| Debug | `-vv` | Adds `REQUEST_DETAIL` per request: scheme, full URL, proto, remote_addr, content_length, user_agent, content_type, and rewrite target info (target_ip, target_host, original) when a rewrite matched |
+| Trace | `-vvv` | Adds all request headers to `REQUEST_DETAIL` |
+
+Debug and trace logging have zero overhead when not enabled — the log construction is gated behind `slog.Default().Enabled()`.
 
 ## Blocked Request Log
 
