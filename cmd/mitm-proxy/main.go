@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,6 +38,13 @@ import (
 
 // version is set at build time via -ldflags "-X main.version=<value>".
 var version = "dev"
+
+// slogProxyLogger adapts goproxy's Logger interface to route through slog.
+type slogProxyLogger struct{}
+
+func (l *slogProxyLogger) Printf(format string, v ...any) {
+	slog.Debug(fmt.Sprintf(format, v...), "source", "goproxy")
+}
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: %s [flags] [command]
@@ -172,18 +180,39 @@ func main() {
 
 	// Initialize the proxy server
 	proxyHandler := goproxy.NewProxyHttpServer()
+	proxyHandler.Logger = &slogProxyLogger{}
+	proxyHandler.Verbose = slog.Default().Enabled(context.Background(), slog.LevelDebug)
+
+	mitmAction := &goproxy.ConnectAction{Action: goproxy.ConnectMitm}
 	if cfg.Proxy.MitmOrg != "" {
-		mitmAction := &goproxy.ConnectAction{
-			Action:    goproxy.ConnectMitm,
-			TLSConfig: cert.MitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg),
-		}
-		proxyHandler.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
-			func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-				return mitmAction, host
-			}))
-	} else {
-		proxyHandler.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+		mitmAction.TLSConfig = cert.MitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg)
 	}
+	passthroughAction := &goproxy.ConnectAction{Action: goproxy.ConnectAccept}
+	proxyHandler.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
+		func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+			slog.Log(context.Background(), slog.Level(-8), "CONNECT",
+				"host", host,
+				"client", ctx.Req.RemoteAddr,
+				"method", ctx.Req.Method,
+				"user_agent", ctx.Req.Header.Get("User-Agent"),
+			)
+
+			// Check passthrough ACL: tunnel without MITM interception
+			_, currentACL, _, _, _ := runtimeCfg.Get()
+			hostname := host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				hostname = h
+			}
+			if config.Matches(hostname, currentACL.Passthrough) {
+				slog.Info("PASSTHROUGH",
+					"host", hostname,
+					"client", ctx.Req.RemoteAddr)
+				metrics.TrafficTotal.WithLabelValues(hostname, "PASSTHROUGH").Inc()
+				return passthroughAction, host
+			}
+
+			return mitmAction, host
+		}))
 
 	// Register the request handler for policy enforcement
 	proxyHandler.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
@@ -334,7 +363,8 @@ func main() {
 			slog.Info("Configuration reloaded successfully",
 				"rewrites", len(newRewrites),
 				"whitelist", len(newACL.Whitelist),
-				"blacklist", len(newACL.Blacklist))
+				"blacklist", len(newACL.Blacklist),
+				"passthrough", len(newACL.Passthrough))
 		}
 	}()
 
@@ -363,6 +393,7 @@ func main() {
 		"rewrites", len(rewrites),
 		"whitelist_rules", len(acl.Whitelist),
 		"blacklist_rules", len(acl.Blacklist),
+		"passthrough_rules", len(acl.Passthrough),
 		"outgoing_ca_bundle", cfg.Proxy.OutgoingCABundle,
 		"outgoing_truststore_path", cfg.Proxy.OutgoingTruststorePath,
 		"insecure_skip_verify", cfg.Proxy.InsecureSkipVerify,

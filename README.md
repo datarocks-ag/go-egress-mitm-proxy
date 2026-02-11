@@ -7,7 +7,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 - **Split-brain DNS** via TCP dial interception (not DNS-level), with `target_ip` or `target_host` routing
 - **Path-based routing** - route different URL paths on the same domain to different backends (`path_pattern`)
 - **Scheme rewriting** - change the request scheme before forwarding (`target_scheme`)
-- **ACL** with whitelist/blacklist support (exact match, wildcards, regex)
+- **ACL** with whitelist/blacklist/passthrough support (exact match, wildcards, regex)
 - **Header injection** on rewritten requests, plus automatic `X-Request-ID` for tracing
 - **Header stripping** - remove sensitive headers before forwarding (`drop_headers`)
 - **Per-rewrite TLS bypass** - skip upstream TLS verification for specific targets (`insecure`)
@@ -161,6 +161,9 @@ acl:
     - "github.com"
   blacklist:
     - "*.tiktok.com"
+  passthrough:                    # Tunnel without MITM (for services with their own PKI)
+    - "kubernetes.default.svc"
+    - "*.vault.internal"
 ```
 
 See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.
@@ -415,7 +418,7 @@ Available at `http://localhost:9090/metrics`:
 | `proxy_response_status_total` | Counter | class | Response status codes (2xx, 4xx, 5xx) |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred (request/response) |
 
-Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
+Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `PASSTHROUGH`
 
 ## Health Endpoints
 

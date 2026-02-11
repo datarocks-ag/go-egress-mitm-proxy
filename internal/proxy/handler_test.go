@@ -51,18 +51,20 @@ func TestNormalizeDomainForMetrics(t *testing.T) {
 		"api.example.com": {TargetIP: "10.0.0.1"},
 	}
 	acl := config.CompiledACL{
-		Whitelist: []*regexp.Regexp{regexp.MustCompile(`^.*\.google\.com$`)},
-		Blacklist: []*regexp.Regexp{regexp.MustCompile(`^.*\.blocked\.com$`)},
+		Whitelist:   []*regexp.Regexp{regexp.MustCompile(`^.*\.google\.com$`)},
+		Blacklist:   []*regexp.Regexp{regexp.MustCompile(`^.*\.blocked\.com$`)},
+		Passthrough: []*regexp.Regexp{regexp.MustCompile(`^kubernetes\.default\.svc$`)},
 	}
 
 	tests := []struct {
 		host string
 		want string
 	}{
-		{"api.example.com", "api.example.com"}, // exact rewrite match
-		{"www.google.com", "google.com"},       // whitelist match -> base domain
-		{"sub.blocked.com", "blocked.com"},     // blacklist match -> base domain
-		{"random.unknown.com", "_other"},       // no match -> _other
+		{"api.example.com", "api.example.com"},    // exact rewrite match
+		{"www.google.com", "google.com"},          // whitelist match -> base domain
+		{"sub.blocked.com", "blocked.com"},        // blacklist match -> base domain
+		{"kubernetes.default.svc", "default.svc"}, // passthrough match -> base domain
+		{"random.unknown.com", "_other"},          // no match -> _other
 	}
 
 	for _, tt := range tests {

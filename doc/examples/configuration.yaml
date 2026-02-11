@@ -100,6 +100,7 @@ rewrites:
 
 # Access Control Lists (exact match, wildcards, or ~regex)
 # Evaluated in order: blacklist -> whitelist -> default_policy
+# Passthrough entries bypass MITM entirely (tunnel without TLS interception)
 acl:
   whitelist:
     - "*.google.com"
@@ -112,3 +113,8 @@ acl:
     - "*.facebook.com"
     - "*.twitter.com"
     - "~social-media\\.internal"   # regex: matches as substring
+  passthrough:
+    # Tunnel these hosts without MITM interception.
+    # Use for services with their own PKI where clients don't trust the proxy CA.
+    - "kubernetes.default.svc"
+    - "*.vault.internal"

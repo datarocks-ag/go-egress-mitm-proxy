@@ -72,15 +72,17 @@ type Config struct {
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
-		Whitelist []string `yaml:"whitelist"` // Regex patterns to allow
-		Blacklist []string `yaml:"blacklist"` // Regex patterns to block
+		Whitelist   []string `yaml:"whitelist"`   // Regex patterns to allow
+		Blacklist   []string `yaml:"blacklist"`   // Regex patterns to block
+		Passthrough []string `yaml:"passthrough"` // Regex patterns to tunnel without MITM
 	} `yaml:"acl"`
 }
 
 // CompiledACL holds pre-compiled regex patterns for efficient matching.
 type CompiledACL struct {
-	Whitelist []*regexp.Regexp
-	Blacklist []*regexp.Regexp
+	Whitelist   []*regexp.Regexp
+	Blacklist   []*regexp.Regexp
+	Passthrough []*regexp.Regexp
 }
 
 // RuntimeConfig holds the compiled, thread-safe runtime configuration.
@@ -405,6 +407,13 @@ func CompileACL(cfg Config) (CompiledACL, error) {
 			return CompiledACL{}, fmt.Errorf("invalid blacklist pattern[%d] %q: %w", i, p, err)
 		}
 		c.Blacklist = append(c.Blacklist, re)
+	}
+	for i, p := range cfg.ACL.Passthrough {
+		re, err := WildcardToRegex(p)
+		if err != nil {
+			return CompiledACL{}, fmt.Errorf("invalid passthrough pattern[%d] %q: %w", i, p, err)
+		}
+		c.Passthrough = append(c.Passthrough, re)
 	}
 	return c, nil
 }

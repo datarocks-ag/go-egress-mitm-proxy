@@ -349,7 +349,7 @@ func NormalizeDomainForMetrics(host string, rewriteExact map[string]*config.Comp
 	}
 
 	// Extract base domain (TLD+1) for ACL-matched hosts
-	if config.Matches(host, acl.Whitelist) || config.Matches(host, acl.Blacklist) {
+	if config.Matches(host, acl.Whitelist) || config.Matches(host, acl.Blacklist) || config.Matches(host, acl.Passthrough) {
 		return ExtractBaseDomain(host)
 	}
 
