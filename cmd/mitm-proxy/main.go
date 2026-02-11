@@ -58,9 +58,11 @@ Commands:
 Flags:
   -h, --help      Show this help message
   --version       Print version and exit
-  -v              Verbose output (info level, default)
+  -v              Info output (access logs)
   -vv             Debug output
   -vvv            Trace output (most verbose)
+
+Default log level is warn (errors and warnings only).
 
 Environment:
   CONFIG_PATH     Path to config file (default: config.yaml)
@@ -74,7 +76,7 @@ func main() {
 	var (
 		showVersion bool
 		showHelp    bool
-		logLevel    = slog.LevelInfo
+		logLevel    = slog.LevelWarn
 	)
 	var remaining []string
 	for _, arg := range os.Args[1:] {
@@ -89,7 +91,7 @@ func main() {
 		case "-vv":
 			logLevel = slog.LevelDebug
 		case "-v":
-			// Explicit info level (same as default)
+			logLevel = slog.LevelInfo
 		default:
 			remaining = append(remaining, arg)
 		}
