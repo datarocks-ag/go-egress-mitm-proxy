@@ -1033,6 +1033,42 @@ func TestRunGencertValidationErrors(t *testing.T) {
 			"invalid key algo",
 			[]string{"--type", "root", "--key-algo", "dsa-1024", "--out-cert", certPath, "--out-key", keyPath},
 		},
+		{
+			"empty cn",
+			[]string{"--type", "root", "--cn", "", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"negative validity",
+			[]string{"--type", "root", "--validity", "-1", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"zero validity",
+			[]string{"--type", "root", "--validity", "0", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"invalid max-path-len",
+			[]string{"--type", "root", "--max-path-len", "-2", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"country code too long",
+			[]string{"--type", "root", "--country", "CHE", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"country code too short",
+			[]string{"--type", "root", "--country", "C", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"intermediate signing-cert not found",
+			[]string{"--type", "intermediate", "--signing-cert", "/nonexistent/ca.crt", "--signing-key", "/nonexistent/ca.key", "--out-cert", certPath, "--out-key", keyPath},
+		},
+		{
+			"output path conflict cert and key",
+			[]string{"--type", "root", "--out-cert", certPath, "--out-key", certPath},
+		},
+		{
+			"output path conflict cert and chain",
+			[]string{"--type", "root", "--out-cert", certPath, "--out-key", keyPath, "--out-chain", certPath},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1040,6 +1076,12 @@ func TestRunGencertValidationErrors(t *testing.T) {
 				t.Error("expected error, got nil")
 			}
 		})
+	}
+}
+
+func TestRunGencertHelpReturnsNil(t *testing.T) {
+	if err := RunGencert([]string{"--help"}); err != nil {
+		t.Errorf("--help should return nil, got %v", err)
 	}
 }
 
