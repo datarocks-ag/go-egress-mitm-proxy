@@ -47,8 +47,11 @@ mitm-proxy --version
 # Show help
 mitm-proxy --help
 
-# Run with default verbosity (info level)
+# Run with default verbosity (warn — errors and warnings only)
 mitm-proxy
+
+# Run with access logs (info level)
+mitm-proxy -v
 
 # Run with debug output
 mitm-proxy -vv
@@ -64,7 +67,8 @@ mitm-proxy gencert --help
 |------|-------------|
 | `--version` | Print version and exit |
 | `-h`, `--help` | Show help message |
-| `-v` | Info level (default) — ACCESS log per request (host, action, method, path) |
+| *(none)* | Warn (default) — errors and warnings only |
+| `-v` | Info — `ACCESS` log per request (host, action, method, path) |
 | `-vv` | Debug — adds `REQUEST_DETAIL` per request (scheme, full URL, proto, remote addr, content-length, user-agent, content-type, rewrite target) |
 | `-vvv` | Trace — adds full request headers to `REQUEST_DETAIL` |
 
@@ -393,7 +397,8 @@ All log output is structured JSON via `slog`. The verbosity flag controls which 
 
 | Level | Flag | What is logged |
 |-------|------|----------------|
-| Info | `-v` (default) | `ACCESS` line per request: request_id, client, host, action, method, path |
+| Warn | *(none, default)* | Errors and warnings only (upstream failures, config errors) |
+| Info | `-v` | `ACCESS` line per request: request_id, client, host, action, method, path |
 | Debug | `-vv` | Adds `REQUEST_DETAIL` per request: scheme, full URL, proto, remote_addr, content_length, user_agent, content_type, and rewrite target info (target_ip, target_host, original) when a rewrite matched |
 | Trace | `-vvv` | Adds all request headers to `REQUEST_DETAIL` |
 
