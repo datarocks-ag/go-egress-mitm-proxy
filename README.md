@@ -7,7 +7,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 - **Split-brain DNS** via TCP dial interception (not DNS-level), with `target_ip` or `target_host` routing
 - **Path-based routing** - route different URL paths on the same domain to different backends (`path_pattern`)
 - **Scheme rewriting** - change the request scheme before forwarding (`target_scheme`)
-- **ACL** with whitelist/blacklist support (exact match, wildcards, regex)
+- **ACL** with whitelist/blacklist/passthrough support (exact match, wildcards, regex)
 - **Header injection** on rewritten requests, plus automatic `X-Request-ID` for tracing
 - **Header stripping** - remove sensitive headers before forwarding (`drop_headers`)
 - **Per-rewrite TLS bypass** - skip upstream TLS verification for specific targets (`insecure`)
@@ -64,9 +64,9 @@ mitm-proxy gencert --help
 |------|-------------|
 | `--version` | Print version and exit |
 | `-h`, `--help` | Show help message |
-| `-v` | Verbose output (info level, default) |
-| `-vv` | Debug output |
-| `-vvv` | Trace output (most verbose) |
+| `-v` | Info level (default) — ACCESS log per request (host, action, method, path) |
+| `-vv` | Debug — adds `REQUEST_DETAIL` per request (scheme, full URL, proto, remote addr, content-length, user-agent, content-type, rewrite target) |
+| `-vvv` | Trace — adds full request headers to `REQUEST_DETAIL` |
 
 | Subcommand | Description |
 |------------|-------------|
@@ -161,6 +161,9 @@ acl:
     - "github.com"
   blacklist:
     - "*.tiktok.com"
+  passthrough:                    # Tunnel without MITM (for services with their own PKI)
+    - "kubernetes.default.svc"
+    - "*.vault.internal"
 ```
 
 See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.
@@ -384,6 +387,18 @@ kill -HUP <pid>
 
 The proxy will log successful reloads and any errors. SIGHUP also reopens the blocked request log file, enabling log rotation.
 
+## Logging
+
+All log output is structured JSON via `slog`. The verbosity flag controls which log levels are emitted:
+
+| Level | Flag | What is logged |
+|-------|------|----------------|
+| Info | `-v` (default) | `ACCESS` line per request: request_id, client, host, action, method, path |
+| Debug | `-vv` | Adds `REQUEST_DETAIL` per request: scheme, full URL, proto, remote_addr, content_length, user_agent, content_type, and rewrite target info (target_ip, target_host, original) when a rewrite matched |
+| Trace | `-vvv` | Adds all request headers to `REQUEST_DETAIL` |
+
+Debug and trace logging have zero overhead when not enabled — the log construction is gated behind `slog.Default().Enabled()`.
+
 ## Blocked Request Log
 
 When `blocked_log_path` is configured, the proxy writes a JSON log entry for every request with action `BLACK-LISTED` or `BLOCKED`. Each entry includes `request_id`, `client`, `host`, `method`, `path`, and `action`. The log file is reopened on SIGHUP for log rotation support.
@@ -403,7 +418,7 @@ Available at `http://localhost:9090/metrics`:
 | `proxy_response_status_total` | Counter | class | Response status codes (2xx, 4xx, 5xx) |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred (request/response) |
 
-Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
+Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `PASSTHROUGH`
 
 ## Health Endpoints
 

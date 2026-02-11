@@ -61,31 +61,33 @@ When the proxy intercepts a CONNECT tunnel, `goproxy` dynamically generates a TL
 
 1. **Client initiates CONNECT** -- The client sends an HTTP `CONNECT host:443` request to the proxy over plaintext HTTP.
 
-2. **Proxy accepts the tunnel** -- The proxy responds with `200 Connection Established`. The TCP tunnel is now open.
+2. **Proxy evaluates passthrough ACL** -- Before performing MITM, the proxy checks if the host matches any `acl.passthrough` pattern. If matched, the proxy responds with `200 Connection Established` and creates a plain TCP tunnel — no TLS interception occurs, the client talks directly to the upstream server through the tunnel. The `PASSTHROUGH` action is logged and recorded in metrics. Steps 3–9 are skipped.
 
-3. **Client-side TLS handshake (MITM)** -- The proxy acts as the TLS server. `goproxy` generates a certificate for `host` signed by the MITM CA and presents it. The client verifies it against its trust store (which includes the MITM CA) and the handshake completes.
+3. **Proxy accepts the tunnel (MITM)** -- For non-passthrough hosts, the proxy responds with `200 Connection Established`. The TCP tunnel is now open.
 
-4. **Client sends HTTP request** -- Over the now-encrypted tunnel, the client sends the actual HTTP request (e.g., `GET /api/data`).
+4. **Client-side TLS handshake (MITM)** -- The proxy acts as the TLS server. `goproxy` generates a certificate for `host` signed by the MITM CA and presents it. The client verifies it against its trust store (which includes the MITM CA) and the handshake completes.
 
-5. **Proxy evaluates policy** -- The `handleRequest` function processes the request:
+5. **Client sends HTTP request** -- Over the now-encrypted tunnel, the client sends the actual HTTP request (e.g., `GET /api/data`).
+
+6. **Proxy evaluates policy** -- The `handleRequest` function processes the request:
    - Generates and injects `X-Request-ID` header
    - Checks **rewrite rules** (exact match, then wildcard patterns)
    - If no rewrite matched: checks **blacklist** -> **whitelist** -> **default policy**
    - If blocked (`BLACK-LISTED` or `BLOCKED`): returns `403 Forbidden` immediately; no upstream connection is made.
 
-6. **Proxy dials upstream** -- For allowed/rewritten requests, the custom `DialContext` resolves the destination:
+7. **Proxy dials upstream** -- For allowed/rewritten requests, the custom `DialContext` resolves the destination:
    - **Normal case:** dials the original `host:443` via DNS
    - **Rewrite case (split-brain DNS):** dials `target_ip:443` instead, bypassing DNS entirely. TLS SNI still uses the original hostname, so the upstream server's certificate is verified against the original domain.
 
-7. **Upstream TLS handshake** -- The proxy acts as a TLS client toward the origin server. It verifies the server's real certificate against:
+8. **Upstream TLS handshake** -- The proxy acts as a TLS client toward the origin server. It verifies the server's real certificate against:
    - System CA trust store
    - Optional `outgoing_ca_bundle` (PEM bundle file)
    - Optional `outgoing_ca` (list of individual PEM cert files)
    - Optional `outgoing_truststore_*` (PKCS#12 truststore)
 
-8. **Request forwarded** -- The proxy forwards the (potentially modified) request to the upstream server. For rewritten domains, custom headers are injected.
+9. **Request forwarded** -- The proxy forwards the (potentially modified) request to the upstream server. For rewritten domains, custom headers are injected.
 
-9. **Response relayed** -- The upstream response flows back through both TLS tunnels to the client. Response metrics are recorded.
+10. **Response relayed** -- The upstream response flows back through both TLS tunnels to the client. Response metrics are recorded.
 
 ### Two Independent TLS Sessions
 
@@ -115,6 +117,17 @@ sequenceDiagram
     note over C,P: Plaintext HTTP (port 8080)
 
     C->>P: CONNECT api.example.com:443 HTTP/1.1
+
+    note right of P: Check acl.passthrough patterns<br/>against hostname
+
+    alt PASSTHROUGH (host matches acl.passthrough)
+        P->>C: HTTP/1.1 200 Connection Established
+        note over C,U: Plain TCP tunnel (no MITM)<br/>Proxy cannot inspect traffic
+        C->>U: TLS Handshake directly with upstream
+        U->>C: Server certificate (real cert)
+        C->>U: Application data
+        U->>C: Application data
+    else Normal flow (MITM)
     P->>C: HTTP/1.1 200 Connection Established
 
     note over C,P: TLS Handshake #1 (Client ↔ Proxy)
@@ -162,6 +175,7 @@ sequenceDiagram
         P->>U: GET /api/data HTTP/1.1<br/>Host: api.example.com<br/>X-Request-ID: abc123
         U->>P: HTTP/1.1 200 OK + body
         P->>C: HTTP/1.1 200 OK + body
+    end
     end
 ```
 

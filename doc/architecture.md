@@ -13,13 +13,20 @@ sequenceDiagram
     participant Target as Target Server
 
     Client->>Proxy: CONNECT example.com:443
-    Proxy-->>Client: 200 OK
 
-    Client->>Proxy: TLS Handshake
-    Note right of Proxy: Proxy presents cert signed<br/>by internal CA
+    alt PASSTHROUGH (matches acl.passthrough)
+        Proxy-->>Client: 200 OK (tunnel, no MITM)
+        Note right of Proxy: TCP tunnel established<br/>No TLS interception<br/>No request inspection
+        Client->>Target: Direct TLS to upstream
+        Target-->>Client: Direct TLS response
+    else Normal (MITM)
+        Proxy-->>Client: 200 OK
 
-    Client->>Proxy: GET /api
-    Note right of Proxy: 1. Generate X-Request-ID<br/>2. Check rewrite rules<br/>   (exact → wildcard → path)<br/>3. Check ACL blacklist<br/>4. Check ACL whitelist<br/>5. Apply default policy
+        Client->>Proxy: TLS Handshake
+        Note right of Proxy: Proxy presents cert signed<br/>by internal CA
+
+        Client->>Proxy: GET /api
+        Note right of Proxy: 1. Generate X-Request-ID<br/>2. Check rewrite rules<br/>   (exact → wildcard → path)<br/>3. Check ACL blacklist<br/>4. Check ACL whitelist<br/>5. Apply default policy
 
     alt BLOCKED / BLACK-LISTED
         Proxy-->>Client: 403 Forbidden
@@ -33,6 +40,7 @@ sequenceDiagram
         Proxy->>Target: Forward request
         Target-->>Proxy: Response
         Proxy-->>Client: Response
+    end
     end
 ```
 
@@ -103,6 +111,7 @@ Environment variable overrides follow 12-factor app principles:
 
 Pre-compiles patterns at startup for efficient runtime matching. ACL patterns support the same syntax as rewrite rules: exact match, wildcards (`*.example.com`), and raw regex (`~<pattern>`). Evaluation order:
 
+0. **Passthrough** - Checked at CONNECT stage (before TLS). Matching hosts are tunneled without MITM interception. No request inspection occurs.
 1. **Rewrite rules** - Exact match first (O(1) map lookup), then wildcard/regex patterns with optional `path_pattern` filtering
 2. **Blacklist** - Blocks request if matched
 3. **Whitelist** - Allows request if matched
@@ -204,7 +213,7 @@ Prometheus metrics with bounded cardinality:
 
 Domain normalization prevents cardinality explosion:
 - Known rewrite domains: tracked individually
-- ACL-matched domains: tracked by base domain (TLD+1)
+- ACL-matched domains (whitelist, blacklist, passthrough): tracked by base domain (TLD+1)
 - Unknown domains: grouped as `_other`
 
 ### Health Server

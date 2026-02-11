@@ -51,18 +51,20 @@ func TestNormalizeDomainForMetrics(t *testing.T) {
 		"api.example.com": {TargetIP: "10.0.0.1"},
 	}
 	acl := config.CompiledACL{
-		Whitelist: []*regexp.Regexp{regexp.MustCompile(`^.*\.google\.com$`)},
-		Blacklist: []*regexp.Regexp{regexp.MustCompile(`^.*\.blocked\.com$`)},
+		Whitelist:   []*regexp.Regexp{regexp.MustCompile(`^.*\.google\.com$`)},
+		Blacklist:   []*regexp.Regexp{regexp.MustCompile(`^.*\.blocked\.com$`)},
+		Passthrough: []*regexp.Regexp{regexp.MustCompile(`^kubernetes\.default\.svc$`)},
 	}
 
 	tests := []struct {
 		host string
 		want string
 	}{
-		{"api.example.com", "api.example.com"}, // exact rewrite match
-		{"www.google.com", "google.com"},       // whitelist match -> base domain
-		{"sub.blocked.com", "blocked.com"},     // blacklist match -> base domain
-		{"random.unknown.com", "_other"},       // no match -> _other
+		{"api.example.com", "api.example.com"},    // exact rewrite match
+		{"www.google.com", "google.com"},          // whitelist match -> base domain
+		{"sub.blocked.com", "blocked.com"},        // blacklist match -> base domain
+		{"kubernetes.default.svc", "default.svc"}, // passthrough match -> base domain
+		{"random.unknown.com", "_other"},          // no match -> _other
 	}
 
 	for _, tt := range tests {
@@ -711,6 +713,44 @@ func TestMakeTLSDialer(t *testing.T) {
 		}
 		conn.Close() //nolint:errcheck // test cleanup
 	})
+}
+
+func TestHandleRequestWhitelistWildcardHTTPAndHTTPS(t *testing.T) {
+	rc := &config.RuntimeConfig{}
+	cfg := config.Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.Proxy.MitmCertPath = "/path/to/cert"
+	cfg.Proxy.MitmKeyPath = "/path/to/key"
+
+	acl := config.CompiledACL{
+		Whitelist: []*regexp.Regexp{regexp.MustCompile(`^subdomain\..*`)},
+	}
+	_ = rc.Update(cfg, acl, nil, nil, nil, nil)
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"http request", "http://subdomain.example.com/test"},
+		{"https request", "https://subdomain.example.com/test"},
+		{"http different tld", "http://subdomain.other.org/path"},
+		{"https different tld", "https://subdomain.other.org/path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tt.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, resp := HandleRequest(req, nil, rc)
+			if resp != nil {
+				resp.Body.Close() //nolint:errcheck // test cleanup
+				t.Fatalf("expected request to be whitelisted (nil response), got status %d", resp.StatusCode)
+			}
+		})
+	}
 }
 
 func TestResponseProtoNormalization(t *testing.T) {

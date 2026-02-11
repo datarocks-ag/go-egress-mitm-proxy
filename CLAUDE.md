@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-go-egress-proxy is a MITM HTTP/HTTPS proxy that implements split-brain DNS functionality. It intercepts egress traffic, applies ACL policies (whitelist/blacklist with regex), rewrites specific domains to internal IPs (with wildcard support), and injects custom headers.
+go-egress-proxy is a MITM HTTP/HTTPS proxy that implements split-brain DNS functionality. It intercepts egress traffic, applies ACL policies (whitelist/blacklist/passthrough with regex), rewrites specific domains to internal IPs (with wildcard support), and injects custom headers. Passthrough ACL entries tunnel CONNECT requests without TLS interception for services with their own PKI (e.g., Kubernetes API).
 
 ## Build and Run Commands
 
@@ -21,8 +21,8 @@ make install-tools  # Install dev tools (golangci-lint, goimports)
 # CLI flags
 ./mitm-proxy --version       # Print version and exit
 ./mitm-proxy --help          # Show usage
-./mitm-proxy -vv             # Run with debug logging
-./mitm-proxy -vvv            # Run with trace logging (most verbose)
+./mitm-proxy -vv             # Debug: ACCESS log + REQUEST_DETAIL (scheme, url, proto, user-agent, content-type, rewrite info)
+./mitm-proxy -vvv            # Trace: all of the above + full request headers
 
 # Validate configuration without starting the proxy
 go run ./cmd/mitm-proxy validate --config config.yaml
@@ -70,10 +70,11 @@ cmd/main    → config, cert, proxy, metrics, health
 ```
 
 **Request Flow:**
-1. Client connects → Proxy presents cert signed by internal CA (MITM)
-2. Request ID generated and injected (`X-Request-ID`)
-3. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
-4. Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
+1. Client connects → CONNECT handler checks passthrough ACL; if matched, tunnel is established without MITM (`PASSTHROUGH`)
+2. Otherwise, proxy presents cert signed by internal CA (MITM)
+3. Request ID generated and injected (`X-Request-ID`)
+4. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
+5. Actions: `PASSTHROUGH`, `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
 5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
 6. Headers dropped (`drop_headers`) and injected (`headers`) on rewritten requests
 7. Request scheme optionally changed (`target_scheme`) before forwarding
@@ -94,7 +95,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 `internal/config`:
 - `RuntimeConfig` - Thread-safe config holder with RWMutex for hot reload
 - `LoadConfig()` - Loads YAML, applies env overrides, validates
-- `CompileACL()` / `CompileRewrites()` - Pre-compiles patterns via `WildcardToRegex()`
+- `CompileACL()` / `CompileRewrites()` - Pre-compiles patterns (whitelist, blacklist, passthrough) via `WildcardToRegex()`
 - `WildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
 - `RunValidate()` - CLI subcommand: validates config file without starting the proxy
 

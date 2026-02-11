@@ -460,8 +460,9 @@ func TestCompileACL(t *testing.T) {
 			name: "valid patterns",
 			config: Config{
 				ACL: struct {
-					Whitelist []string `yaml:"whitelist"`
-					Blacklist []string `yaml:"blacklist"`
+					Whitelist   []string `yaml:"whitelist"`
+					Blacklist   []string `yaml:"blacklist"`
+					Passthrough []string `yaml:"passthrough"`
 				}{
 					Whitelist: []string{`*.google.com`, `github.com`},
 					Blacklist: []string{`*.tiktok.com`},
@@ -473,8 +474,9 @@ func TestCompileACL(t *testing.T) {
 			name: "invalid whitelist pattern",
 			config: Config{
 				ACL: struct {
-					Whitelist []string `yaml:"whitelist"`
-					Blacklist []string `yaml:"blacklist"`
+					Whitelist   []string `yaml:"whitelist"`
+					Blacklist   []string `yaml:"blacklist"`
+					Passthrough []string `yaml:"passthrough"`
 				}{
 					Whitelist: []string{`~[invalid`},
 				},
@@ -485,10 +487,37 @@ func TestCompileACL(t *testing.T) {
 			name: "invalid blacklist pattern",
 			config: Config{
 				ACL: struct {
-					Whitelist []string `yaml:"whitelist"`
-					Blacklist []string `yaml:"blacklist"`
+					Whitelist   []string `yaml:"whitelist"`
+					Blacklist   []string `yaml:"blacklist"`
+					Passthrough []string `yaml:"passthrough"`
 				}{
 					Blacklist: []string{`~[invalid`},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid passthrough patterns",
+			config: Config{
+				ACL: struct {
+					Whitelist   []string `yaml:"whitelist"`
+					Blacklist   []string `yaml:"blacklist"`
+					Passthrough []string `yaml:"passthrough"`
+				}{
+					Passthrough: []string{`kubernetes.default.svc`, `*.internal.local`},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid passthrough pattern",
+			config: Config{
+				ACL: struct {
+					Whitelist   []string `yaml:"whitelist"`
+					Blacklist   []string `yaml:"blacklist"`
+					Passthrough []string `yaml:"passthrough"`
+				}{
+					Passthrough: []string{`~[invalid`},
 				},
 			},
 			wantErr: true,
@@ -520,6 +549,32 @@ func TestMatches(t *testing.T) {
 		{"google.com", false},
 		{"notgoogle.com", false},
 		{"github.org", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := Matches(tt.host, patterns); got != tt.want {
+				t.Errorf("Matches(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesPassthrough(t *testing.T) {
+	p1, _ := WildcardToRegex("kubernetes.default.svc")
+	p2, _ := WildcardToRegex("*.internal.local")
+	patterns := []*regexp.Regexp{p1, p2}
+
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"kubernetes.default.svc", true},
+		{"api.internal.local", true},
+		{"deep.sub.internal.local", true},
+		{"internal.local", false},
+		{"kubernetes.default", false},
+		{"other.svc", false},
 	}
 
 	for _, tt := range tests {

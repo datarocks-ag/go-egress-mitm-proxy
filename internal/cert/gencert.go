@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"strings"
 	"time"
 
 	gopkcs12 "software.sslmate.com/src/go-pkcs12"
@@ -73,25 +74,82 @@ Flags:
 	clientP12Password := fs.String("client-p12-password", "changeit", "password for --out-client-p12 truststore")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // usage already printed by FlagSet
+		}
 		return err
 	}
 
 	// Validate flags
+	var validationErrors []string
+
 	switch *certType {
 	case "root", "intermediate":
 	default:
-		return fmt.Errorf("--type must be 'root' or 'intermediate', got %q", *certType)
+		validationErrors = append(validationErrors, fmt.Sprintf("--type must be 'root' or 'intermediate', got %q", *certType))
 	}
+
+	switch *keyAlgo {
+	case "rsa-2048", "rsa-4096", "ecdsa-p256", "ecdsa-p384", "ed25519":
+	default:
+		validationErrors = append(validationErrors, fmt.Sprintf("--key-algo must be one of rsa-2048, rsa-4096, ecdsa-p256, ecdsa-p384, ed25519; got %q", *keyAlgo))
+	}
+
+	if *cn == "" {
+		validationErrors = append(validationErrors, "--cn must not be empty")
+	}
+	if *validity <= 0 {
+		validationErrors = append(validationErrors, fmt.Sprintf("--validity must be a positive number of days, got %d", *validity))
+	}
+	if *maxPathLen < -1 {
+		validationErrors = append(validationErrors, fmt.Sprintf("--max-path-len must be -1 (unlimited) or >= 0, got %d", *maxPathLen))
+	}
+	if *country != "" && len(*country) != 2 {
+		validationErrors = append(validationErrors, fmt.Sprintf("--country must be a 2-letter ISO 3166-1 code, got %q", *country))
+	}
+
 	if *certType == "intermediate" {
 		if *signingCert == "" || *signingKey == "" {
-			return errors.New("--signing-cert and --signing-key are required for intermediate CA")
+			validationErrors = append(validationErrors, "--signing-cert and --signing-key are required for intermediate CA")
+		} else {
+			if _, err := os.Stat(*signingCert); err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("--signing-cert file not accessible: %v", err))
+			}
+			if _, err := os.Stat(*signingKey); err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("--signing-key file not accessible: %v", err))
+			}
 		}
 	}
+
 	if *outP12 != "" && *p12Password == "" {
-		return errors.New("--p12-password is required when using --out-p12")
+		validationErrors = append(validationErrors, "--p12-password is required when using --out-p12")
 	}
 	if *outClientP12 != "" && *clientP12Password == "" {
-		return errors.New("--client-p12-password is required when using --out-client-p12")
+		validationErrors = append(validationErrors, "--client-p12-password is required when using --out-client-p12")
+	}
+
+	// Check for output path conflicts
+	outputs := map[string]string{
+		*outCert: "--out-cert",
+	}
+	outputConflict := func(path, flagName string) {
+		if path == "" {
+			return
+		}
+		if existing, ok := outputs[path]; ok {
+			validationErrors = append(validationErrors, fmt.Sprintf("%s and %s must not share the same path %q", existing, flagName, path))
+		} else {
+			outputs[path] = flagName
+		}
+	}
+	outputConflict(*outKey, "--out-key")
+	outputConflict(*outChain, "--out-chain")
+	outputConflict(*outP12, "--out-p12")
+	outputConflict(*outClientBundle, "--out-client-bundle")
+	outputConflict(*outClientP12, "--out-client-p12")
+
+	if len(validationErrors) > 0 {
+		return fmt.Errorf("invalid flags:\n  - %s", strings.Join(validationErrors, "\n  - "))
 	}
 
 	// Generate key pair
