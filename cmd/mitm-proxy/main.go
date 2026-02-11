@@ -58,11 +58,12 @@ Commands:
 Flags:
   -h, --help      Show this help message
   --version       Print version and exit
-  -v              Info output (access logs)
+  -v              Enable info logs (includes access logs)
   -vv             Debug output
   -vvv            Trace output (most verbose)
 
 Default log level is warn (errors and warnings only).
+Subcommands (validate, gencert) default to info for user-friendly output.
 
 Environment:
   CONFIG_PATH     Path to config file (default: config.yaml)
@@ -74,9 +75,10 @@ Use "%s gencert --help" for certificate generation options.
 func main() {
 	// Parse top-level flags from os.Args[1:]
 	var (
-		showVersion bool
-		showHelp    bool
-		logLevel    = slog.LevelWarn
+		showVersion  bool
+		showHelp     bool
+		logLevel     = slog.LevelWarn
+		verbositySet bool
 	)
 	var remaining []string
 	for _, arg := range os.Args[1:] {
@@ -87,11 +89,20 @@ func main() {
 			showHelp = true
 			remaining = append(remaining, arg) // pass through for subcommand help
 		case "-vvv":
-			logLevel = slog.Level(-8) // Trace: below slog.LevelDebug (-4)
+			if level := slog.Level(-8); !verbositySet || level < logLevel {
+				logLevel = level // Trace: below slog.LevelDebug (-4)
+			}
+			verbositySet = true
 		case "-vv":
-			logLevel = slog.LevelDebug
+			if !verbositySet || slog.LevelDebug < logLevel {
+				logLevel = slog.LevelDebug
+			}
+			verbositySet = true
 		case "-v":
-			logLevel = slog.LevelInfo
+			if !verbositySet || slog.LevelInfo < logLevel {
+				logLevel = slog.LevelInfo
+			}
+			verbositySet = true
 		default:
 			remaining = append(remaining, arg)
 		}
@@ -107,6 +118,12 @@ func main() {
 	if showHelp && !hasSubcommand {
 		printUsage()
 		return
+	}
+
+	// Subcommands default to info for user-friendly output;
+	// the proxy defaults to warn (quiet) unless verbosity is set explicitly.
+	if !verbositySet && hasSubcommand {
+		logLevel = slog.LevelInfo
 	}
 
 	// Initialize structured JSON logging with configured level

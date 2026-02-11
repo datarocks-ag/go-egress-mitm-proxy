@@ -21,7 +21,7 @@ make install-tools  # Install dev tools (golangci-lint, goimports)
 # CLI flags
 ./mitm-proxy --version       # Print version and exit
 ./mitm-proxy --help          # Show usage
-./mitm-proxy -v              # Info: ACCESS log per request (default is warn-only)
+./mitm-proxy -v              # Info: enables info logs including access logs (default is warn-only; subcommands default to info)
 ./mitm-proxy -vv             # Debug: ACCESS log + REQUEST_DETAIL (scheme, url, proto, user-agent, content-type, rewrite info)
 ./mitm-proxy -vvv            # Trace: all of the above + full request headers
 
