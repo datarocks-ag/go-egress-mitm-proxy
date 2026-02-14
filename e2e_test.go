@@ -1303,3 +1303,258 @@ acl:
 		t.Logf("passthrough cert issuer: CN=%s, O=%v (verified upstream CA, not MITM)", issuer.CommonName, issuer.Organization)
 	})
 }
+
+// TestE2ENonStandardPort verifies that HTTPS requests on non-standard ports
+// work through the MITM proxy. The CONNECT host includes the non-standard
+// port (e.g., host:8443) and the proxy must correctly generate MITM certs
+// and forward the request.
+func TestE2ENonStandardPort(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// --- MITM CA certificates ---
+	mitmCertsDir := filepath.Join(tmpDir, "mitm-certs")
+	if err := os.Mkdir(mitmCertsDir, 0o750); err != nil {
+		t.Fatalf("create mitm certs dir: %v", err)
+	}
+	mitmCAPool := generateE2ECerts(t, mitmCertsDir)
+
+	// --- Upstream TLS certificates (for nginx on non-standard port) ---
+	upstreamDir := filepath.Join(tmpDir, "upstream-certs")
+	if err := os.Mkdir(upstreamDir, 0o750); err != nil {
+		t.Fatalf("create upstream certs dir: %v", err)
+	}
+	generateUpstreamTLSCerts(t, upstreamDir, []string{"nonstandard-port.example.com"})
+
+	// --- Docker network ---
+	nw, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create docker network: %v", err)
+	}
+	t.Cleanup(func() {
+		if rmErr := nw.Remove(ctx); rmErr != nil {
+			t.Logf("remove network: %v", rmErr)
+		}
+	})
+
+	// --- nginx TLS on non-standard port 8443 ---
+	nginxConf := filepath.Join(tmpDir, "nginx.conf")
+	nginxConfContent := `events {
+    worker_connections 64;
+}
+
+http {
+    server {
+        listen 8443 ssl;
+        ssl_certificate /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+
+        location / {
+            return 200 'nonstandard-port-ok';
+            default_type text/plain;
+        }
+    }
+}
+`
+	if writeErr := os.WriteFile(nginxConf, []byte(nginxConfContent), 0o600); writeErr != nil {
+		t.Fatalf("write nginx.conf: %v", writeErr)
+	}
+
+	nginxCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:          "nginx:1.27-alpine",
+			ExposedPorts:   []string{"8443/tcp"},
+			Networks:       []string{nw.Name},
+			NetworkAliases: map[string][]string{nw.Name: {"nonstandard-port.example.com"}},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.crt"),
+					ContainerFilePath: "/etc/nginx/certs/server.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(upstreamDir, "server.key"),
+					ContainerFilePath: "/etc/nginx/certs/server.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      nginxConf,
+					ContainerFilePath: "/etc/nginx/nginx.conf",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForListeningPort("8443/tcp").WithStartupTimeout(30 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start nginx container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(nginxCtr); termErr != nil {
+			t.Logf("terminate nginx: %v", termErr)
+		}
+	})
+
+	t.Logf("nginx non-standard port container started on 8443")
+
+	// --- Proxy config: whitelist the domain, insecure_skip_verify for upstream ---
+	upstreamCAPEM, err := os.ReadFile(filepath.Join(upstreamDir, "ca.crt"))
+	if err != nil {
+		t.Fatalf("read upstream CA: %v", err)
+	}
+	upstreamCAPath := filepath.Join(tmpDir, "upstream-ca.crt")
+	if writeErr := os.WriteFile(upstreamCAPath, upstreamCAPEM, 0o600); writeErr != nil {
+		t.Fatalf("write upstream CA bundle: %v", writeErr)
+	}
+
+	proxyConfig := fmt.Sprintf(`proxy:
+  port: "8080"
+  metrics_port: "9090"
+  default_policy: "BLOCK"
+  mitm_cert_path: "/app/certs/ca.crt"
+  mitm_key_path: "/app/certs/ca.key"
+  outgoing_ca_bundle: "/app/certs/upstream-ca.crt"
+acl:
+  whitelist:
+    - "nonstandard-port.example.com"
+`)
+	if writeErr := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(proxyConfig), 0o600); writeErr != nil {
+		t.Fatalf("write proxy config: %v", writeErr)
+	}
+
+	// --- Start proxy container ---
+	proxyCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
+			Networks:     []string{nw.Name},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
+					ContainerFilePath: "/app/certs/ca.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(mitmCertsDir, "ca.key"),
+					ContainerFilePath: "/app/certs/ca.key",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      upstreamCAPath,
+					ContainerFilePath: "/app/certs/upstream-ca.crt",
+					FileMode:          0o644,
+				},
+				{
+					HostFilePath:      filepath.Join(tmpDir, "config.yaml"),
+					ContainerFilePath: "/app/config.yaml",
+					FileMode:          0o644,
+				},
+			},
+			WaitingFor: wait.ForHTTP("/healthz").WithPort("9090/tcp").WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start proxy container: %v", err)
+	}
+	t.Cleanup(func() {
+		if termErr := testcontainers.TerminateContainer(proxyCtr); termErr != nil {
+			t.Logf("terminate proxy: %v", termErr)
+		}
+	})
+
+	proxyPort, err := proxyCtr.MappedPort(ctx, "8080/tcp")
+	if err != nil {
+		t.Fatalf("get proxy port: %v", err)
+	}
+	proxyHost, err := proxyCtr.Host(ctx)
+	if err != nil {
+		t.Fatalf("get proxy host: %v", err)
+	}
+
+	proxyURL, err := url.Parse(fmt.Sprintf("http://%s:%s", proxyHost, proxyPort.Port()))
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	t.Logf("proxy at %s", proxyURL)
+
+	// Client trusts the MITM CA (proxy generates MITM certs signed by this CA)
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    mitmCAPool,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	t.Run("https_nonstandard_port_whitelisted", func(t *testing.T) {
+		// CONNECT to nonstandard-port.example.com:8443 → MITM → whitelist → forward.
+		// The proxy must generate a valid MITM cert for the hostname (without port)
+		// and successfully connect to upstream on port 8443.
+		resp, err := doGet(ctx, tlsClient, "https://nonstandard-port.example.com:8443/")
+		if err != nil {
+			t.Fatalf("request through proxy failed (non-standard port MITM broken): %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		if string(body) != "nonstandard-port-ok" {
+			t.Errorf("unexpected body: %s", string(body))
+		}
+		t.Logf("non-standard port response: %d %s", resp.StatusCode, string(body))
+	})
+
+	t.Run("mitm_cert_valid_for_nonstandard_port", func(t *testing.T) {
+		// Verify the MITM cert is properly generated for the hostname
+		// (port stripped) and signed by our test CA.
+		resp, err := doGet(ctx, tlsClient, "https://nonstandard-port.example.com:8443/")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.TLS == nil {
+			t.Fatal("response has no TLS connection state")
+		}
+		if len(resp.TLS.PeerCertificates) == 0 {
+			t.Fatal("no peer certificates in TLS handshake")
+		}
+
+		leaf := resp.TLS.PeerCertificates[0]
+
+		// Cert should be for the hostname (without port)
+		matched := false
+		for _, name := range leaf.DNSNames {
+			if name == "nonstandard-port.example.com" {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("MITM cert DNSNames = %v, want to contain %q", leaf.DNSNames, "nonstandard-port.example.com")
+		}
+
+		// Cert should be signed by the MITM CA, not the upstream CA
+		if leaf.Issuer.CommonName == "E2E Upstream CA" {
+			t.Fatal("cert is signed by upstream CA — MITM interception did not happen")
+		}
+		if leaf.Issuer.CommonName != "E2E Test CA" {
+			t.Errorf("MITM cert issuer CN = %q, want %q", leaf.Issuer.CommonName, "E2E Test CA")
+		}
+		t.Logf("non-standard port MITM cert: CN=%s, DNSNames=%v, issuer=%s",
+			leaf.Subject.CommonName, leaf.DNSNames, leaf.Issuer.CommonName)
+	})
+}
