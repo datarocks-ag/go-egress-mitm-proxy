@@ -218,3 +218,10 @@ docker-compose.yaml            # Local dev environment
 - `github.com/prometheus/client_golang` - Prometheus metrics
 - `software.sslmate.com/src/go-pkcs12` - PKCS#12 keystore/truststore encoding and decoding
 - `gopkg.in/yaml.v3` - Config parsing
+
+## Conventions
+
+- Git branching: `feature/`, `bugfix/`, `hotfix/`, `release/` prefixes
+- **Never push directly to `develop` or `main`** — always create a feature branch and open a pull request
+- Do not add `Co-Authored-By` lines in commit messages
+- Do not add `Generated with Claude Code` lines in pull request descriptions

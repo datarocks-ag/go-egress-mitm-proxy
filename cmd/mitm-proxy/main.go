@@ -204,7 +204,10 @@ func main() {
 	proxyHandler.Logger = &slogProxyLogger{}
 	proxyHandler.Verbose = slog.Default().Enabled(context.Background(), slog.LevelDebug)
 
-	mitmAction := &goproxy.ConnectAction{Action: goproxy.ConnectMitm}
+	mitmAction := &goproxy.ConnectAction{
+		Action:    goproxy.ConnectMitm,
+		TLSConfig: goproxy.TLSConfigFromCA(&goproxy.GoproxyCa),
+	}
 	if cfg.Proxy.MitmOrg != "" {
 		mitmAction.TLSConfig = cert.MitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg)
 	}
