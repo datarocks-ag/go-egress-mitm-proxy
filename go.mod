@@ -3,7 +3,7 @@ module go-egress-proxy
 go 1.25.0
 
 require (
-	github.com/elazarl/goproxy v1.8.1
+	github.com/elazarl/goproxy v1.8.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/testcontainers/testcontainers-go v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
