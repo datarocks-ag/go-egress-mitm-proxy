@@ -196,6 +196,17 @@ Optional JSON log file for auditing blocked requests:
 - Reopened on SIGHUP for log rotation support
 - Old file handle closed after successful reload
 
+### Request Tracing (`internal/trace`)
+
+Opt-in, full-detail tracing of a subset of requests (configured via the `trace:` block), emitted as one aggregated JSON record per request/tunnel:
+
+- A `*trace.Record` is created in `HandleRequest` when a request matches a trace rule, before any header mutation (so the inbound snapshot is what the client sent)
+- The record is threaded to the dialers via the request context (`trace.CtxKey`) — which populate the connected IP, dial timing, and TLS version/cipher — and to the response handler via goproxy `ctx.UserData`
+- The response body is wrapped so the record is emitted exactly once (`sync.Once`) when the body finishes streaming; blocked (403) and upstream-error (502/504) paths emit via their synthetic responses
+- Passthrough (non-MITM) hosts are traced TCP-only via goproxy's per-request `ctx.Dialer` (connected IP, dial timing, bytes up/down)
+- Redaction is secure-by-default (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` always masked; `redact_headers`/`redact_query` extend; `log_secrets` disables)
+- Independent of the `-v/-vv/-vvv` level; trace log file reopened on SIGHUP for rotation
+
 ### Metrics System
 
 Prometheus metrics with bounded cardinality:
@@ -210,6 +221,7 @@ Prometheus metrics with bounded cardinality:
 | `proxy_upstream_errors_total` | Counter | type | Upstream errors |
 | `proxy_response_status_total` | Counter | class | Response codes |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred |
+| `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough) |
 
 Domain normalization prevents cardinality explosion:
 - Known rewrite domains: tracked individually
@@ -287,6 +299,7 @@ flowchart LR
 - Metrics cardinality bounded to prevent OOM attacks
 - Request IDs are cryptographically random (8 bytes)
 - Blocked request log file created with 0600 permissions
+- Trace log file created with 0600 permissions; trace redaction is secure-by-default (sensitive headers and query values masked unless `log_secrets` is set)
 
 ### Configuration Security
 

@@ -14,6 +14,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 - **Outgoing TLS trust** - custom CA bundle (PEM) and/or PKCS#12 truststore for upstream verification
 - **Hot reload** via SIGHUP signal (no restart required)
 - **Blocked request log** - optional JSON log file for auditing blocked requests
+- **Selective request tracing** - opt-in, full-detail aggregated trace records for a configurable subset of requests (by host/URL), spanning the TCP/TLS, request, and response layers (plus optional bodies), with secure-by-default redaction
 - **Environment variable overrides** for 12-factor app compatibility
 - **Outbound HTTP/2** - negotiates HTTP/2 with upstream servers via ALPN
 - **Prometheus metrics** - request counts, latency histograms, active connections, upstream errors
@@ -424,6 +425,7 @@ Available at `http://localhost:9090/metrics`:
 | `proxy_upstream_errors_total` | Counter | type | Upstream connection errors |
 | `proxy_response_status_total` | Counter | class | Response status codes (2xx, 4xx, 5xx) |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred (request/response) |
+| `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough) |
 
 Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `PASSTHROUGH`
 
@@ -435,6 +437,45 @@ Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLO
 ## Request Tracing
 
 The proxy automatically injects an `X-Request-ID` header into all forwarded requests for distributed tracing. This ID is also logged with each access log entry.
+
+### Selective full-detail tracing
+
+For deep debugging of a specific subset of traffic, configure a `trace:` block. Matching requests are emitted as a single aggregated JSON record (keyed by `trace_id` = `X-Request-ID`) covering every layer at once — independent of the `-v/-vv/-vvv` log level.
+
+```yaml
+trace:
+  enabled: true
+  log_path: "/var/log/mitm-proxy/trace.jsonl"  # optional; omit to use the main log stream
+  redact_query: true                            # mask ?token=... query-string values
+  redact_headers:                               # extends the built-in masked set
+    - "X-Api-Key"
+  log_secrets: false                            # escape hatch: true logs everything verbatim
+  rules:                                        # OR across rules; within a rule host AND url must both match
+    - host: "*.internal.com"                    # WildcardToRegex syntax (~ = raw regex)
+      bodies:
+        enabled: true
+        capture: both                           # request | response | both
+        max_request_bytes: 65536
+        max_response_bytes: 65536
+        content_types: ["application/json", "text/*"]
+        on_binary: base64                       # base64 | skip
+    - url: "~/v1/(debug|trace)"                 # matched against the full scheme://host/path?query
+```
+
+Each record captures:
+
+- **CONNECT/TCP/TLS** — host (with port), SNI, resolved/connected IP, dial timing, negotiated TLS version/cipher
+- **Request** — method, URL, inbound headers, outbound (post-mutation) headers, and the `dropped`/`added`/`modified`/`scheme_changed` diff
+- **Response** — status, proto, headers
+- **Bodies** (per rule) — size-capped, content-type-gated (text inline, binary base64/skip), truncation marked; streaming is preserved
+
+**Matching:** rules are OR'd; within a single rule, `host` and `url` must both match (use separate rules for OR). `host`/`url` use the same convention as ACL/rewrites (wildcard, or `~` for raw regex).
+
+**Redaction is secure-by-default.** `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always masked; `redact_headers` extends the set and `redact_query` masks query values. Set `log_secrets: true` to disable all redaction (use with care — these logs may be shipped/retained).
+
+**Passthrough hosts** (non-MITM tunnels) are traced TCP-only: connected IP, dial timing, and bytes transferred. Headers and bodies are inherently invisible because the traffic is not intercepted.
+
+The trace log file is reopened on SIGHUP for log rotation, like `blocked_log_path`. See [doc/examples/configuration.yaml](doc/examples/configuration.yaml) for a complete example.
 
 ## Client Setup
 
