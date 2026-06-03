@@ -49,6 +49,20 @@ func (l *slogProxyLogger) Printf(format string, v ...any) {
 	}
 }
 
+// normalizeResponseProto forces HTTP/1.1 framing so goproxy's resp.Write()
+// never serializes an unusable status line. Two cases need fixing:
+//  1. goproxy.NewResponse() leaves Proto fields at zero → "HTTP/0.0"
+//  2. Upstream HTTP/2 responses have Proto "HTTP/2.0"
+//
+// Both cause "Unsupported HTTP version" errors in clients on MITM tunnels.
+func normalizeResponseProto(resp *http.Response) {
+	if resp.ProtoMajor != 1 {
+		resp.Proto = "HTTP/1.1"
+		resp.ProtoMajor = 1
+		resp.ProtoMinor = 1
+	}
+}
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: %s [flags] [command]
 
@@ -297,17 +311,7 @@ func main() {
 			rec = v
 		}
 		if resp != nil {
-			// Normalize response protocol to HTTP/1.1 for MITM tunnels.
-			// goproxy writes responses via resp.Write() which serializes
-			// ProtoMajor/ProtoMinor into the status line. Two cases need fixing:
-			// 1) goproxy.NewResponse() leaves Proto fields at zero → "HTTP/0.0"
-			// 2) Upstream HTTP/2 responses have Proto "HTTP/2.0" → "HTTP/2.0"
-			// Both cause "Unsupported HTTP version" errors in clients.
-			if resp.ProtoMajor != 1 {
-				resp.Proto = "HTTP/1.1"
-				resp.ProtoMajor = 1
-				resp.ProtoMinor = 1
-			}
+			normalizeResponseProto(resp)
 			proxy.RecordResponseMetrics(resp)
 			if rec != nil {
 				trace.PrepareResponse(rec, resp)
@@ -324,6 +328,7 @@ func main() {
 				goproxy.ContentTypeText,
 				status,
 				reason)
+			normalizeResponseProto(errResp)
 			if rec != nil {
 				rec.SetError(ctx.Error.Error())
 				trace.PrepareResponse(rec, errResp)
@@ -428,6 +433,12 @@ func main() {
 			if tfErr != nil {
 				slog.Error("Failed to open trace log on reload", "path", newCfg.Trace.LogPath, "err", tfErr)
 				metrics.ConfigLoadErrors.Inc()
+				// Avoid leaking the blocked log FD opened just above when we bail out.
+				if newBlockedFile != nil {
+					if err := newBlockedFile.Close(); err != nil {
+						slog.Warn("Failed to close blocked log file after reload error", "err", err)
+					}
+				}
 				continue
 			}
 			newTLSConfig := cert.BuildOutboundTLSConfig(newCfg)

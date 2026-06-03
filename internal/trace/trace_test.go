@@ -173,6 +173,7 @@ func TestBodyTruncationAndBinary(t *testing.T) {
 	}{
 		{"text within cap", 100, "text/plain", "base64", "hello", true, false, false},
 		{"text truncated", 3, "text/plain", "base64", "hello", true, false, true},
+		{"text truncated mid-rune still text", 2, "text/plain", "base64", "héllo", true, false, true},
 		{"binary base64", 100, "application/octet-stream", "base64", "\x00\x01\x02", false, true, false},
 		{"binary skipped", 100, "application/octet-stream", "skip", "\x00\x01\x02", false, false, false},
 	}

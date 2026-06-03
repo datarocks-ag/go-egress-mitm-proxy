@@ -110,6 +110,11 @@ func TestTraceEndToEndThroughProxy(t *testing.T) {
 		t.Errorf("tcp.connected_ip = %v, want %s (populated by the dialer)", rec0["tcp"], backendURL.Hostname())
 	}
 
+	// connect.host preserves the explicit port from the request URL.
+	if connect := rec0["connect"].(map[string]any); connect["host"] != backendURL.Host {
+		t.Errorf("connect.host = %v, want %s (with port)", connect["host"], backendURL.Host)
+	}
+
 	reqObj := rec0["request"].(map[string]any)
 	if in := reqObj["headers_in"].(map[string]any); in["X-Probe"] != "hi" {
 		t.Errorf("X-Probe header_in = %v, want hi", in["X-Probe"])

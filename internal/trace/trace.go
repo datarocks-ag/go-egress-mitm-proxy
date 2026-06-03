@@ -392,14 +392,37 @@ func renderBody(b *bodyBuffer, contentType string, cfg config.CompiledBodyCaptur
 	if len(data) == 0 {
 		return out
 	}
-	if contentTypeAllowed(contentType, cfg.ContentTypes) && utf8.Valid(data) {
-		out["text"] = string(data)
-	} else if cfg.OnBinary == "base64" {
+	if contentTypeAllowed(contentType, cfg.ContentTypes) {
+		// Truncation may have cut a multi-byte rune in half; drop the trailing
+		// partial rune so allowed text content is still emitted as text.
+		text := data
+		if !utf8.Valid(text) {
+			text = trimPartialRune(text)
+		}
+		if utf8.Valid(text) {
+			out["text"] = string(text)
+			return out
+		}
+	}
+	if cfg.OnBinary == "base64" {
 		out["base64"] = base64.StdEncoding.EncodeToString(data)
 	} else {
 		out["skipped"] = "binary"
 	}
 	return out
+}
+
+// trimPartialRune drops up to utf8.UTFMax-1 trailing bytes that form an
+// incomplete UTF-8 rune (e.g. a character cut by body truncation), returning
+// the longest valid-UTF-8 prefix reachable that way.
+func trimPartialRune(b []byte) []byte {
+	for i := 0; i < utf8.UTFMax-1 && len(b) > 0; i++ {
+		b = b[:len(b)-1]
+		if utf8.Valid(b) {
+			return b
+		}
+	}
+	return b
 }
 
 // contentTypeAllowed reports whether a Content-Type matches the allowlist,

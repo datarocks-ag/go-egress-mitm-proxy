@@ -220,7 +220,9 @@ func setupTrace(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.Runt
 		return nil
 	}
 	rec := trace.NewRecord(requestID, "mitm", rule, trace.NewRedactor(ct), logger)
-	rec.SetConnect(host, host)
+	// connect.host preserves an explicit port (consistent with the passthrough
+	// CONNECT path); SNI is the bare hostname.
+	rec.SetConnect(r.URL.Host, host)
 	rec.SetRequestIn(r)
 	if pctx != nil {
 		pctx.UserData = rec
@@ -382,6 +384,9 @@ func MakeTLSDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, n
 			}
 			return nil, dialErr
 		}
+		// Measure dial_ms as the TCP connect only (excluding the TLS handshake),
+		// to stay consistent with the plain MakeDialer path.
+		dialDur := time.Since(dialStart)
 
 		// Build per-connection TLS config
 		tlsCfg := baseTLSConfig.Clone()
@@ -403,7 +408,7 @@ func MakeTLSDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, n
 
 		if rec := trace.FromContext(ctx); rec != nil {
 			state := tlsConn.ConnectionState()
-			rec.SetTCP(hostFromAddr(rawConn.RemoteAddr()), time.Since(dialStart),
+			rec.SetTCP(hostFromAddr(rawConn.RemoteAddr()), dialDur,
 				tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
 		}
 
