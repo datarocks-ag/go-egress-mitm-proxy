@@ -1163,6 +1163,125 @@ proxy:
 	})
 }
 
+func TestCompileTrace(t *testing.T) {
+	t.Run("defaults applied to body capture", func(t *testing.T) {
+		ct, err := CompileTrace(TraceConfig{
+			Enabled: true,
+			Rules: []TraceRule{
+				{Host: "*.internal.com", Bodies: BodyCaptureConfig{Enabled: true}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := ct.Rules[0].Bodies
+		if !b.CaptureRequest || !b.CaptureResponse {
+			t.Errorf("default capture should be both, got req=%v resp=%v", b.CaptureRequest, b.CaptureResponse)
+		}
+		if b.MaxRequestBytes != 8192 || b.MaxResponseBytes != 8192 {
+			t.Errorf("default caps = %d/%d, want 8192/8192", b.MaxRequestBytes, b.MaxResponseBytes)
+		}
+		if b.OnBinary != "base64" {
+			t.Errorf("default on_binary = %q, want base64", b.OnBinary)
+		}
+		if len(b.ContentTypes) == 0 {
+			t.Error("default content types should be non-empty")
+		}
+	})
+
+	t.Run("redact defaults merged with user list", func(t *testing.T) {
+		ct, err := CompileTrace(TraceConfig{
+			Enabled:       true,
+			RedactHeaders: []string{"X-Custom-Token"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range []string{"authorization", "proxy-authorization", "cookie", "set-cookie", "x-custom-token"} {
+			if !ct.RedactHeaders[h] {
+				t.Errorf("expected %q to be redacted", h)
+			}
+		}
+	})
+
+	t.Run("rule without host or url is rejected", func(t *testing.T) {
+		_, err := CompileTrace(TraceConfig{Enabled: true, Rules: []TraceRule{{}}})
+		if err == nil || !contains(err.Error(), "must set host or url") {
+			t.Errorf("err = %v, want 'must set host or url'", err)
+		}
+	})
+
+	t.Run("invalid host regex is rejected", func(t *testing.T) {
+		_, err := CompileTrace(TraceConfig{Enabled: true, Rules: []TraceRule{{Host: "~[invalid"}}})
+		if err == nil || !contains(err.Error(), "invalid trace host") {
+			t.Errorf("err = %v, want 'invalid trace host'", err)
+		}
+	})
+
+	t.Run("invalid capture is rejected", func(t *testing.T) {
+		_, err := CompileTrace(TraceConfig{Enabled: true, Rules: []TraceRule{
+			{Host: "x", Bodies: BodyCaptureConfig{Enabled: true, Capture: "nonsense"}},
+		}})
+		if err == nil || !contains(err.Error(), "invalid capture") {
+			t.Errorf("err = %v, want 'invalid capture'", err)
+		}
+	})
+
+	t.Run("invalid on_binary is rejected", func(t *testing.T) {
+		_, err := CompileTrace(TraceConfig{Enabled: true, Rules: []TraceRule{
+			{Host: "x", Bodies: BodyCaptureConfig{Enabled: true, OnBinary: "rot13"}},
+		}})
+		if err == nil || !contains(err.Error(), "invalid on_binary") {
+			t.Errorf("err = %v, want 'invalid on_binary'", err)
+		}
+	})
+}
+
+func TestCompiledTraceMatch(t *testing.T) {
+	ct, err := CompileTrace(TraceConfig{
+		Enabled: true,
+		Rules: []TraceRule{
+			{Host: "~^api\\.internal$"},                 // host-only
+			{URL: "~/v1/debug"},                         // url-only
+			{Host: "~^admin\\.internal$", URL: "~/ops"}, // host AND url
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		host    string
+		url     string
+		hasURL  bool
+		matches bool
+	}{
+		{"host rule matches any url", "api.internal", "https://api.internal/anything", true, true},
+		{"url rule matches any host", "other.host", "https://other.host/v1/debug", true, true},
+		{"and rule needs both", "admin.internal", "https://admin.internal/ops/x", true, true},
+		{"and rule host only is no match", "admin.internal", "https://admin.internal/other", true, false},
+		{"no match", "random.host", "https://random.host/", true, false},
+		{"connect time skips url-only rules", "other.host", "", false, false},
+		{"connect time still matches host rule", "api.internal", "", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ct.Match(tt.host, tt.url, tt.hasURL)
+			if (got != nil) != tt.matches {
+				t.Errorf("Match(%q,%q,%v) matched=%v, want %v", tt.host, tt.url, tt.hasURL, got != nil, tt.matches)
+			}
+		})
+	}
+
+	t.Run("disabled trace never matches", func(t *testing.T) {
+		disabled := CompiledTrace{Enabled: false, Rules: ct.Rules}
+		if disabled.Match("api.internal", "https://api.internal/x", true) != nil {
+			t.Error("disabled trace should not match")
+		}
+	})
+}
+
 // Helper function
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))

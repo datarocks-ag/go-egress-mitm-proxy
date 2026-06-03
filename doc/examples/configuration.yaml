@@ -118,3 +118,45 @@ acl:
     # Use for services with their own PKI where clients don't trust the proxy CA.
     - "kubernetes.default.svc"
     - "*.vault.internal"
+
+# Selective full-detail request tracing.
+# When enabled, requests matching any rule are logged as a single aggregated
+# JSON record spanning the TCP/TLS, request, and response layers (and optionally
+# bodies). Tracing is independent of the -v/-vv/-vvv log level.
+#
+# Matching: OR across rules; within a rule, host AND url must both match.
+# host/url use the same convention as acl/rewrites (wildcard, or "~" raw regex).
+# url is matched against the full URL (scheme://host/path?query).
+trace:
+  enabled: true
+  # Optional dedicated JSON-lines file. When omitted, records go to the main
+  # log stream. Reopened on SIGHUP for rotation (like blocked_log_path).
+  log_path: "/var/log/mitm-proxy/trace.jsonl"
+
+  # Redaction is secure-by-default. The built-in masked set
+  # (Authorization, Proxy-Authorization, Cookie, Set-Cookie) is always applied;
+  # redact_headers extends it. Set log_secrets: true to disable ALL redaction.
+  redact_headers:
+    - "X-Api-Key"
+  redact_query: true      # mask ?token=... query-string values
+  log_secrets: false      # escape hatch: true logs everything verbatim
+
+  rules:
+    # Trace every request to a host, including request & response bodies.
+    - host: "*.internal.com"
+      bodies:
+        enabled: true
+        capture: both                 # request | response | both (default: both)
+        max_request_bytes: 65536       # per-direction cap (default: 8192)
+        max_response_bytes: 65536
+        content_types:                 # logged as text; others use on_binary
+          - "application/json"
+          - "text/*"
+        on_binary: base64              # base64 | skip (default: base64)
+
+    # Trace a specific path across any host, headers only (no bodies).
+    - url: "~/v1/(debug|trace)"
+
+    # Narrow: trace only the /ops path on admin.internal (host AND url).
+    - host: "~^admin\\.internal$"
+      url: "~^https?://[^/]+/ops"

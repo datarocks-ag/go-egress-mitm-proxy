@@ -34,6 +34,7 @@ import (
 	"go-egress-proxy/internal/health"
 	"go-egress-proxy/internal/metrics"
 	"go-egress-proxy/internal/proxy"
+	"go-egress-proxy/internal/trace"
 )
 
 // version is set at build time via -ldflags "-X main.version=<value>".
@@ -190,6 +191,19 @@ func main() {
 	runtimeCfg := &config.RuntimeConfig{}
 	_ = runtimeCfg.Update(cfg, acl, rewrites, baseTLSConfig, blockedLogger, blockedFile)
 
+	// Compile selective-trace config and open its optional dedicated log file.
+	compiledTrace, err := config.CompileTrace(cfg.Trace)
+	if err != nil {
+		slog.Error("Failed to compile trace configuration", "err", err)
+		os.Exit(1)
+	}
+	traceLogger, traceFile, err := config.OpenTraceLog(cfg.Trace.LogPath)
+	if err != nil {
+		slog.Error("Failed to open trace log", "path", cfg.Trace.LogPath, "err", err)
+		os.Exit(1)
+	}
+	_ = runtimeCfg.SetTrace(compiledTrace, traceLogger, traceFile)
+
 	// Load MITM CA certificate and key for TLS interception
 	if err := cert.LoadMITMCertificate(cfg); err != nil {
 		slog.Error("Failed to load MITM certificate", "err", err)
@@ -233,6 +247,18 @@ func main() {
 					"client", ctx.Req.RemoteAddr)
 				metricDomain := proxy.NormalizeDomainForMetrics(hostname, rewriteExact, currentACL)
 				metrics.TrafficTotal.WithLabelValues(metricDomain, "PASSTHROUGH").Inc()
+
+				// Passthrough tunnels are not MITM'd, so only the TCP layer is
+				// observable. When a host-based trace rule matches, wire a tracing
+				// dialer that records the connected IP, timing, and byte counts.
+				if ct, traceLogger := runtimeCfg.GetTrace(); ct.Enabled {
+					if rule := ct.Match(hostname, "", false); rule != nil {
+						rec := trace.NewRecord(proxy.GenerateRequestID(), "passthrough", rule, trace.NewRedactor(ct), traceLogger)
+						rec.SetConnect(host, hostname)
+						ctx.UserData = rec
+						ctx.Dialer = trace.PassthroughDialer(rec)
+					}
+				}
 				return passthroughAction, host
 			}
 
@@ -266,6 +292,10 @@ func main() {
 
 	// Register response handler for metrics and upstream error handling
 	proxyHandler.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		var rec *trace.Record
+		if v, ok := ctx.UserData.(*trace.Record); ok {
+			rec = v
+		}
 		if resp != nil {
 			// Normalize response protocol to HTTP/1.1 for MITM tunnels.
 			// goproxy writes responses via resp.Write() which serializes
@@ -279,6 +309,9 @@ func main() {
 				resp.ProtoMinor = 1
 			}
 			proxy.RecordResponseMetrics(resp)
+			if rec != nil {
+				trace.PrepareResponse(rec, resp)
+			}
 			return resp
 		}
 		if ctx.Error != nil {
@@ -287,10 +320,18 @@ func main() {
 				"host", ctx.Req.URL.Host,
 				"status", status,
 				"err", ctx.Error)
-			return goproxy.NewResponse(ctx.Req,
+			errResp := goproxy.NewResponse(ctx.Req,
 				goproxy.ContentTypeText,
 				status,
 				reason)
+			if rec != nil {
+				rec.SetError(ctx.Error.Error())
+				trace.PrepareResponse(rec, errResp)
+			}
+			return errResp
+		}
+		if rec != nil {
+			rec.Emit()
 		}
 		return resp
 	})
@@ -371,9 +412,21 @@ func main() {
 				metrics.ConfigLoadErrors.Inc()
 				continue
 			}
+			newTrace, tErr := config.CompileTrace(newCfg.Trace)
+			if tErr != nil {
+				slog.Error("Failed to compile trace config on reload", "err", tErr)
+				metrics.ConfigLoadErrors.Inc()
+				continue
+			}
 			newBlockedLogger, newBlockedFile, blErr := config.OpenBlockedLog(newCfg.Proxy.BlockedLogPath)
 			if blErr != nil {
 				slog.Error("Failed to open blocked log on reload", "path", newCfg.Proxy.BlockedLogPath, "err", blErr)
+				metrics.ConfigLoadErrors.Inc()
+				continue
+			}
+			newTraceLogger, newTraceFile, tfErr := config.OpenTraceLog(newCfg.Trace.LogPath)
+			if tfErr != nil {
+				slog.Error("Failed to open trace log on reload", "path", newCfg.Trace.LogPath, "err", tfErr)
 				metrics.ConfigLoadErrors.Inc()
 				continue
 			}
@@ -382,6 +435,12 @@ func main() {
 			if oldFile != nil {
 				if err := oldFile.Close(); err != nil {
 					slog.Warn("Failed to close rotated blocked log file", "err", err)
+				}
+			}
+			oldTraceFile := runtimeCfg.SetTrace(newTrace, newTraceLogger, newTraceFile)
+			if oldTraceFile != nil {
+				if err := oldTraceFile.Close(); err != nil {
+					slog.Warn("Failed to close rotated trace log file", "err", err)
 				}
 			}
 			metrics.ConfigReloads.Inc()
@@ -408,6 +467,7 @@ func main() {
 			slog.Error("Metrics server shutdown error", "err", err)
 		}
 		runtimeCfg.CloseBlockedLog()
+		runtimeCfg.CloseTraceLog()
 	}()
 
 	// Start the proxy server
