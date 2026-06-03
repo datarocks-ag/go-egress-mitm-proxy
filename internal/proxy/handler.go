@@ -19,6 +19,7 @@ import (
 
 	"go-egress-proxy/internal/config"
 	"go-egress-proxy/internal/metrics"
+	"go-egress-proxy/internal/trace"
 )
 
 // RewriteResult holds the outcome of a rewrite rule lookup.
@@ -31,13 +32,24 @@ type RewriteResult struct {
 
 // HandleRequest processes each incoming request through the policy engine.
 // It evaluates rules in order: rewrites -> blacklist -> whitelist -> default policy.
-func HandleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig) (*http.Request, *http.Response) {
+func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig) (*http.Request, *http.Response) {
 	start := time.Now()
 	metrics.ActiveConnections.Inc()
 	defer metrics.ActiveConnections.Dec()
 
-	// Generate and inject request ID for tracing
+	// Generate request ID for tracing
 	requestID := GenerateRequestID()
+
+	// Set up selective tracing before any header mutation so the inbound snapshot
+	// reflects exactly what the client sent. The record rides the request context
+	// down to the dialers (TCP/TLS layer) and goproxy ctx.UserData (response layer).
+	rec := setupTrace(r, pctx, runtimeCfg, requestID)
+	if rec != nil {
+		r = r.WithContext(context.WithValue(r.Context(), trace.CtxKey, rec))
+		rec.WrapRequestBody(r)
+	}
+
+	// Inject request ID
 	r.Header.Set("X-Request-ID", requestID)
 
 	cfg, acl, rewrites, rewriteExact, _ := runtimeCfg.Get()
@@ -159,23 +171,71 @@ func HandleRequest(r *http.Request, _ *goproxy.ProxyCtx, runtimeCfg *config.Runt
 				slog.String("action", action),
 			)
 		}
+		if rec != nil {
+			// Blocked requests are not forwarded; the only mutation is X-Request-ID.
+			rec.SetRequestOut(r, nil, []string{"X-Request-ID"}, nil, "")
+		}
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
 	}
 
-	// Apply rewrite transformations: drop headers, inject headers, change scheme
+	// Apply rewrite transformations: drop headers, inject headers, change scheme.
+	// X-Request-ID is always injected by the proxy and is absent from the
+	// inbound snapshot, so it is a genuine addition.
+	added := []string{"X-Request-ID"}
+	var dropped, modified []string
+	schemeChanged := ""
 	if matchedRewrite != nil {
 		for _, h := range matchedRewrite.DropHeaders {
+			if len(r.Header.Values(h)) > 0 {
+				dropped = append(dropped, h)
+			}
 			r.Header.Del(h)
 		}
 		for k, v := range matchedRewrite.Headers {
+			// Set overwrites; distinguish a brand-new header from one that
+			// replaces an existing client value so the diff stays accurate.
+			if len(r.Header.Values(k)) > 0 {
+				modified = append(modified, k)
+			} else {
+				added = append(added, k)
+			}
 			r.Header.Set(k, v)
 		}
 		if matchedRewrite.TargetScheme != "" {
 			r.URL.Scheme = matchedRewrite.TargetScheme
+			schemeChanged = matchedRewrite.TargetScheme
 		}
 	}
 
+	if rec != nil {
+		rec.SetRequestOut(r, dropped, added, modified, schemeChanged)
+	}
+
 	return r, nil
+}
+
+// setupTrace creates a trace Record when tracing is enabled and the request
+// matches a trace rule, capturing the inbound request before any mutation.
+// Returns nil when the request is not traced.
+func setupTrace(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig, requestID string) *trace.Record {
+	ct, logger := runtimeCfg.GetTrace()
+	if !ct.Enabled {
+		return nil
+	}
+	host := r.URL.Hostname()
+	rule := ct.Match(host, r.URL.String(), true)
+	if rule == nil {
+		return nil
+	}
+	rec := trace.NewRecord(requestID, "mitm", rule, trace.NewRedactor(ct), logger)
+	// connect.host preserves an explicit port (consistent with the passthrough
+	// CONNECT path); SNI is the bare hostname.
+	rec.SetConnect(r.URL.Host, host)
+	rec.SetRequestIn(r)
+	if pctx != nil {
+		pctx.UserData = rec
+	}
+	return rec
 }
 
 // UpstreamErrorResponse returns the HTTP status code and reason text for an upstream error.
@@ -257,6 +317,7 @@ func MakeDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, netw
 			slog.Debug("Rewriting dial", "original", host, "target", rw.TargetHost)
 		}
 
+		dialStart := time.Now()
 		conn, dialErr := (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -264,11 +325,29 @@ func MakeDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, netw
 
 		if dialErr != nil {
 			RecordDialError(dialErr)
+			if rec := trace.FromContext(ctx); rec != nil {
+				rec.SetError(dialErr.Error())
+			}
 			return nil, dialErr
+		}
+
+		if rec := trace.FromContext(ctx); rec != nil {
+			rec.SetTCP(hostFromAddr(conn.RemoteAddr()), time.Since(dialStart), "", "")
 		}
 
 		return conn, nil
 	}
+}
+
+// hostFromAddr extracts the IP/host (without port) from a network address.
+func hostFromAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
 }
 
 // MakeTLSDialer creates a custom DialTLSContext function that performs TCP dial with
@@ -301,14 +380,21 @@ func MakeTLSDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, n
 		}
 
 		// TCP connect
+		dialStart := time.Now()
 		rawConn, dialErr := (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext(ctx, network, dialAddr)
 		if dialErr != nil {
 			RecordDialError(dialErr)
+			if rec := trace.FromContext(ctx); rec != nil {
+				rec.SetError(dialErr.Error())
+			}
 			return nil, dialErr
 		}
+		// Measure dial_ms as the TCP connect only (excluding the TLS handshake),
+		// to stay consistent with the plain MakeDialer path.
+		dialDur := time.Since(dialStart)
 
 		// Build per-connection TLS config
 		tlsCfg := baseTLSConfig.Clone()
@@ -322,7 +408,16 @@ func MakeTLSDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, n
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close() //nolint:errcheck // best-effort cleanup on handshake failure
 			RecordDialError(err)
+			if rec := trace.FromContext(ctx); rec != nil {
+				rec.SetError(err.Error())
+			}
 			return nil, err
+		}
+
+		if rec := trace.FromContext(ctx); rec != nil {
+			state := tlsConn.ConnectionState()
+			rec.SetTCP(hostFromAddr(rawConn.RemoteAddr()), dialDur,
+				tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
 		}
 
 		return tlsConn, nil

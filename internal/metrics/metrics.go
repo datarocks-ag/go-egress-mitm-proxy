@@ -56,4 +56,10 @@ var (
 		Name: "proxy_bytes_total",
 		Help: "Total bytes transferred by direction",
 	}, []string{"direction"})
+
+	// TraceRecords counts emitted trace records by mode (mitm or passthrough).
+	TraceRecords = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_trace_records_total",
+		Help: "Total emitted trace records by mode",
+	}, []string{"mode"})
 )

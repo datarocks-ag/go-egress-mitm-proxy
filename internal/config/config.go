@@ -76,6 +76,182 @@ type Config struct {
 		Blacklist   []string `yaml:"blacklist"`   // Regex patterns to block
 		Passthrough []string `yaml:"passthrough"` // Regex patterns to tunnel without MITM
 	} `yaml:"acl"`
+	Trace TraceConfig `yaml:"trace"` // Selective full-detail request tracing
+}
+
+// TraceConfig configures selective full-detail request tracing.
+// When enabled, requests matching any rule are logged as a single aggregated
+// JSON record covering the TCP/TLS, request, and response layers.
+type TraceConfig struct {
+	Enabled       bool        `yaml:"enabled"`        // Master switch; when false tracing is fully short-circuited
+	LogPath       string      `yaml:"log_path"`       // Optional dedicated JSON-lines file; empty = main log stream
+	RedactHeaders []string    `yaml:"redact_headers"` // Header names to mask, in addition to the built-in defaults
+	RedactQuery   bool        `yaml:"redact_query"`   // Mask URL query-string values
+	LogSecrets    bool        `yaml:"log_secrets"`    // Escape hatch: disable all redaction and log verbatim
+	Rules         []TraceRule `yaml:"rules"`          // OR across rules; within a rule host AND url must both match
+}
+
+// TraceRule selects requests to trace by host and/or URL, with per-rule body capture.
+// Host and URL use the same convention as ACL/rewrites (wildcard, or "~" prefix for raw regex).
+type TraceRule struct {
+	Host   string            `yaml:"host"`   // Matched against the request hostname (optional)
+	URL    string            `yaml:"url"`    // Matched against the full request URL (optional)
+	Bodies BodyCaptureConfig `yaml:"bodies"` // Per-rule request/response body capture
+}
+
+// BodyCaptureConfig controls request/response body capture for a trace rule.
+type BodyCaptureConfig struct {
+	Enabled          bool     `yaml:"enabled"`            // Capture bodies for this rule
+	Capture          string   `yaml:"capture"`            // "request", "response", or "both" (default: both)
+	MaxRequestBytes  int      `yaml:"max_request_bytes"`  // Per-request cap (default: 8192)
+	MaxResponseBytes int      `yaml:"max_response_bytes"` // Per-response cap (default: 8192)
+	ContentTypes     []string `yaml:"content_types"`      // Content types logged as text; others use on_binary
+	OnBinary         string   `yaml:"on_binary"`          // "base64" or "skip" for non-text bodies (default: base64)
+}
+
+// CompiledTrace holds the compiled, ready-to-match trace configuration.
+type CompiledTrace struct {
+	Enabled       bool
+	RedactHeaders map[string]bool // lowercased header names to mask (built-in defaults + user)
+	RedactQuery   bool
+	LogSecrets    bool
+	Rules         []CompiledTraceRule
+}
+
+// CompiledTraceRule is a trace rule with its patterns compiled.
+type CompiledTraceRule struct {
+	Host   *regexp.Regexp // nil when no host pattern is set
+	URL    *regexp.Regexp // nil when no url pattern is set
+	Bodies CompiledBodyCapture
+}
+
+// CompiledBodyCapture is a body-capture config with defaults applied and directions resolved.
+type CompiledBodyCapture struct {
+	Enabled          bool
+	CaptureRequest   bool
+	CaptureResponse  bool
+	MaxRequestBytes  int
+	MaxResponseBytes int
+	ContentTypes     []string // lowercased; supports "type/*" suffix wildcards
+	OnBinary         string
+}
+
+// DefaultRedactHeaders are always masked unless log_secrets is set.
+var DefaultRedactHeaders = []string{"authorization", "proxy-authorization", "cookie", "set-cookie"}
+
+// DefaultBodyContentTypes are logged as text when no content_types are configured.
+var DefaultBodyContentTypes = []string{"application/json", "text/*", "application/xml", "application/x-www-form-urlencoded"}
+
+// Match returns the first trace rule matching the host (and full URL, when known), or nil.
+// When hasURL is false (e.g. at CONNECT time, before the HTTP request is seen),
+// rules carrying a URL pattern are skipped since the URL cannot yet be evaluated.
+func (ct CompiledTrace) Match(host, fullURL string, hasURL bool) *CompiledTraceRule {
+	if !ct.Enabled {
+		return nil
+	}
+	for i := range ct.Rules {
+		r := &ct.Rules[i]
+		if r.Host != nil && !r.Host.MatchString(host) {
+			continue
+		}
+		if r.URL != nil {
+			if !hasURL || !r.URL.MatchString(fullURL) {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// CompileTrace validates and compiles the trace configuration.
+func CompileTrace(tc TraceConfig) (CompiledTrace, error) {
+	ct := CompiledTrace{
+		Enabled:       tc.Enabled,
+		RedactQuery:   tc.RedactQuery,
+		LogSecrets:    tc.LogSecrets,
+		RedactHeaders: make(map[string]bool),
+	}
+	for _, h := range DefaultRedactHeaders {
+		ct.RedactHeaders[h] = true
+	}
+	for _, h := range tc.RedactHeaders {
+		ct.RedactHeaders[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+
+	for i, r := range tc.Rules {
+		if r.Host == "" && r.URL == "" {
+			return CompiledTrace{}, fmt.Errorf("trace.rules[%d]: must set host or url", i)
+		}
+		cr := CompiledTraceRule{}
+		if r.Host != "" {
+			re, err := WildcardToRegex(r.Host)
+			if err != nil {
+				return CompiledTrace{}, fmt.Errorf("invalid trace host[%d] %q: %w", i, r.Host, err)
+			}
+			cr.Host = re
+		}
+		if r.URL != "" {
+			re, err := WildcardToRegex(r.URL)
+			if err != nil {
+				return CompiledTrace{}, fmt.Errorf("invalid trace url[%d] %q: %w", i, r.URL, err)
+			}
+			cr.URL = re
+		}
+		cb, err := compileBodyCapture(r.Bodies)
+		if err != nil {
+			return CompiledTrace{}, fmt.Errorf("trace.rules[%d].bodies: %w", i, err)
+		}
+		cr.Bodies = cb
+		ct.Rules = append(ct.Rules, cr)
+	}
+	return ct, nil
+}
+
+func compileBodyCapture(b BodyCaptureConfig) (CompiledBodyCapture, error) {
+	cb := CompiledBodyCapture{Enabled: b.Enabled}
+	if !b.Enabled {
+		return cb, nil
+	}
+
+	switch capture := b.Capture; capture {
+	case "", "both":
+		cb.CaptureRequest, cb.CaptureResponse = true, true
+	case "request":
+		cb.CaptureRequest = true
+	case "response":
+		cb.CaptureResponse = true
+	default:
+		return cb, fmt.Errorf("invalid capture %q: must be request, response, or both", capture)
+	}
+
+	switch onBinary := b.OnBinary; onBinary {
+	case "", "base64":
+		cb.OnBinary = "base64"
+	case "skip":
+		cb.OnBinary = "skip"
+	default:
+		return cb, fmt.Errorf("invalid on_binary %q: must be base64 or skip", onBinary)
+	}
+
+	const defaultMaxBodyBytes = 8192
+	cb.MaxRequestBytes = b.MaxRequestBytes
+	if cb.MaxRequestBytes <= 0 {
+		cb.MaxRequestBytes = defaultMaxBodyBytes
+	}
+	cb.MaxResponseBytes = b.MaxResponseBytes
+	if cb.MaxResponseBytes <= 0 {
+		cb.MaxResponseBytes = defaultMaxBodyBytes
+	}
+
+	contentTypes := b.ContentTypes
+	if len(contentTypes) == 0 {
+		contentTypes = DefaultBodyContentTypes
+	}
+	for _, c := range contentTypes {
+		cb.ContentTypes = append(cb.ContentTypes, strings.ToLower(strings.TrimSpace(c)))
+	}
+	return cb, nil
 }
 
 // CompiledACL holds pre-compiled regex patterns for efficient matching.
@@ -95,6 +271,9 @@ type RuntimeConfig struct {
 	tlsConfig     *tls.Config                     // Outbound TLS config (rebuilt on reload)
 	blockedLogger *slog.Logger                    // nil when blocked log feature disabled
 	blockedFile   *os.File                        // underlying file handle for Close()
+	trace         CompiledTrace                   // compiled trace configuration
+	traceLogger   *slog.Logger                    // nil when trace writes to the main log stream
+	traceFile     *os.File                        // underlying trace log file handle for Close()
 }
 
 // Update atomically updates the runtime configuration.
@@ -159,6 +338,54 @@ func (rc *RuntimeConfig) CloseBlockedLog() {
 		rc.blockedFile = nil
 		rc.blockedLogger = nil
 	}
+}
+
+// SetTrace atomically updates the trace configuration and its log sink.
+// It returns the previous trace log file (if any) so the caller can close it
+// after releasing the lock, mirroring Update's blocked-log handling.
+func (rc *RuntimeConfig) SetTrace(ct CompiledTrace, logger *slog.Logger, file *os.File) *os.File {
+	rc.mu.Lock()
+	old := rc.traceFile
+	rc.trace = ct
+	rc.traceLogger = logger
+	rc.traceFile = file
+	rc.mu.Unlock()
+	return old
+}
+
+// GetTrace returns the compiled trace config and its dedicated logger.
+// The logger is nil when trace output should go to the main log stream.
+func (rc *RuntimeConfig) GetTrace() (CompiledTrace, *slog.Logger) {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.trace, rc.traceLogger
+}
+
+// CloseTraceLog closes the trace log file handle, if open.
+func (rc *RuntimeConfig) CloseTraceLog() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.traceFile != nil {
+		if err := rc.traceFile.Close(); err != nil {
+			slog.Warn("Failed to close trace log file", "err", err)
+		}
+		rc.traceFile = nil
+		rc.traceLogger = nil
+	}
+}
+
+// OpenTraceLog opens (or creates) the trace log file and returns a JSON logger writing to it.
+// If path is empty, the feature uses the main log stream and nil values are returned.
+func OpenTraceLog(path string) (*slog.Logger, *os.File, error) {
+	if path == "" {
+		return nil, nil, nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open trace log: %w", err)
+	}
+	logger := slog.New(slog.NewJSONHandler(f, nil))
+	return logger, f, nil
 }
 
 // OpenBlockedLog opens (or creates) the blocked request log file and returns a JSON logger writing to it.
@@ -353,6 +580,17 @@ func RunValidate(configPath string) error {
 		dir := filepath.Dir(cfg.Proxy.BlockedLogPath)
 		if _, err := os.Stat(dir); err != nil {
 			return fmt.Errorf("blocked_log_path: parent directory: %w", err)
+		}
+	}
+
+	// Compile trace rules and validate their log_path parent directory
+	if _, err := CompileTrace(cfg.Trace); err != nil {
+		return fmt.Errorf("trace: %w", err)
+	}
+	if cfg.Trace.LogPath != "" {
+		dir := filepath.Dir(cfg.Trace.LogPath)
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("trace.log_path: parent directory: %w", err)
 		}
 	}
 

@@ -55,6 +55,8 @@ internal/config/config.go      # Types, YAML loading, validation, env overrides,
 internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
 internal/cert/gencert.go       # gencert subcommand + key pair generation
 internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, domain metrics
+internal/trace/trace.go        # Selective trace Record, redaction, body capture, aggregated emit
+internal/trace/conn.go         # Passthrough tunnel tracing dialer + byte-counting conn
 internal/metrics/metrics.go    # Prometheus metric vars (promauto registrations)
 internal/health/health.go      # Health and readiness HTTP handlers
 e2e_test.go                    # End-to-end tests (build tag: e2e, uses testcontainers)
@@ -66,8 +68,9 @@ metrics     → (none)
 health      → (none)
 config      → metrics
 cert        → config
-proxy       → config, metrics, cert
-cmd/main    → config, cert, proxy, metrics, health
+trace       → config, metrics
+proxy       → config, metrics, cert, trace
+cmd/main    → config, cert, proxy, metrics, health, trace
 ```
 
 **Request Flow:**
@@ -132,7 +135,20 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - Per-rewrite `drop_headers`: list of header names to strip from the request before forwarding (case-insensitive via `r.Header.Del()`)
 - Per-rewrite `path_pattern`: optional regex matched against `r.URL.Path` for path-based routing (rules evaluated in YAML order, first match wins; passed to dialers via request context)
 - Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation
+- Selective request tracing (`trace:` block, see below)
 - Hot reload via SIGHUP signal
+
+**Selective Request Tracing (`trace:` block):**
+
+Opt-in, full-detail tracing of a *subset* of requests selected by host and/or URL. Each traced request is emitted as a single aggregated JSON record (keyed by `trace_id` = `X-Request-ID`) spanning every layer: CONNECT/TCP (resolved/connected IP, dial timing, TLS version/cipher), request (inbound headers, outbound post-mutation headers, the dropped/added/modified/scheme-changed diff), response (status, headers), and optionally request/response bodies. Independent of the `-v/-vv/-vvv` log level.
+
+- `enabled`: master switch; when false, tracing is fully short-circuited (no per-request overhead)
+- `log_path`: optional dedicated JSON-lines file (reopened on SIGHUP for rotation, like `blocked_log_path`); empty = main log stream
+- `rules`: OR across rules; within a rule `host` AND `url` must both match. `host`/`url` use the `WildcardToRegex` convention (wildcard, or `~` prefix for raw regex); `url` is matched against the full `scheme://host/path?query`. Rules carrying a `url` are skipped at CONNECT time (URL not yet known), so passthrough hosts are matched by `host` only.
+- Redaction is secure-by-default: built-in masked headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`) always apply; `redact_headers` extends the set; `redact_query` masks query-string values; `log_secrets: true` is the escape hatch that disables all redaction.
+- Per-rule `bodies`: `enabled`, `capture` (request/response/both), `max_request_bytes`/`max_response_bytes` (default 8192), `content_types` allowlist (logged as text; supports `type/*`), `on_binary` (base64/skip). Bodies are teed (streaming preserved); the aggregated record is emitted once the response body finishes (`sync.Once`).
+- Passthrough (non-MITM) hosts are traced TCP-only via goproxy's per-request `ctx.Dialer` (connected IP, dial timing, bytes up/down); headers/bodies are inherently invisible.
+- The record is threaded from `HandleRequest` to the dialers via the request context (`trace.CtxKey`) and to the response handler via goproxy `ctx.UserData`.
 
 **Metrics:** Prometheus metrics on `:9090/metrics`:
 - `proxy_traffic_total` - requests by domain and action
@@ -142,6 +158,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `proxy_upstream_errors_total` - upstream connection errors by type
 - `proxy_response_status_total` - response status codes by class
 - `proxy_bytes_total` - bytes transferred by direction
+- `proxy_trace_records_total` - emitted trace records by mode (mitm/passthrough)
 
 **Health Endpoints:** `/healthz` (liveness), `/readyz` (readiness)
 
@@ -199,6 +216,12 @@ internal/cert/
 internal/proxy/
   handler.go                   # Request handling, dialers, rewrite lookup, metrics recording
   handler_test.go              # Handler, dialer, rewrite, metrics tests
+  trace_handler_test.go        # Trace setup, header-diff, context threading tests
+  trace_integration_test.go    # In-process end-to-end trace through goproxy + real dialer
+internal/trace/
+  trace.go                     # Trace Record, redaction, body capture, aggregated emit
+  conn.go                      # Passthrough tunnel dialer + byte-counting conn
+  trace_test.go                # Record emit, redaction, body truncation/binary tests
 internal/metrics/
   metrics.go                   # Prometheus metric var registrations
 internal/health/
