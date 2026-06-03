@@ -1,13 +1,14 @@
 package health
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
 func TestHealthHandler(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 
 	HealthHandler(rec, req)
@@ -24,7 +25,7 @@ func TestHealthHandler(t *testing.T) {
 }
 
 func TestReadyHandler(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
 
 	ReadyHandler(rec, req)
