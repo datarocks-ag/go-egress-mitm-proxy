@@ -57,7 +57,7 @@ func TestRecordEmitAggregatedRedacts(t *testing.T) {
 	reqIn.Header.Set("Authorization", "Bearer secret-token")
 	reqIn.Header.Set("Accept", "application/json")
 	rec.SetRequestIn(reqIn)
-	rec.SetRequestOut(reqIn, []string{"Cookie"}, []string{"X-Request-ID"}, "")
+	rec.SetRequestOut(reqIn, []string{"Cookie"}, []string{"X-Request-ID"}, nil, "")
 
 	resp := &http.Response{
 		StatusCode: http.StatusOK,

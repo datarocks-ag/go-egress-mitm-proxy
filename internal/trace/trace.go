@@ -119,6 +119,7 @@ type Record struct {
 	reqHeadersOut map[string]string
 	dropped       []string
 	added         []string
+	modified      []string
 	schemeChanged string
 	reqBody       *bodyBuffer
 	reqCT         string
@@ -176,11 +177,14 @@ func (r *Record) SetRequestIn(req *http.Request) {
 	r.reqCT = req.Header.Get("Content-Type")
 }
 
-// SetRequestOut captures the outbound request headers after drop/inject/scheme rewriting.
-func (r *Record) SetRequestOut(req *http.Request, dropped, added []string, schemeChanged string) {
+// SetRequestOut captures the outbound request headers after drop/inject/scheme
+// rewriting. added are headers newly introduced; modified are injected headers
+// that overwrote an existing client value.
+func (r *Record) SetRequestOut(req *http.Request, dropped, added, modified []string, schemeChanged string) {
 	r.reqHeadersOut = r.redactor.headerMap(req.Header)
 	r.dropped = dropped
 	r.added = added
+	r.modified = modified
 	r.schemeChanged = schemeChanged
 }
 
@@ -292,6 +296,9 @@ func (r *Record) emit() {
 		}
 		if len(r.added) > 0 {
 			req = append(req, slog.Any("added", r.added))
+		}
+		if len(r.modified) > 0 {
+			req = append(req, slog.Any("modified", r.modified))
 		}
 		if r.schemeChanged != "" {
 			req = append(req, slog.String("scheme_changed", r.schemeChanged))

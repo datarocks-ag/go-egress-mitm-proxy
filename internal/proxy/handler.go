@@ -173,14 +173,16 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 		}
 		if rec != nil {
 			// Blocked requests are not forwarded; the only mutation is X-Request-ID.
-			rec.SetRequestOut(r, nil, []string{"X-Request-ID"}, "")
+			rec.SetRequestOut(r, nil, []string{"X-Request-ID"}, nil, "")
 		}
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
 	}
 
-	// Apply rewrite transformations: drop headers, inject headers, change scheme
+	// Apply rewrite transformations: drop headers, inject headers, change scheme.
+	// X-Request-ID is always injected by the proxy and is absent from the
+	// inbound snapshot, so it is a genuine addition.
 	added := []string{"X-Request-ID"}
-	var dropped []string
+	var dropped, modified []string
 	schemeChanged := ""
 	if matchedRewrite != nil {
 		for _, h := range matchedRewrite.DropHeaders {
@@ -190,8 +192,14 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 			r.Header.Del(h)
 		}
 		for k, v := range matchedRewrite.Headers {
+			// Set overwrites; distinguish a brand-new header from one that
+			// replaces an existing client value so the diff stays accurate.
+			if len(r.Header.Values(k)) > 0 {
+				modified = append(modified, k)
+			} else {
+				added = append(added, k)
+			}
 			r.Header.Set(k, v)
-			added = append(added, k)
 		}
 		if matchedRewrite.TargetScheme != "" {
 			r.URL.Scheme = matchedRewrite.TargetScheme
@@ -200,7 +208,7 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 	}
 
 	if rec != nil {
-		rec.SetRequestOut(r, dropped, added, schemeChanged)
+		rec.SetRequestOut(r, dropped, added, modified, schemeChanged)
 	}
 
 	return r, nil

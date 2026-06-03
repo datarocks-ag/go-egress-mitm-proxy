@@ -140,7 +140,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 
 **Selective Request Tracing (`trace:` block):**
 
-Opt-in, full-detail tracing of a *subset* of requests selected by host and/or URL. Each traced request is emitted as a single aggregated JSON record (keyed by `trace_id` = `X-Request-ID`) spanning every layer: CONNECT/TCP (resolved/connected IP, dial timing, TLS version/cipher), request (inbound headers, outbound post-mutation headers, the dropped/added/scheme-changed diff), response (status, headers), and optionally request/response bodies. Independent of the `-v/-vv/-vvv` log level.
+Opt-in, full-detail tracing of a *subset* of requests selected by host and/or URL. Each traced request is emitted as a single aggregated JSON record (keyed by `trace_id` = `X-Request-ID`) spanning every layer: CONNECT/TCP (resolved/connected IP, dial timing, TLS version/cipher), request (inbound headers, outbound post-mutation headers, the dropped/added/modified/scheme-changed diff), response (status, headers), and optionally request/response bodies. Independent of the `-v/-vv/-vvv` log level.
 
 - `enabled`: master switch; when false, tracing is fully short-circuited (no per-request overhead)
 - `log_path`: optional dedicated JSON-lines file (reopened on SIGHUP for rotation, like `blocked_log_path`); empty = main log stream

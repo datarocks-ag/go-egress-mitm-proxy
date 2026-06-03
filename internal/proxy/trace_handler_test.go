@@ -110,6 +110,43 @@ func TestHandleRequestTraceCapturesHeaderDiff(t *testing.T) {
 	}
 }
 
+// TestHandleRequestTraceOverwriteIsModified verifies that an injected header
+// which overwrites an existing client header is reported under "modified",
+// not "added".
+func TestHandleRequestTraceOverwriteIsModified(t *testing.T) {
+	var buf bytes.Buffer
+	rc := traceRuntime(t, &buf)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://trace.example.com/path", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Add-Me", "client-supplied") // rewrite injects X-Add-Me, overwriting this
+
+	pctx := &goproxy.ProxyCtx{}
+	if _, resp := HandleRequest(req, pctx, rc); resp != nil {
+		resp.Body.Close() //nolint:errcheck // test cleanup
+		t.Fatalf("expected pass-through, got %d", resp.StatusCode)
+	}
+	rec, ok := pctx.UserData.(*trace.Record)
+	if !ok {
+		t.Fatal("expected a trace record")
+	}
+	rec.Emit()
+
+	var out map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	reqObj := out["request"].(map[string]any)
+	if added := toStringSet(reqObj["added"]); added["X-Add-Me"] {
+		t.Errorf("X-Add-Me overwrote an existing header; it must not be in added: %v", reqObj["added"])
+	}
+	if modified := toStringSet(reqObj["modified"]); !modified["X-Add-Me"] {
+		t.Errorf("modified = %v, want it to include X-Add-Me", reqObj["modified"])
+	}
+}
+
 func TestHandleRequestNoTraceWhenDisabled(t *testing.T) {
 	rc := &config.RuntimeConfig{}
 	cfg := config.Config{}
