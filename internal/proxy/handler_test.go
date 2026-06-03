@@ -397,6 +397,72 @@ func TestHandleRequestDropHeaders(t *testing.T) {
 	}
 }
 
+// TestHandleRequestPreservesConditionalHeaders guards against the proxy
+// stripping caching/conditional request headers. These must reach the
+// upstream unchanged unless a rewrite explicitly lists them in drop_headers,
+// so a 304 Not Modified round-trip keeps working through the proxy.
+func TestHandleRequestPreservesConditionalHeaders(t *testing.T) {
+	conditionalHeaders := map[string]string{
+		"If-Modified-Since":   "Wed, 21 Oct 2015 07:28:00 GMT",
+		"If-None-Match":       `"686897696a7c876b7e"`,
+		"If-Unmodified-Since": "Wed, 21 Oct 2015 07:28:00 GMT",
+		"If-Match":            `"abc123"`,
+		"If-Range":            `"686897696a7c876b7e"`,
+	}
+
+	tests := []struct {
+		name     string
+		url      string
+		rewrites []config.CompiledRewriteRule
+	}{
+		{
+			name: "allowed by default",
+			url:  "http://allow.example.com/asset.css",
+		},
+		{
+			name: "rewritten target",
+			url:  "http://rewrite.example.com/asset.css",
+			rewrites: []config.CompiledRewriteRule{
+				{
+					Pattern:  regexp.MustCompile(`^rewrite\.example\.com$`),
+					TargetIP: "10.0.0.1",
+					Original: "rewrite.example.com",
+					Headers:  map[string]string{"X-Injected": "yes"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rc := &config.RuntimeConfig{}
+			cfg := config.Config{}
+			cfg.Proxy.DefaultPolicy = "ALLOW"
+			_ = rc.Update(cfg, config.CompiledACL{}, tt.rewrites, nil, nil, nil)
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tt.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for k, v := range conditionalHeaders {
+				req.Header.Set(k, v)
+			}
+
+			resultReq, resp := HandleRequest(req, nil, rc)
+			if resp != nil {
+				resp.Body.Close() //nolint:errcheck // test cleanup
+				t.Fatalf("expected nil response, got %d", resp.StatusCode)
+			}
+
+			for k, want := range conditionalHeaders {
+				if got := resultReq.Header.Get(k); got != want {
+					t.Errorf("%s header = %q, want %q (must be preserved)", k, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestHandleRequestTargetScheme(t *testing.T) {
 	rc := &config.RuntimeConfig{}
 	cfg := config.Config{}
