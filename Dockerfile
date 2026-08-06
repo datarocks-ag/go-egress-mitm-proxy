@@ -11,7 +11,7 @@ COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o /mitm-proxy ./cmd/mitm-proxy
 
-FROM alpine:3.19
+FROM alpine:3.24
 
 # Upgrade all packages to pick up security fixes, then install ca-certificates
 RUN apk --no-cache upgrade && \
