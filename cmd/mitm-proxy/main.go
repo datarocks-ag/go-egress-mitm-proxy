@@ -48,7 +48,6 @@ const shutdownTimeout = 30 * time.Second
 const (
 	maxIdleConnsPerTransport = 32
 	maxIdleConnsPerHost      = 10
-	maxConnsPerHost          = 64
 )
 
 // slogProxyLogger adapts goproxy's Logger interface to route through slog.
@@ -456,16 +455,34 @@ func main() {
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
 	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
 	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
+	//
 	// MaxIdleConns is per-transport, and TransportPool clones this one per rewrite
 	// target, so the process-wide idle ceiling is (targets + 1) x MaxIdleConns.
-	// Sized per transport accordingly rather than leaving the old global figure to
-	// multiply. MaxConnsPerHost bounds *active* connections, which nothing did
-	// before: for a split-brain proxy many client hostnames collapse onto one
-	// target_ip, which is exactly the ephemeral-port-exhaustion case.
+	// Sized per transport accordingly rather than leaving a global figure to
+	// multiply.
+	//
+	// MaxConnsPerHost is deliberately NOT set. It bounds the wrong key and buys
+	// the bound with unbounded latency:
+	//
+	//   - Go keys connsPerHost on the *request URL* host:port, computed before the
+	//     dialer substitutes target_ip, and TransportPool clones per target. So N
+	//     rewritten hostnames still permit N x limit sockets to one upstream IP --
+	//     the ephemeral-port case a previous comment here claimed it covered is
+	//     the one case it does not.
+	//   - When the cap is reached, queueForConn parks the request and the only
+	//     escape is req.Context().Done(). goproxy builds MITM requests over
+	//     context.Background() with a bare WithCancel, so there is no deadline,
+	//     and ResponseHeaderTimeout does not bound body streaming. A handful of
+	//     large concurrent downloads from one registry would block the next client
+	//     indefinitely, holding its tunnel and listener slot, with no queue-depth
+	//     metric and no log line.
+	//
+	// A correct per-target bound has to live in the dialer, where the real dial
+	// address is known, and has to fail fast rather than queue. That is not
+	// implemented; TransportPool.Len() at least makes pool growth observable.
 	proxyHandler.Tr = proxy.NewOutboundTransport(baseTLSConfig, runtimeCfg, proxy.OutboundTransportOptions{
 		MaxIdleConns:          maxIdleConnsPerTransport,
 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
-		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	})
