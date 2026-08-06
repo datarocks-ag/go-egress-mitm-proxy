@@ -1457,3 +1457,29 @@ func TestBuildOutboundTLSConfigDecisions(t *testing.T) {
 		}
 	})
 }
+
+// TestRunGencertCreatesOutputDirectory pins the Quick Start's first command.
+// Every documented invocation writes into a subdirectory that the repo does not
+// ship, and plain os.WriteFile made `gencert --out-cert certs/ca.crt` fail on a
+// fresh clone.
+func TestRunGencertCreatesOutputDirectory(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "certs", "ca.crt")
+	keyPath := filepath.Join(dir, "certs", "ca.key")
+
+	err := RunGencert([]string{
+		"--type", "root",
+		"--cn", "Quick Start CA",
+		"--out-cert", certPath,
+		"--out-key", keyPath,
+	})
+	if err != nil {
+		t.Fatalf("RunGencert into a nonexistent directory: %v", err)
+	}
+
+	for _, p := range []string{certPath, keyPath} {
+		if _, statErr := os.Stat(p); statErr != nil {
+			t.Errorf("expected %s to exist: %v", p, statErr)
+		}
+	}
+}

@@ -15,4 +15,7 @@ data:
         target_ip: "10.20.30.40"
     acl:
       whitelist:
-        - "^.*\\.google\\.com$"
+        # Wildcard form. A bare regex like "^.*\\.google\\.com$" is escaped
+        # literally by WildcardToRegex and never matches; prefix with "~" to opt
+        # into raw regex, or use the wildcard form as here.
+        - "*.google.com"

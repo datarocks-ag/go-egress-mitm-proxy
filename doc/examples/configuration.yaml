@@ -127,11 +127,17 @@ acl:
 # Matching: OR across rules; within a rule, host AND url must both match.
 # host/url use the same convention as acl/rewrites (wildcard, or "~" raw regex).
 # url is matched against the full URL (scheme://host/path?query).
+# Left disabled here on purpose. This file is what the Quick Start tells you to
+# copy, and two things make trace-on a poor default: Validate() rejects a
+# log_path whose parent directory does not exist (so `make run` exits 1 on a
+# fresh clone), and trace records carry full headers and, with bodies enabled,
+# full payloads. Turn it on deliberately.
 trace:
-  enabled: true
+  enabled: false
   # Optional dedicated JSON-lines file. When omitted, records go to the main
   # log stream. Reopened on SIGHUP for rotation (like blocked_log_path).
-  log_path: "/var/log/mitm-proxy/trace.jsonl"
+  # The parent directory must already exist.
+  # log_path: "/var/log/mitm-proxy/trace.jsonl"
 
   # Redaction is secure-by-default. The built-in masked set
   # (Authorization, Proxy-Authorization, Cookie, Set-Cookie) is always applied;

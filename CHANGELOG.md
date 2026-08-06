@@ -26,6 +26,73 @@ git history for the full detail.
 - SIGHUP reload drops pooled connections to the previous rewrite targets instead
   of letting them serve until `IdleConnTimeout` (90s) expires.
 
+Findings from a full multi-lens code review of `main`, grouped by area:
+
+- **Hostnames are normalized before every policy decision.** DNS names are
+  case-insensitive and a trailing dot denotes the same FQDN, but patterns were
+  compiled case-sensitively and hosts were matched verbatim. In the documented
+  denylist deployment (`default_policy: ALLOW` plus a blacklist) that was a full
+  egress-control bypass costing one uppercase letter, and it silently disabled
+  rewrite rules in the other direction — sending a request over public DNS
+  without its injected headers.
+- **The blacklist is evaluated before passthrough.** A passthrough match accepts
+  the tunnel, and an accepted tunnel never reaches the request handler where
+  every other blacklist check lives, so a broad passthrough pattern voided the
+  blacklist entries it overlapped.
+- **Raw `~` host patterns are anchored.** Unanchored, a whitelist entry such as
+  `~api\.corp\.com` also matched `api.corp.com.attacker.net`. Trace `url`
+  patterns deliberately remain substring matches.
+- **Tracing no longer alters the traffic it observes.** Enabling trace on a
+  passthrough host replaced the dialer, losing rewrite targets and dial metrics
+  (so tracing a route changed the route); the tunnel wrapper hid
+  `CloseRead`/`CloseWrite`, truncating protocols that half-close; and response
+  bodies were wrapped unconditionally, re-framing every traced response as
+  chunked and emitting an invalid chunked 204/304. Also fixes a data race in the
+  body buffer.
+- **Graceful shutdown actually drains.** The drain ran in a goroutine nothing
+  joined, so the process exited mid-drain and the 30s budget never elapsed; and
+  CONNECT tunnels — all HTTPS traffic — were never tracked at all, because
+  `http.Server` stops tracking hijacked connections.
+- **`/readyz` reports real state.** Previously a hardcoded 200, so it reported
+  ready before the proxy port was bound and stayed ready while draining.
+- **SIGHUP warns about settings it cannot apply** (`mitm_*`, `port`,
+  `metrics_port`) instead of reporting a clean reload that ignored them.
+- **Leaf certificates share one bounded, expiring cache.** The default path
+  re-signed on every CONNECT; setting `mitm_org` switched to a cache with no
+  eviction and no expiry. `SignHost` also attached only the first CA
+  certificate, breaking path building for multi-level chains.
+- **Unloadable CA sources are fatal** rather than warned-and-continued with a
+  success message and an incremented success counter.
+- **The upstream TLS handshake is bounded** (10s). Nothing bounded it before —
+  `TLSHandshakeTimeout` does not apply with a custom `DialTLSContext` — so a
+  target that accepted the connection and then went silent parked a goroutine
+  and two file descriptors indefinitely.
+- **`HTTPS_PROXY` in the environment no longer bypasses the dialers**, which had
+  silently disabled `target_ip` substitution, tracing and dial metrics for every
+  CONNECT.
+- **The Security Scan CI job can fail.** All trivy steps lacked `exit-code`, so
+  a CRITICAL shipped with a green pipeline. The scanned image is now the pushed
+  image.
+- `gencert` creates its output directories, so the documented Quick Start works
+  on a fresh clone.
+
+### Changed
+- Server timeouts: `ReadTimeout`/`WriteTimeout` replaced with
+  `ReadHeaderTimeout`. The old absolute deadlines severed plain-HTTP transfers
+  at 60s mid-body while leaving every CONNECT tunnel unbounded, since hijacking
+  clears the deadline.
+- `MaxConnsPerHost` is now set, bounding active upstream connections; idle
+  connection limits are sized per transport rather than assuming one global pool.
+- The example configuration ships with `trace.enabled: false`. It is the file the
+  Quick Start copies, and the previous default both failed validation (its
+  `log_path` parent directory does not exist) and captured full headers and
+  bodies by default.
+- `cert.BuildOutboundTLSConfig` and `cert.LoadCertPool` now return errors.
+- Kubernetes example manifests: corrected the config mount path (the container
+  read `/app/config.yaml` while the ConfigMap mounted at `/root/config.yaml`, so
+  it exited on start), fixed a whitelist pattern that could never match, and
+  added readiness/liveness probes with a grace period exceeding the drain budget.
+
 ## [3.0.0] - 2026-06-03
 
 ### Added
