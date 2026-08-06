@@ -22,6 +22,17 @@ import (
 	"go-egress-proxy/internal/trace"
 )
 
+// DefaultTLSHandshakeTimeout bounds the upstream TLS handshake performed by
+// MakeTLSDialer. It is separate from the 5s TCP dial timeout, which a target
+// that accepts the connection and then stalls has already passed.
+const DefaultTLSHandshakeTimeout = 10 * time.Second
+
+// tlsHandshakeTimeout is the value actually used. It is a variable rather than a
+// constant purely so tests can lower it: asserting that a stalled handshake is
+// bounded otherwise costs the full timeout in wall-clock time on every CI run.
+// Production never reassigns it.
+var tlsHandshakeTimeout = DefaultTLSHandshakeTimeout
+
 // RewriteResult holds the outcome of a rewrite rule lookup.
 type RewriteResult struct {
 	TargetIP   string
@@ -404,9 +415,25 @@ func MakeTLSDialer(runtimeCfg *config.RuntimeConfig) func(ctx context.Context, n
 			tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured insecure for dev/internal endpoints
 		}
 
-		// TLS handshake
+		// TLS handshake, explicitly bounded.
+		//
+		// Nothing else bounds it. Transport.TLSHandshakeTimeout is only applied in
+		// net/http's own addTLS(); with a custom DialTLSContext the transport calls
+		// straight through (transport.go hasCustomTLSDialer branch). The context
+		// here descends from goproxy's MITM request, which is built over
+		// context.Background(), so it carries no deadline either. The 5s Dialer
+		// timeout above covers TCP connect only.
+		//
+		// Without this, a target that completes the TCP handshake and then goes
+		// silent -- half-dead TLS terminator, silent firewall, overloaded LB --
+		// parks the request goroutine forever holding an upstream socket and the
+		// client's hijacked tunnel. ResponseHeaderTimeout never fires, because the
+		// handshake never completes.
+		hsCtx, cancelHandshake := context.WithTimeout(ctx, tlsHandshakeTimeout)
+		defer cancelHandshake()
+
 		tlsConn := tls.Client(rawConn, tlsCfg)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		if err := tlsConn.HandshakeContext(hsCtx); err != nil {
 			rawConn.Close() //nolint:errcheck // best-effort cleanup on handshake failure
 			RecordDialError(err)
 			if rec := trace.FromContext(ctx); rec != nil {
