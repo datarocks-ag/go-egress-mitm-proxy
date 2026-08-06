@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -381,6 +382,9 @@ func (rc *RuntimeConfig) CloseTraceLog() {
 
 // OpenTraceLog opens (or creates) the trace log file and returns a JSON logger writing to it.
 // If path is empty, the feature uses the main log stream and nil values are returned.
+// A nil logger means "use the main log stream"; callers are expected to supply
+// one whose level admits Info, because trace records are documented as
+// independent of the -v/-vv/-vvv verbosity. See MainStreamTraceLogger.
 func OpenTraceLog(path string) (*slog.Logger, *os.File, error) {
 	if path == "" {
 		return nil, nil, nil
@@ -866,4 +870,15 @@ func ReloadIgnoredFields(oldCfg, newCfg Config) []string {
 		}
 	}
 	return changed
+}
+
+// MainStreamTraceLogger returns the logger to use when trace.log_path is empty.
+//
+// Trace records are written at Info, and the proxy's default level is Warn, so
+// falling back to slog.Default() silently discarded every record on the
+// documented default configuration -- while the records counter still
+// incremented. This handler always admits Info, which is what makes tracing
+// "independent of the -v/-vv/-vvv log level" true rather than aspirational.
+func MainStreamTraceLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
