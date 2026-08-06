@@ -451,6 +451,12 @@ func main() {
 		// request context, so req here is the post-handler request, not r.
 		ctx.RoundTripper = goproxy.RoundTripperFunc(func(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
 			resp, err := transportPool.RoundTrip(req)
+
+			// Timed here, not in HandleRequest: this span covers DNS, dial, TLS
+			// handshake and upstream think-time, which is what request latency
+			// means. The handler returns before any of it happens.
+			proxy.ObserveRequestDuration(req)
+
 			if err != nil {
 				status, reason := proxy.UpstreamErrorResponse(err)
 				slog.Warn("Upstream connection error",
@@ -607,6 +613,11 @@ func main() {
 		os.Exit(1)
 	}
 	trackedLn := proxy.NewTrackingListener(proxyLn)
+
+	// Publish the live client-connection count. This is the number the old
+	// proxy_active_connections gauge was meant to report; it previously
+	// bracketed the OnRequest filter and read ~0 at every scrape.
+	metrics.RegisterActiveConnections(func() float64 { return float64(trackedLn.Open()) })
 
 	// Closed when the drain finishes, so main waits for it instead of exiting
 	// mid-drain. Shutdown closes listeners first, which unblocks Serve on the

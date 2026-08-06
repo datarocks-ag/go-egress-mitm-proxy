@@ -21,12 +21,6 @@ var (
 		Buckets: prometheus.DefBuckets,
 	}, []string{"action"})
 
-	// ActiveConnections tracks currently active proxy connections.
-	ActiveConnections = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "proxy_active_connections",
-		Help: "Number of active proxy connections",
-	})
-
 	// ConfigLoadErrors counts configuration loading failures.
 	ConfigLoadErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "proxy_config_load_errors_total",
@@ -63,3 +57,22 @@ var (
 		Help: "Total emitted trace records by mode",
 	}, []string{"mode"})
 )
+
+// RegisterActiveConnections publishes the live client-connection count under
+// proxy_active_connections.
+//
+// It takes a source function rather than exposing Inc/Dec because the previous
+// gauge was incremented and decremented inside the OnRequest filter, which
+// returns before the upstream round-trip. It therefore bracketed rule
+// evaluation -- microseconds -- and read ~0 at every scrape under any load,
+// while never counting passthrough CONNECTs at all. The connection-tracking
+// listener added for graceful shutdown already holds an exact live count;
+// this publishes that instead of a number that was never meaningful.
+//
+// Call once during startup.
+func RegisterActiveConnections(source func() float64) {
+	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "proxy_active_connections",
+		Help: "Number of client connections currently open",
+	}, source)
+}

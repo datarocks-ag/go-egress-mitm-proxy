@@ -45,8 +45,6 @@ type RewriteResult struct {
 // It evaluates rules in order: rewrites -> blacklist -> whitelist -> default policy.
 func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig) (*http.Request, *http.Response) {
 	start := time.Now()
-	metrics.ActiveConnections.Inc()
-	defer metrics.ActiveConnections.Dec()
 
 	// Generate request ID for tracing
 	requestID := GenerateRequestID()
@@ -179,10 +177,6 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 		metrics.BytesTransferred.WithLabelValues("request").Add(float64(r.ContentLength))
 	}
 
-	defer func() {
-		metrics.RequestDuration.WithLabelValues(action).Observe(time.Since(start).Seconds())
-	}()
-
 	// Block denied requests
 	if action == "BLACK-LISTED" || action == "BLOCKED" {
 		LogBlocked(r.Context(), runtimeCfg, BlockedRequest{
@@ -197,6 +191,9 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 			// Blocked requests are not forwarded; the only mutation is X-Request-ID.
 			rec.SetRequestOut(r, nil, []string{"X-Request-ID"}, nil, "")
 		}
+		// Nothing is forwarded, so the handler's own elapsed time is the whole
+		// request.
+		metrics.RequestDuration.WithLabelValues(action).Observe(time.Since(start).Seconds())
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
 	}
 
@@ -233,7 +230,38 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 		rec.SetRequestOut(r, dropped, added, modified, schemeChanged)
 	}
 
+	// Forwarded requests are timed around the upstream round-trip instead, which
+	// is where DNS, dial, TLS handshake and upstream think-time actually happen.
+	// Observing here would have measured rule evaluation and called it request
+	// latency.
+	r = r.WithContext(context.WithValue(r.Context(), timingCtxKey, &requestTiming{
+		start:  start,
+		action: action,
+	}))
+
 	return r, nil
+}
+
+// requestTiming carries the handler's start time and policy outcome to whoever
+// completes the request, so the duration histogram spans the upstream call.
+type requestTiming struct {
+	start  time.Time
+	action string
+}
+
+type timingCtxKeyType struct{}
+
+var timingCtxKey = timingCtxKeyType{}
+
+// ObserveRequestDuration records the elapsed time for a forwarded request.
+// Call once the upstream round-trip has returned. No-op for requests that were
+// never forwarded, which record their own duration in HandleRequest.
+func ObserveRequestDuration(r *http.Request) {
+	t, ok := r.Context().Value(timingCtxKey).(*requestTiming)
+	if !ok {
+		return
+	}
+	metrics.RequestDuration.WithLabelValues(t.action).Observe(time.Since(t.start).Seconds())
 }
 
 // setupTrace creates a trace Record when tracing is enabled and the request
