@@ -59,8 +59,13 @@ func preStopGrace() time.Duration {
 		return defaultPreStopGrace
 	}
 	d, err := time.ParseDuration(raw)
-	if err != nil || d < 0 {
-		slog.Warn("Invalid PROXY_PRESTOP_GRACE; using the default",
+	switch {
+	case err != nil:
+		slog.Warn("Unparseable PROXY_PRESTOP_GRACE; using the default",
+			"value", raw, "default", defaultPreStopGrace, "err", err)
+		return defaultPreStopGrace
+	case d < 0:
+		slog.Warn("Negative PROXY_PRESTOP_GRACE; using the default",
 			"value", raw, "default", defaultPreStopGrace)
 		return defaultPreStopGrace
 	}
