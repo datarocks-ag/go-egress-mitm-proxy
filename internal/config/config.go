@@ -14,8 +14,6 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
-
-	"go-egress-proxy/internal/metrics"
 )
 
 // RewriteRule defines a domain rewrite configuration.
@@ -810,12 +808,10 @@ func WildcardToURLRegex(pattern string) (*regexp.Regexp, error) {
 func LoadConfig(path string) (Config, error) {
 	f, err := os.ReadFile(path)
 	if err != nil {
-		metrics.ConfigLoadErrors.Inc()
 		return Config{}, fmt.Errorf("read config file: %w", err)
 	}
 	var c Config
 	if err := yaml.Unmarshal(f, &c); err != nil {
-		metrics.ConfigLoadErrors.Inc()
 		return Config{}, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -823,7 +819,6 @@ func LoadConfig(path string) (Config, error) {
 	c.ApplyEnvOverrides()
 
 	if err := c.Validate(); err != nil {
-		metrics.ConfigLoadErrors.Inc()
 		return Config{}, fmt.Errorf("validate config: %w", err)
 	}
 	return c, nil
