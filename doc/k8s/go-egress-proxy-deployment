@@ -3,8 +3,19 @@ kind: Deployment
 metadata:
   name: my-app
 spec:
+  # selector and template.metadata.labels are required for apps/v1 Deployments
+  # and must match; without them kubectl apply fails validation.
+  selector:
+    matchLabels:
+      app: my-app
   template:
+    metadata:
+      labels:
+        app: my-app
     spec:
+      # Must exceed the proxy's 30s drain budget, or the kubelet SIGKILLs it
+      # mid-drain and the graceful shutdown is wasted.
+      terminationGracePeriodSeconds: 45
       containers:
         # 1. Your Application
         - name: app
@@ -25,9 +36,26 @@ spec:
           ports:
             - containerPort: 8080
             - containerPort: 9090
+          # /readyz reports 503 until the proxy port is bound, and again as soon
+          # as shutdown begins, so it is safe to gate traffic on. /healthz stays
+          # independent on purpose: failing it during a drain would have the
+          # kubelet kill the pod mid-drain.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            periodSeconds: 10
           volumeMounts:
             - name: config
-              mountPath: /root/config.yaml
+              # The image sets WORKDIR /app and CONFIG_PATH=/app/config.yaml.
+              # Mounting at /root/config.yaml left the container with no config
+              # at the path it reads, so it exited 1 on start.
+              mountPath: /app/config.yaml
               subPath: config.yaml
             - name: ca-certs
               mountPath: /etc/proxy/certs

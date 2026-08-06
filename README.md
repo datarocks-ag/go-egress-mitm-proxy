@@ -18,7 +18,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 - **Environment variable overrides** for 12-factor app compatibility
 - **Outbound HTTP/2** - negotiates HTTP/2 with upstream servers via ALPN
 - **Prometheus metrics** - request counts, latency histograms, active connections, upstream errors
-- **Graceful shutdown** - proper connection draining on SIGTERM
+- **Graceful shutdown** - drains in-flight requests and CONNECT tunnels on SIGTERM (30s budget), failing `/readyz` first so load balancers stop sending new traffic
 - **Health endpoints** - `/healthz` and `/readyz` for Kubernetes probes
 
 ## Quick Start
@@ -310,7 +310,9 @@ keytool -importkeystore \
 
 ### Environment Variable Overrides
 
-All config options can be overridden via environment variables:
+Selected `proxy:` settings can be overridden via environment variables. The
+`rewrites:`, `acl:` and `trace:` blocks have **no** environment equivalents —
+they are structured and must come from the config file.
 
 | Variable | Description |
 |----------|-------------|
@@ -318,6 +320,7 @@ All config options can be overridden via environment variables:
 | `PROXY_PORT` | Proxy listen port |
 | `PROXY_METRICS_PORT` | Metrics endpoint port |
 | `PROXY_DEFAULT_POLICY` | `ALLOW` or `BLOCK` |
+| `PROXY_MITM_ORG` | Organization on generated MITM leaf certificates (see `mitm_org`) |
 | `PROXY_MITM_CERT_PATH` | Path to MITM CA certificate (PEM) |
 | `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |
 | `PROXY_MITM_KEYSTORE_PATH` | Path to PKCS#12 keystore (`.p12`) containing cert and key |
@@ -394,6 +397,18 @@ kill -HUP <pid>
 
 The proxy will log successful reloads and any errors. SIGHUP also reopens the blocked request log file, enabling log rotation.
 
+**What SIGHUP applies:** ACL lists, rewrite rules, `default_policy`, trace
+configuration, outbound CA sources, and both log files. Pooled upstream
+connections to previous rewrite targets are dropped so new targets take effect
+immediately rather than after `IdleConnTimeout`.
+
+**What needs a restart:** `port`, `metrics_port`, and every `mitm_*` setting
+(`mitm_cert_path`, `mitm_key_path`, `mitm_keystore_path`,
+`mitm_keystore_password`, `mitm_org`). The MITM CA is loaded once at startup and
+its leaf-certificate cache outlives a reload, so rotating the CA requires a
+restart. If any of these change, the reload logs a warning naming them rather
+than reporting a clean reload that silently ignored them.
+
 ## Logging
 
 All log output is structured JSON via `slog`. The verbosity flag controls which log levels are emitted:
@@ -464,7 +479,13 @@ trace:
 
 Each record captures:
 
-- **CONNECT/TCP/TLS** — host (with port), SNI, resolved/connected IP, dial timing, negotiated TLS version/cipher
+- **CONNECT/TCP/TLS** — host (with port) and SNI always; plus resolved/connected
+  IP, dial timing and negotiated TLS version/cipher **only when this request
+  opened a new upstream connection**. When a pooled connection is reused those
+  four fields are absent and the record carries `tcp.connection_reused: true`
+  instead — there is no per-request TCP layer to report. With keep-alive that is
+  the common case, so their absence is normal rather than a sign tracing is
+  broken.
 - **Request** — method, URL, inbound headers, outbound (post-mutation) headers, and the `dropped`/`added`/`modified`/`scheme_changed` diff
 - **Response** — status, proto, headers
 - **Bodies** (per rule) — size-capped, content-type-gated (text inline, binary base64/skip), truncation marked; streaming is preserved

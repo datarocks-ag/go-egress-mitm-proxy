@@ -67,9 +67,13 @@ type RuntimeConfig struct {
     config        Config
     acl           CompiledACL
     rewrites      []CompiledRewriteRule
-    rewriteExact  map[string]*CompiledRewriteRule  // O(1) lookup
+    rewriteExact  map[string]*CompiledRewriteRule  // O(1) lookup, normalized keys
+    tlsConfig     *tls.Config                      // outbound TLS (rebuilt on reload)
     blockedLogger *slog.Logger                     // nil when disabled
     blockedFile   *os.File                         // underlying file for Close()
+    trace         CompiledTrace                    // compiled trace rules
+    traceLogger   *slog.Logger                     // nil when trace log undirected
+    traceFile     *os.File                         // underlying trace file for Close()
 }
 ```
 
@@ -89,7 +93,7 @@ Built-in CLI subcommand for generating root and intermediate CA certificates:
 - Output formats: PEM cert+key, PEM chain, PKCS#12 keystore (cert+key)
 - Client trust bundles: PEM trust bundle, PKCS#12 truststore (for Java keystore import)
 - `generateKeyPair()` creates keys by algorithm name
-- `runGencert()` orchestrates flag parsing, key generation, cert creation, and file output
+- `RunGencert()` orchestrates flag parsing, key generation, cert creation, and file output
 
 ### Configuration Loader
 
@@ -98,7 +102,10 @@ Loads and validates YAML configuration at startup and on SIGHUP:
 1. Read YAML file from `CONFIG_PATH` (default: `config.yaml`)
 2. Apply environment variable overrides
 3. Validate required fields and values
-4. Compile patterns (ACL and rewrites) via `wildcardToRegex()`
+4. Compile patterns (ACL and rewrites) via `WildcardToRegex()`; patterns are
+   lowercased and anchored, and every host is normalized with
+   `config.NormalizeHost()` (lowercase, trailing dot stripped) before matching,
+   so `EVIL.example.com` and `evil.example.com.` cannot slip past a blacklist
 
 Environment variable overrides follow 12-factor app principles:
 - `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`
@@ -122,7 +129,7 @@ Pre-compiles patterns at startup for efficient runtime matching. ACL patterns su
 Rewrite rules support wildcards and raw regex for domain matching:
 
 ```go
-// wildcardToRegex converts patterns:
+// WildcardToRegex converts patterns:
 // "example.com"     -> "^example\.com$"           (exact)
 // "*.example.com"   -> "^.+\.example\.com$"       (any subdomain depth)
 // "*"               -> ".*"                        (match all)
@@ -131,7 +138,7 @@ Rewrite rules support wildcards and raw regex for domain matching:
 
 ### Request Handler
 
-The `handleRequest()` function processes every HTTP request:
+The `HandleRequest()` function processes every HTTP request:
 
 1. Generate unique `X-Request-ID` for tracing
 2. Evaluate against rules (rewrite → blacklist → whitelist → default)
@@ -149,33 +156,51 @@ The `handleRequest()` function processes every HTTP request:
 
 ### Dialers (Split-Brain DNS)
 
-Two custom dial functions in `http.Transport` implement split-brain DNS:
+Split-brain DNS is implemented by two custom dial functions, and each request is
+routed to a transport dedicated to its upstream identity.
 
-**`makeDialer()` (plain TCP)**
+`http.Transport` keys its idle-connection pool on the request URL's scheme and
+`host:port`, both fixed *before* the dial functions run. Because the dialers
+substitute the target address inside the dial, rules for one domain differing
+only by `target_ip`, `target_host` or `insecure` would share a pool key and reuse
+each other's connections — misrouting traffic, and handing a connection
+negotiated with `InsecureSkipVerify` to a request that required verification.
+`proxy.TransportPool` therefore hands out one `*http.Transport` per
+`(target_ip | target_host | insecure)` identity, selected per request via
+goproxy's `ctx.RoundTripper`. Within one transport, every connection under a
+given key really is interchangeable, so Go's pooling and HTTP/2 stay intact.
 
-For HTTP upstream connections. Checks request context first (for path-based rewrites set by `handleRequest`), then falls back to `lookupRewrite()` for domain-only rules.
+`TransportPool.Reset()` is called on SIGHUP: the map swap makes stale transports
+unreachable, and closing their idle connections releases sockets immediately
+rather than at `IdleConnTimeout`.
+
+The dial functions themselves:
+
+**`MakeDialer()` (plain TCP)**
+
+For HTTP upstream connections. Checks request context first (for path-based rewrites set by `HandleRequest`), then falls back to `LookupRewrite()` for domain-only rules.
 
 ```go
 DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
     host, port, _ := net.SplitHostPort(addr)
 
     // Check context first (path-based rewrites)
-    rw, ok := ctx.Value(rewriteCtxKey).(rewriteResult)
+    rw, ok := ctx.Value(config.RewriteCtxKey).(proxy.RewriteResult)
     if !ok {
-        rw = lookupRewrite(host, rewrites, rewriteExact)
+        rw = proxy.LookupRewrite(host, rewrites, rewriteExact)
     }
 
-    if rw.targetIP != "" {
-        addr = net.JoinHostPort(rw.targetIP, port)
-    } else if rw.targetHost != "" {
-        addr = net.JoinHostPort(rw.targetHost, port)
+    if rw.TargetIP != "" {
+        addr = net.JoinHostPort(rw.TargetIP, port)
+    } else if rw.TargetHost != "" {
+        addr = net.JoinHostPort(rw.TargetHost, port)
     }
 
     return dialer.DialContext(ctx, network, addr)
 }
 ```
 
-**`makeTLSDialer()` (TLS)**
+**`MakeTLSDialer()` (TLS)**
 
 For HTTPS upstream connections. Performs TCP dial with IP/host substitution, then a separate TLS handshake with per-connection configuration:
 
@@ -240,7 +265,7 @@ Separate HTTP server on metrics port exposing:
 | Signal | Action |
 |--------|--------|
 | `SIGINT` / `SIGTERM` | Graceful shutdown with 30s drain |
-| `SIGHUP` | Hot reload configuration + reopen blocked log file |
+| `SIGHUP` | Hot reload configuration, reopen blocked and trace log files, rebuild outbound TLS, and `TransportPool.Reset()`. Warns about changed `mitm_*` and port settings, which need a restart. |
 
 ## Data Flow
 
@@ -253,9 +278,9 @@ flowchart LR
     end
 
     subgraph main.go
-        load["loadConfig()<br/>Read YAML → ApplyEnvOverrides() → Validate()"]
-        compile["compileACL() → CompiledACL<br/>compileRewrites() → []CompiledRewriteRule"]
-        bllog["openBlockedLog()"]
+        load["LoadConfig()<br/>Read YAML → ApplyEnvOverrides() → Validate()"]
+        compile["CompileACL() → CompiledACL<br/>CompileRewrites() → []CompiledRewriteRule"]
+        bllog["OpenBlockedLog()"]
         rtcfg["RuntimeConfig.Update()"]
 
         subgraph proxy ["goproxy.ProxyHttpServer"]

@@ -56,6 +56,8 @@ internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS p
 internal/cert/gencert.go       # gencert subcommand + key pair generation
 internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, domain metrics
 internal/proxy/transport.go    # Per-rewrite-target transport pool (correct connection-pool keying)
+internal/proxy/listener.go     # Connection-tracking listener (drains hijacked CONNECT tunnels)
+internal/cert/store.go         # Bounded, TTL'd MITM leaf certificate cache
 internal/trace/trace.go        # Selective trace Record, redaction, body capture, aggregated emit
 internal/trace/conn.go         # Passthrough tunnel tracing dialer + byte-counting conn
 internal/metrics/metrics.go    # Prometheus metric vars (promauto registrations)
@@ -101,7 +103,10 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `RuntimeConfig` - Thread-safe config holder with RWMutex for hot reload
 - `LoadConfig()` - Loads YAML, applies env overrides, validates
 - `CompileACL()` / `CompileRewrites()` - Pre-compiles patterns (whitelist, blacklist, passthrough) via `WildcardToRegex()`
-- `WildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode
+- `NormalizeHost()` - Lowercases and strips the trailing dot. **Every policy decision must compare normalized values**: DNS is case-insensitive and `evil.example.com.` is the same FQDN, so matching raw input let either form bypass a blacklist and silently miss rewrite rules.
+- `WildcardToRegex()` - Converts `*.example.com` to regex; `~` prefix enables raw regex mode. Patterns are lowercased, anchored, and compiled case-insensitively (the `(?i)` is redundant given callers normalize — it is there so a future call site that forgets fails closed)
+- `WildcardToURLRegex()` - As above but leaves raw `~` patterns unanchored, for trace `url` rules where substring matching against the full URL is intended. URL rules select what to observe and grant no access, so the fail-open concern that motivates anchoring does not apply
+- `ReloadIgnoredFields()` - Diffs settings SIGHUP cannot apply (`mitm_*`, ports) so the reload warns instead of reporting success and silently discarding them
 - `RunValidate()` - CLI subcommand: validates config file without starting the proxy
 
 `internal/cert`:
@@ -109,7 +114,8 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `SignHost()` - Generates MITM leaf certificates with custom Organization (key type matches CA)
 - `MitmTLSConfigFromCA()` - TLS config factory for custom MITM certs with sync.Map cache
 - `BuildOutboundTLSConfig()` - Builds outbound TLS config with custom CA pool
-- `LoadCertPool()` - Loads CA certificates from PEM bundle and/or PKCS#12 truststore
+- `LoadCertPool()` - Loads CA certificates from PEM bundle and/or PKCS#12 truststore. Returns an error when a *configured* source cannot be loaded (a missing system pool is still only a warning), so startup aborts and a reload keeps the previous config rather than installing a degraded pool alongside a success message
+- `CertStore` - Bounded LRU with TTL implementing `goproxy.CertStorage`, shared by both signing paths. Without it goproxy re-signs on every CONNECT; the `mitm_org` path previously used an unbounded cache with no expiry, so the caching policy depended on a cosmetic field
 - `LoadTruststoreCerts()` - Extracts CA certificates from PKCS#12 truststore
 - `RunGencert()` - CLI subcommand: generates root/intermediate CA certs with optional client trust bundles
 
@@ -119,6 +125,10 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `MakeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
 - `MakeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
 - `NormalizeDomainForMetrics()` - Bounds metrics cardinality
+- `DecideConnect()` - ACL policy for a CONNECT target. **The blacklist is checked before passthrough**, and the order is load-bearing: a passthrough match accepts the tunnel, and an accepted tunnel never reaches `HandleRequest`, where every other blacklist check happens
+- `NormalizeResponseProto()` - Forces HTTP/1.1 framing so goproxy's `resp.Write()` cannot emit an unusable status line
+- `NewOutboundTransport()` - Builds the upstream transport (extracted from main so the real construction is testable)
+- `TrackingListener` - Counts client connections at the listener. `http.Server` cannot drain this proxy's main traffic class, because goproxy hijacks the connection for every CONNECT and the server stops tracking hijacked connections
 - `TransportPool` - One `http.Transport` per distinct upstream identity (`target_ip` + `target_host` + `insecure`). Go keys idle connections on the request URL's `host:port`, which is fixed before the dialers substitute the target, so a single shared transport would let rules for the same domain reuse each other's connections (misrouting traffic, and leaking `insecure` TLS connections to requests that require verification). `RoundTrip()` dispatches on the rewrite result stored in the request context; `Reset()` is called on SIGHUP so reloaded targets do not keep serving from stale pools.
 
 `internal/metrics`: All Prometheus metric vars (`TrafficTotal`, `RequestDuration`, etc.)
@@ -162,11 +172,15 @@ Opt-in, full-detail tracing of a *subset* of requests selected by host and/or UR
 - `proxy_bytes_total` - bytes transferred by direction
 - `proxy_trace_records_total` - emitted trace records by mode (mitm/passthrough)
 
-**Health Endpoints:** `/healthz` (liveness), `/readyz` (readiness)
+**Health Endpoints:** `/healthz` (liveness), `/readyz` (readiness).
 
-**Graceful Shutdown:** SIGINT/SIGTERM with 30s drain period
+`/readyz` is backed by an atomic flag: 503 until the proxy listener is bound, 200 while serving, 503 again as the first step of shutdown so load balancers stop sending traffic before draining begins. `/healthz` stays independent — failing it during a drain would have Kubernetes kill the pod mid-drain.
 
-**Hot Reload:** SIGHUP reloads config without restart
+**Graceful Shutdown:** SIGINT/SIGTERM with a 30s drain budget. Readiness fails first, then `http.Server.Shutdown` drains non-hijacked connections, then `TrackingListener.WaitForDrain` waits out the CONNECT tunnels `http.Server` cannot see. `main` joins the drain goroutine rather than returning underneath it.
+
+**Hot Reload:** SIGHUP reloads ACL, rewrites, trace config, both log files and outbound TLS, and calls `transportPool.Reset()`. It does **not** reload the MITM CA, `mitm_org` or the listen ports — those are captured at startup — and logs a warning naming any that changed.
+
+**Timeouts:** upstream TCP dial 5s, upstream TLS handshake 10s (nothing else bounds it: `TLSHandshakeTimeout` does not apply with a custom `DialTLSContext`), response header 30s, server `ReadHeaderTimeout` 10s, idle 120s. There is deliberately no whole-request deadline: a proxy streams arbitrary bodies, and the previous absolute `ReadTimeout` severed plain HTTP mid-body while leaving every hijacked CONNECT tunnel unbounded.
 
 **Certificate Generation (`gencert` subcommand):**
 

@@ -18,11 +18,29 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	gopkcs12 "software.sslmate.com/src/go-pkcs12"
 )
+
+// writeOutput writes data to path, creating the parent directory if needed.
+//
+// Every documented gencert invocation writes into a subdirectory (certs/ in the
+// README Quick Start, the config example, make docker-run and docker-compose),
+// and none of them ship that directory. Plain os.WriteFile therefore made the
+// very first command in the Quick Start fail on a fresh clone.
+// The path comes from the operator's own --out-* flag on a CLI they are running
+// deliberately; there is no untrusted input and nothing to traverse away from.
+func writeOutput(path string, data []byte, perm os.FileMode) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // operator-supplied output path
+			return fmt.Errorf("create directory %q: %w", dir, err)
+		}
+	}
+	return os.WriteFile(path, data, perm) //nolint:gosec // operator-supplied output path
+}
 
 // RunGencert generates a root or intermediate CA certificate with optional client trust bundles.
 func RunGencert(args []string) error {
@@ -249,13 +267,13 @@ Flags:
 
 	// Write certificate PEM
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	if err := os.WriteFile(*outCert, certPEM, 0644); err != nil { //nolint:gosec // certificate is public
+	if err := writeOutput(*outCert, certPEM, 0o644); err != nil { //nolint:gosec // certificate is public
 		return fmt.Errorf("write certificate: %w", err)
 	}
 
 	// Write private key PEM (restrictive permissions)
 	keyPEMBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := os.WriteFile(*outKey, keyPEMBytes, 0600); err != nil {
+	if err := writeOutput(*outKey, keyPEMBytes, 0o600); err != nil {
 		return fmt.Errorf("write private key: %w", err)
 	}
 
@@ -278,7 +296,7 @@ Flags:
 		if parentCertsPEM != nil {
 			chainData = append(chainData, parentCertsPEM...)
 		}
-		if err := os.WriteFile(*outChain, chainData, 0644); err != nil { //nolint:gosec // chain is public
+		if err := writeOutput(*outChain, chainData, 0o644); err != nil { //nolint:gosec // chain is public
 			return fmt.Errorf("write chain: %w", err)
 		}
 		slog.Info("Wrote certificate chain", "path", *outChain)
@@ -294,7 +312,7 @@ Flags:
 		if p12Err != nil {
 			return fmt.Errorf("encode PKCS#12 keystore: %w", p12Err)
 		}
-		if err := os.WriteFile(*outP12, p12Data, 0600); err != nil {
+		if err := writeOutput(*outP12, p12Data, 0o600); err != nil {
 			return fmt.Errorf("write PKCS#12 keystore: %w", err)
 		}
 		slog.Info("Wrote PKCS#12 keystore", "path", *outP12)
@@ -315,7 +333,7 @@ Flags:
 
 	// Write client trust bundle (PEM)
 	if *outClientBundle != "" {
-		if err := os.WriteFile(*outClientBundle, trustAnchorPEM, 0644); err != nil { //nolint:gosec // trust bundle is public
+		if err := writeOutput(*outClientBundle, trustAnchorPEM, 0o644); err != nil { //nolint:gosec // trust bundle is public
 			return fmt.Errorf("write client trust bundle: %w", err)
 		}
 		slog.Info("Wrote client trust bundle (PEM)", "path", *outClientBundle)
@@ -327,7 +345,7 @@ Flags:
 		if tsErr != nil {
 			return fmt.Errorf("encode client PKCS#12 truststore: %w", tsErr)
 		}
-		if err := os.WriteFile(*outClientP12, tsData, 0644); err != nil { //nolint:gosec // truststore is public (no private keys)
+		if err := writeOutput(*outClientP12, tsData, 0o644); err != nil { //nolint:gosec // truststore is public (no private keys)
 			return fmt.Errorf("write client PKCS#12 truststore: %w", err)
 		}
 		slog.Info("Wrote client PKCS#12 truststore", "path", *outClientP12,
