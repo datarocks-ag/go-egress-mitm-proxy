@@ -499,89 +499,11 @@ func main() {
 	sighupChan := make(chan os.Signal, 1)
 	signal.Notify(sighupChan, syscall.SIGHUP)
 
-	go func() {
-		for range sighupChan {
-			slog.Info("SIGHUP received, reloading configuration...")
-			newCfg, newACL, newRewrites, err := config.LoadAndCompileConfig(configPath)
-			if err != nil {
-				slog.Error("Failed to reload configuration", "err", err)
-				metrics.ConfigLoadErrors.Inc()
-				continue
-			}
-			newTrace, tErr := config.CompileTrace(newCfg.Trace)
-			if tErr != nil {
-				slog.Error("Failed to compile trace config on reload", "err", tErr)
-				metrics.ConfigLoadErrors.Inc()
-				continue
-			}
-			newBlockedLogger, newBlockedFile, blErr := config.OpenBlockedLog(newCfg.Proxy.BlockedLogPath)
-			if blErr != nil {
-				slog.Error("Failed to open blocked log on reload", "path", newCfg.Proxy.BlockedLogPath, "err", blErr)
-				metrics.ConfigLoadErrors.Inc()
-				continue
-			}
-			newTraceLogger, newTraceFile, tfErr := config.OpenTraceLog(newCfg.Trace.LogPath)
-			if tfErr != nil {
-				slog.Error("Failed to open trace log on reload", "path", newCfg.Trace.LogPath, "err", tfErr)
-				metrics.ConfigLoadErrors.Inc()
-				// Avoid leaking the blocked log FD opened just above when we bail out.
-				if newBlockedFile != nil {
-					if err := newBlockedFile.Close(); err != nil {
-						slog.Warn("Failed to close blocked log file after reload error", "err", err)
-					}
-				}
-				continue
-			}
-			// Warn about settings that changed but cannot be applied without a
-			// restart, rather than reporting a clean reload that silently ignored them.
-			previousCfg, _, _, _, _ := runtimeCfg.Get()
-			if ignored := config.ReloadIgnoredFields(previousCfg, newCfg); len(ignored) > 0 {
-				slog.Warn("Configuration changes require a restart and were NOT applied",
-					"fields", ignored,
-					"hint", "certificate and listen-port changes take effect on restart only")
-			}
-
-			newTLSConfig, tlsErr := cert.BuildOutboundTLSConfig(newCfg)
-			if tlsErr != nil {
-				slog.Error("Failed to build outbound TLS configuration on reload; keeping previous configuration",
-					"err", tlsErr)
-				metrics.ConfigLoadErrors.Inc()
-				// Release the log files opened above, since this reload is abandoned.
-				if newBlockedFile != nil {
-					if closeErr := newBlockedFile.Close(); closeErr != nil {
-						slog.Warn("Failed to close blocked log file after reload error", "err", closeErr)
-					}
-				}
-				if newTraceFile != nil {
-					if closeErr := newTraceFile.Close(); closeErr != nil {
-						slog.Warn("Failed to close trace log file after reload error", "err", closeErr)
-					}
-				}
-				continue
-			}
-			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newTLSConfig, newBlockedLogger, newBlockedFile)
-			if oldFile != nil {
-				if err := oldFile.Close(); err != nil {
-					slog.Warn("Failed to close rotated blocked log file", "err", err)
-				}
-			}
-			oldTraceFile := runtimeCfg.SetTrace(newTrace, newTraceLogger, newTraceFile)
-			if oldTraceFile != nil {
-				if err := oldTraceFile.Close(); err != nil {
-					slog.Warn("Failed to close rotated trace log file", "err", err)
-				}
-			}
-			// Rewrite targets may now resolve elsewhere; drop pooled connections to
-			// the previous targets instead of letting them serve until IdleConnTimeout.
-			transportPool.Reset()
-			metrics.ConfigReloads.Inc()
-			slog.Info("Configuration reloaded successfully",
-				"rewrites", len(newRewrites),
-				"whitelist", len(newACL.Whitelist),
-				"blacklist", len(newACL.Blacklist),
-				"passthrough", len(newACL.Passthrough))
-		}
-	}()
+	go watchSIGHUP(sighupChan, reloadDeps{
+		configPath: configPath,
+		runtimeCfg: runtimeCfg,
+		pool:       transportPool,
+	})
 
 	// Bind the proxy listener explicitly so client connections can be tracked.
 	// http.Server cannot drain them itself: goproxy hijacks the connection for
