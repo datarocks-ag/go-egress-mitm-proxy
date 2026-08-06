@@ -1,23 +1,24 @@
 name: CI go-egress-proxy
 
+# Pull requests only.
+#
+# This previously also triggered on pushes to feature/bugfix/hotfix/release/
+# dependabot branches. Running both meant every push to a branch with an open PR
+# started two runs; a concurrency group collapsed them, but "collapsed" means one
+# run is cancelled, and a cancelled run reports as a failed check on the PR. Red
+# X's for work that actually passed are worse than the duplication they prevent.
+#
+# Triggering on pull_request alone gives every PR a full set of checks regardless
+# of how its branch is named — the gap that motivated adding the trigger — with
+# no second event to race. Pushes to main are covered by release.yaml.
 on:
-  push:
-    branches:
-      - 'feature/**'
-      - 'bugfix/**'
-      - 'hotfix/**'
-      - 'release/**'
-      - 'dependabot/**'
-  # Without this, a branch outside the prefixes above gets no checks at all and
-  # its PR reports success by silence.
   pull_request:
     branches: [main]
 
-# A branch matching a prefix above that also has an open PR would otherwise run
-# twice per push. Keying on head_ref for PRs and ref_name for pushes yields the
-# same group for both, so the newer run cancels the older instead of duplicating.
+# Supersede in-flight runs when a PR is pushed to again. Only one event type
+# reaches this workflow now, so this cannot cancel a run for a different event.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true
 
 jobs:
