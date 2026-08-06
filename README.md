@@ -18,7 +18,7 @@ A MITM HTTP/HTTPS proxy implementing split-brain DNS for egress traffic control 
 - **Environment variable overrides** for 12-factor app compatibility
 - **Outbound HTTP/2** - negotiates HTTP/2 with upstream servers via ALPN
 - **Prometheus metrics** - request counts, latency histograms, active connections, upstream errors
-- **Graceful shutdown** - drains in-flight requests and CONNECT tunnels on SIGTERM (30s budget), failing `/readyz` first so load balancers stop sending new traffic
+- **Graceful shutdown** - on SIGTERM: fail `/readyz`, keep serving for `PROXY_PRESTOP_GRACE` (default 10s) so load balancers route away, then drain in-flight requests and CONNECT tunnels within a 30s budget
 - **Health endpoints** - `/healthz` and `/readyz` for Kubernetes probes
 
 ## Quick Start
@@ -321,6 +321,7 @@ they are structured and must come from the config file.
 | `PROXY_METRICS_PORT` | Metrics endpoint port |
 | `PROXY_DEFAULT_POLICY` | `ALLOW` or `BLOCK` |
 | `PROXY_MITM_ORG` | Organization on generated MITM leaf certificates (see `mitm_org`) |
+| `PROXY_PRESTOP_GRACE` | How long to keep serving after failing `/readyz` on SIGTERM, before closing the listener (default `10s`; set `0` when a `preStop` hook already sleeps) |
 | `PROXY_MITM_CERT_PATH` | Path to MITM CA certificate (PEM) |
 | `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |
 | `PROXY_MITM_KEYSTORE_PATH` | Path to PKCS#12 keystore (`.p12`) containing cert and key |

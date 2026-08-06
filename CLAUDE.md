@@ -177,7 +177,7 @@ Opt-in, full-detail tracing of a *subset* of requests selected by host and/or UR
 
 `/readyz` is backed by an atomic flag: 503 until the proxy listener is bound, 200 while serving, 503 again as the first step of shutdown so load balancers stop sending traffic before draining begins. `/healthz` stays independent — failing it during a drain would have Kubernetes kill the pod mid-drain.
 
-**Graceful Shutdown:** SIGINT/SIGTERM with a 30s drain budget. Readiness fails first, then `http.Server.Shutdown` drains non-hijacked connections, then `TrackingListener.WaitForDrain` waits out the CONNECT tunnels `http.Server` cannot see. `main` joins the drain goroutine rather than returning underneath it.
+**Graceful Shutdown:** SIGINT/SIGTERM. Readiness fails first, then the proxy keeps serving for `PROXY_PRESTOP_GRACE` (default 10s) — failing readiness and closing the listener in the same instant just produces ECONNREFUSED until the next probe, so only already-accepted connections would benefit from the drain. Then `http.Server.Shutdown` drains non-hijacked connections, and `TrackingListener.WaitForDrain` waits out the CONNECT tunnels `http.Server` cannot see, within a 30s budget. `main` joins the drain goroutine rather than returning underneath it. Deployment grace periods must exceed grace + drain: the k8s manifest and docker-compose both use 45s.
 
 **Hot Reload:** SIGHUP reloads ACL, rewrites, trace config, both log files and outbound TLS, and calls `transportPool.Reset()`. It does **not** reload the MITM CA, `mitm_org` or the listen ports — those are captured at startup — and logs a warning naming any that changed.
 
