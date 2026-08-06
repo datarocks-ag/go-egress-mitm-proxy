@@ -16,7 +16,7 @@ make run            # Run directly with go run
 make certs          # Generate CA certificates
 make docker-build   # Build Docker image
 make docker-run     # Run in Docker
-make install-tools  # Install dev tools (golangci-lint, goimports)
+make install-tools  # Install dev tools (goimports). golangci-lint is NOT installed here — it runs via the go.mod tool directive: `go tool golangci-lint run` (what `make lint` does)
 
 # CLI flags
 ./mitm-proxy --version       # Print version and exit
@@ -112,7 +112,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 `internal/cert`:
 - `LoadMITMCertificate()` - Loads MITM CA from PEM or PKCS#12
 - `SignHost()` - Generates MITM leaf certificates with custom Organization (key type matches CA)
-- `MitmTLSConfigFromCA()` - TLS config factory for custom MITM certs with sync.Map cache
+- `MitmTLSConfigFromCA()` - TLS config factory for custom MITM leaf certificates. Uses the shared `CertStore`; cache keys are qualified by a hash of the signing CA chain plus the Organization, so two callers with different CAs cannot be served each other's leaves
 - `BuildOutboundTLSConfig()` - Builds outbound TLS config with custom CA pool
 - `LoadCertPool()` - Loads CA certificates from PEM bundle and/or PKCS#12 truststore. Returns an error when a *configured* source cannot be loaded (a missing system pool is still only a warning), so startup aborts and a reload keeps the previous config rather than installing a degraded pool alongside a success message
 - `CertStore` - Bounded LRU with TTL implementing `goproxy.CertStorage`, shared by both signing paths. Without it goproxy re-signs on every CONNECT; the `mitm_org` path previously used an unbounded cache with no expiry, so the caching policy depended on a cosmetic field
