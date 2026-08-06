@@ -43,6 +43,12 @@ var version = "dev"
 // shutdownTimeout bounds the drain period after SIGINT/SIGTERM.
 const shutdownTimeout = 30 * time.Second
 
+// preStopGrace is how long the proxy keeps serving after failing readiness and
+// before it closes the listener, so load balancers notice and route away first.
+// Sized at two probe intervals of the shipped Kubernetes manifest (5s).
+// shutdownTimeout + preStopGrace must stay under terminationGracePeriodSeconds.
+const preStopGrace = 10 * time.Second
+
 // Outbound connection pool sizing. These apply per transport, and TransportPool
 // clones the base transport once per distinct rewrite target.
 const (
@@ -582,9 +588,26 @@ func main() {
 		<-ctx.Done()
 		slog.Info("Shutdown signal received, draining connections...")
 
-		// Fail readiness first so load balancers stop sending new connections
-		// while the in-flight ones finish.
+		// Fail readiness first, then keep serving for a moment before closing the
+		// listener.
+		//
+		// Failing readiness and shutting down in the same instant achieves
+		// nothing: a load balancer only stops routing here once its next probe
+		// fails, and Shutdown closes the listener immediately, so clients get
+		// ECONNREFUSED for a probe period or two. Only connections already
+		// accepted benefited from the drain. Serving through one full probe
+		// interval is what actually lets traffic move away first.
+		//
+		// Deployments with a preStop hook (sleep, then SIGTERM) can set this to
+		// zero; the shipped Kubernetes manifest has no hook and probes every 5s,
+		// so the default covers two intervals. It is inside
+		// terminationGracePeriodSeconds together with the drain budget.
 		health.SetNotReady()
+		if preStopGrace > 0 {
+			slog.Info("Readiness failed; serving briefly so traffic can move away",
+				"grace", preStopGrace)
+			time.Sleep(preStopGrace)
+		}
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
@@ -604,7 +627,12 @@ func main() {
 			}
 		}
 
-		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		// Its own context: after a timed-out drain shutdownCtx is already expired,
+		// so reusing it made every timed-out drain also log a spurious metrics
+		// shutdown error.
+		metricsCtx, cancelMetrics := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelMetrics()
+		if err := metricsServer.Shutdown(metricsCtx); err != nil {
 			slog.Error("Metrics server shutdown error", "err", err)
 		}
 		runtimeCfg.CloseBlockedLog()
