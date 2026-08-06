@@ -289,20 +289,17 @@ func TestCertStoreConcurrentSameHostSignsOnceWithoutHoldingLock(t *testing.T) {
 // TestMitmTLSConfigKeysCacheByCA pins that cached leaves belong to a signing
 // identity, not just a hostname.
 //
-// A leaf is interchangeable with another only if the same CA signed it with the
-// same subject. Keyed on hostname alone, a second caller with a different CA
-// received the first caller's certificate -- wrong issuer, wrong Organization.
-// Latent in production, which has one CA and one call site, but the store is
-// process-wide and nothing stops a second caller appearing.
+// Each sub-test holds one dimension fixed. The combined version of this test
+// varied CA and Organization together, so either component alone separated the
+// entries — deleting the CA hash from the key left it green, and that is the
+// half with security consequence: it is what stops two callers sharing a
+// mitm_org but using different CAs from being served a leaf signed by the wrong
+// issuer.
 func TestMitmTLSConfigKeysCacheByCA(t *testing.T) {
 	caA := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 	caB := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 
-	shared := NewCertStore(10, time.Hour)
-	fnA := MitmTLSConfigFromCA(&caA, "Org A", shared)
-	fnB := MitmTLSConfigFromCA(&caB, "Org B", shared)
-
-	leafFor := func(fn func(string, *goproxy.ProxyCtx) (*tls.Config, error)) *x509.Certificate {
+	leafFor := func(t *testing.T, fn func(string, *goproxy.ProxyCtx) (*tls.Config, error)) *x509.Certificate {
 		t.Helper()
 		cfg, err := fn("shared.example.com", nil)
 		if err != nil {
@@ -315,19 +312,49 @@ func TestMitmTLSConfigKeysCacheByCA(t *testing.T) {
 		return leaf
 	}
 
-	leafA := leafFor(fnA)
-	leafB := leafFor(fnB)
+	t.Run("different CA, same org", func(t *testing.T) {
+		shared := NewCertStore(10, time.Hour)
+		a := leafFor(t, MitmTLSConfigFromCA(&caA, "Same Org", shared))
+		b := leafFor(t, MitmTLSConfigFromCA(&caB, "Same Org", shared))
 
-	if len(leafB.Subject.Organization) == 0 || leafB.Subject.Organization[0] != "Org B" {
-		t.Errorf("second CA got Organization %v, want [Org B] — it was served the first CA's cached leaf",
-			leafB.Subject.Organization)
-	}
-	if leafA.SerialNumber.Cmp(leafB.SerialNumber) == 0 {
-		t.Error("both CAs share one cached certificate; the cache key ignores the signing identity")
-	}
+		if a.SerialNumber.Cmp(b.SerialNumber) == 0 {
+			t.Error("two CAs sharing an Organization were served one cached leaf; " +
+				"the second caller gets a certificate signed by the wrong issuer")
+		}
 
-	// Same CA and host must still hit the cache.
-	if again := leafFor(fnA); again.SerialNumber.Cmp(leafA.SerialNumber) != 0 {
-		t.Error("same CA and host re-signed; qualifying the key must not defeat caching")
-	}
+		// Issuer DN is not a discriminator here: the test CAs share a subject.
+		// Check who actually signed each leaf.
+		caBCert, err := x509.ParseCertificate(caB.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.CheckSignatureFrom(caBCert); err != nil {
+			t.Errorf("the second caller's leaf was not signed by its own CA: %v", err)
+		}
+	})
+
+	t.Run("same CA, different org", func(t *testing.T) {
+		shared := NewCertStore(10, time.Hour)
+		a := leafFor(t, MitmTLSConfigFromCA(&caA, "Org A", shared))
+		b := leafFor(t, MitmTLSConfigFromCA(&caA, "Org B", shared))
+
+		if len(b.Subject.Organization) == 0 || b.Subject.Organization[0] != "Org B" {
+			t.Errorf("second caller got Organization %v, want [Org B]; the org is not part of the cache key",
+				b.Subject.Organization)
+		}
+		if a.SerialNumber.Cmp(b.SerialNumber) == 0 {
+			t.Error("both orgs share one cached certificate")
+		}
+	})
+
+	t.Run("same CA and org still caches", func(t *testing.T) {
+		shared := NewCertStore(10, time.Hour)
+		fn := MitmTLSConfigFromCA(&caA, "Org A", shared)
+		first := leafFor(t, fn)
+		again := leafFor(t, fn)
+
+		if first.SerialNumber.Cmp(again.SerialNumber) != 0 {
+			t.Error("same CA and host re-signed; qualifying the key must not defeat caching")
+		}
+	})
 }

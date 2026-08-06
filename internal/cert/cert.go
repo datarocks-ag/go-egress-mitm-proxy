@@ -279,6 +279,7 @@ func caCacheKeyPrefix(ca *tls.Certificate, org string) string {
 	h := sha256.New()
 	for _, der := range ca.Certificate {
 		h.Write(der)
+		h.Write([]byte{0}) // separator: without it, adjacent DERs and the org concatenate ambiguously
 	}
 	h.Write([]byte(org))
 	return hex.EncodeToString(h.Sum(nil))

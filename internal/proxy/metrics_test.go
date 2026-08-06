@@ -53,7 +53,7 @@ func TestHandleRequestRecordsAction(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.action, func(t *testing.T) {
+		t.Run(tt.action+"/"+tt.host, func(t *testing.T) {
 			before := trafficCount(t, tt.domain, tt.action)
 
 			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+tt.host+"/x", nil)
@@ -152,10 +152,20 @@ func TestRequestTimingIsCarriedOnlyByForwardedRequests(t *testing.T) {
 
 // TestObserveRequestDurationIgnoresUntimedRequests: a request that never went
 // through HandleRequest must not record anything.
+//
+// "Does not record" is asserted by label-set count rather than observation
+// count: a histogram's WithLabelValues returns an Observer, which testutil
+// cannot read, and reading the sample count would need a client_model import.
+// Creating a series is the observable side effect here.
 func TestObserveRequestDurationIgnoresUntimedRequests(t *testing.T) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://x.example.com/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	before := testutil.CollectAndCount(metrics.RequestDuration)
 	ObserveRequestDuration(req) // must not panic or record
+	if after := testutil.CollectAndCount(metrics.RequestDuration); after != before {
+		t.Errorf("label sets went from %d to %d; an untimed request created a series", before, after)
+	}
 }
