@@ -165,8 +165,8 @@ Opt-in, full-detail tracing of a *subset* of requests selected by host and/or UR
 
 **Metrics:** Prometheus metrics on `:9090/metrics`:
 - `proxy_traffic_total` - requests by domain and action
-- `proxy_request_duration_seconds` - request latency histogram
-- `proxy_active_connections` - current connections
+- `proxy_request_duration_seconds` - request latency by action. Forwarded requests are observed once the upstream round-trip returns, so the span covers DNS, dial, TLS handshake and upstream think-time; blocked requests record in the handler, where their elapsed time is the whole request
+- `proxy_active_connections` - client connections currently open, published as a GaugeFunc backed by `TrackingListener.Open()`. It was previously incremented around the `OnRequest` filter, which returns before the upstream round-trip, so it bracketed rule evaluation and read ~0 at every scrape
 - `proxy_config_load_errors_total` / `proxy_config_reloads_total` - config operations
 - `proxy_upstream_errors_total` - upstream connection errors by type
 - `proxy_response_status_total` - response status codes by class
