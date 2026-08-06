@@ -26,7 +26,7 @@ func recordFor(t *testing.T, buf *bytes.Buffer, bodies config.BodyCaptureConfig)
 	if err != nil {
 		t.Fatalf("CompileTrace: %v", err)
 	}
-	return NewRecord("tid", "mitm", &ct.Rules[0], NewRedactor(ct), slog.New(slog.NewJSONHandler(buf, nil)))
+	return NewRecord("tid", "mitm", &ct.Rules[0], NewRedactor(ct), StaticLogger(slog.New(slog.NewJSONHandler(buf, nil))))
 }
 
 // readWriteCloser stands in for the upgraded connection http.Transport returns

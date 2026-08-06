@@ -90,10 +90,26 @@ func (rd Redactor) redactURL(raw string) string {
 	return u.String()
 }
 
+// LoggerFunc resolves the destination logger at emit time.
+//
+// A Record can outlive the configuration it was created under: a passthrough
+// record emits from countingConn.Close, which may be hours after the tunnel
+// opened. SIGHUP rotates the trace log and closes the previous file handle, so a
+// Record holding a captured *slog.Logger would write to a closed descriptor.
+// slog discards handler errors, so the record would vanish with no diagnostic —
+// on precisely the code path rotation exists for. Resolving late means a record
+// emitted after a rotation lands in the current file.
+type LoggerFunc func() *slog.Logger
+
+// StaticLogger adapts a fixed logger for callers with no rotation concern.
+func StaticLogger(l *slog.Logger) LoggerFunc {
+	return func() *slog.Logger { return l }
+}
+
 // Record accumulates the full trace of a single request or passthrough tunnel
 // and emits it exactly once as an aggregated JSON log entry.
 type Record struct {
-	logger   *slog.Logger
+	logger   LoggerFunc
 	bodies   config.CompiledBodyCapture
 	redactor Redactor
 	once     sync.Once
@@ -142,7 +158,7 @@ type Record struct {
 
 // NewRecord creates a trace Record. logger may be nil, in which case the
 // aggregated entry is emitted via the default slog logger.
-func NewRecord(traceID, mode string, rule *config.CompiledTraceRule, redactor Redactor, logger *slog.Logger) *Record {
+func NewRecord(traceID, mode string, rule *config.CompiledTraceRule, redactor Redactor, logger LoggerFunc) *Record {
 	rec := &Record{
 		logger:   logger,
 		redactor: redactor,
@@ -286,11 +302,13 @@ func (r *Record) Emit() {
 }
 
 func (r *Record) emit() {
-	logger := r.logger
+	var logger *slog.Logger
+	if r.logger != nil {
+		logger = r.logger()
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	metrics.TraceRecords.WithLabelValues(r.mode).Inc()
 
 	attrs := []any{
 		slog.String("trace_id", r.traceID),
@@ -373,6 +391,11 @@ func (r *Record) emit() {
 	}
 
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "trace", toAttrs(attrs)...)
+
+	// Counted after the write, not before. slog discards handler errors so this
+	// cannot detect a failed write, but incrementing first guaranteed the counter
+	// and the file diverged whenever a write did not land.
+	metrics.TraceRecords.WithLabelValues(r.mode).Inc()
 }
 
 // toAttrs converts a slice that already holds slog.Attr values into []slog.Attr.

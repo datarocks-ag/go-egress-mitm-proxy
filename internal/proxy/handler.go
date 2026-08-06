@@ -240,7 +240,7 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 // matches a trace rule, capturing the inbound request before any mutation.
 // Returns nil when the request is not traced.
 func setupTrace(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig, requestID string) *trace.Record {
-	ct, logger := runtimeCfg.GetTrace()
+	ct, _ := runtimeCfg.GetTrace()
 	if !ct.Enabled {
 		return nil
 	}
@@ -249,7 +249,13 @@ func setupTrace(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.Runt
 	if rule == nil {
 		return nil
 	}
-	rec := trace.NewRecord(requestID, "mitm", rule, trace.NewRedactor(ct), logger)
+	// Resolve the logger at emit time rather than capturing it: SIGHUP rotates
+	// the trace log and closes the previous handle, and a record emitted after
+	// that must land in the current file rather than a closed descriptor.
+	rec := trace.NewRecord(requestID, "mitm", rule, trace.NewRedactor(ct), func() *slog.Logger {
+		_, l := runtimeCfg.GetTrace()
+		return l
+	})
 	// connect.host preserves an explicit port (consistent with the passthrough
 	// CONNECT path); SNI is the bare hostname.
 	rec.SetConnect(r.URL.Host, host)

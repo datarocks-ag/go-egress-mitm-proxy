@@ -66,7 +66,7 @@ func testRecord(t *testing.T, buf *bytes.Buffer) *Record {
 	if err != nil {
 		t.Fatalf("CompileTrace: %v", err)
 	}
-	return NewRecord("tid", "passthrough", &ct.Rules[0], NewRedactor(ct), slog.New(slog.NewJSONHandler(buf, nil)))
+	return NewRecord("tid", "passthrough", &ct.Rules[0], NewRedactor(ct), StaticLogger(slog.New(slog.NewJSONHandler(buf, nil))))
 }
 
 // TestPassthroughDialerDecoratesBase pins the routing fix: the tracing dialer

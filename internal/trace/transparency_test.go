@@ -7,6 +7,7 @@ package trace
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -91,5 +92,41 @@ func TestPrepareResponseWrapsWhenCapturing(t *testing.T) {
 
 	if buf.Len() == 0 {
 		t.Error("record was not emitted when the captured body closed")
+	}
+}
+
+// TestRecordResolvesLoggerAtEmitTime pins the rotation behavior.
+//
+// A passthrough record emits when its tunnel closes, which can be long after
+// SIGHUP rotated the trace log and closed the file handle the record was created
+// with. Capturing the logger meant those writes went to a closed descriptor, and
+// slog discards handler errors, so the record vanished with no diagnostic — on
+// exactly the code path rotation exists for.
+func TestRecordResolvesLoggerAtEmitTime(t *testing.T) {
+	ct, err := config.CompileTrace(config.TraceConfig{
+		Enabled: true,
+		Rules:   []config.TraceRule{{Host: "*"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after bytes.Buffer
+	current := slog.New(slog.NewJSONHandler(&before, nil))
+
+	// The indirection a live proxy uses: read the logger from config each time.
+	rec := NewRecord("tid", "passthrough", &ct.Rules[0], NewRedactor(ct),
+		func() *slog.Logger { return current })
+
+	// SIGHUP: the destination is swapped while the tunnel is still open.
+	current = slog.New(slog.NewJSONHandler(&after, nil))
+
+	rec.Emit()
+
+	if before.Len() != 0 {
+		t.Errorf("record went to the pre-rotation destination:\n%s", before.String())
+	}
+	if after.Len() == 0 {
+		t.Error("record did not reach the post-rotation destination; a captured logger would have written to a closed file")
 	}
 }

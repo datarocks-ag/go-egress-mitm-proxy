@@ -45,7 +45,7 @@ func TestRecordEmitAggregatedRedacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := NewRecord("trace-123", "mitm", bodyRule(), NewRedactor(ct), newBufferLogger(&buf))
+	rec := NewRecord("trace-123", "mitm", bodyRule(), NewRedactor(ct), StaticLogger(newBufferLogger(&buf)))
 	rec.SetConnect("api.internal", "api.internal")
 	rec.SetTCP("10.0.0.5", 4*time.Millisecond, "TLS 1.3", "TLS_AES_128_GCM_SHA256")
 
@@ -118,7 +118,7 @@ func TestRecordEmitAggregatedRedacts(t *testing.T) {
 
 func TestRecordEmitsExactlyOnce(t *testing.T) {
 	var buf bytes.Buffer
-	rec := NewRecord("once", "mitm", &config.CompiledTraceRule{}, Redactor{}, newBufferLogger(&buf))
+	rec := NewRecord("once", "mitm", &config.CompiledTraceRule{}, Redactor{}, StaticLogger(newBufferLogger(&buf)))
 	rec.SetConnect("h", "h")
 	rec.Emit()
 	rec.Emit()
@@ -130,7 +130,7 @@ func TestRecordEmitsExactlyOnce(t *testing.T) {
 
 func TestRequestBodyCapturedAndForwarded(t *testing.T) {
 	var buf bytes.Buffer
-	rec := NewRecord("b", "mitm", bodyRule(), Redactor{}, newBufferLogger(&buf))
+	rec := NewRecord("b", "mitm", bodyRule(), Redactor{}, StaticLogger(newBufferLogger(&buf)))
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://x/y",
 		strings.NewReader(`{"hello":"world"}`))
 	if err != nil {

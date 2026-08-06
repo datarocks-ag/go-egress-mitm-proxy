@@ -345,9 +345,16 @@ func main() {
 				// Passthrough tunnels are not MITM'd, so only the TCP layer is
 				// observable. When a host-based trace rule matches, wire a tracing
 				// dialer that records the connected IP, timing, and byte counts.
-				if ct, traceLogger := runtimeCfg.GetTrace(); ct.Enabled {
+				if ct, _ := runtimeCfg.GetTrace(); ct.Enabled {
 					if rule := ct.Match(hostname, "", false); rule != nil {
-						rec := trace.NewRecord(proxy.GenerateRequestID(), "passthrough", rule, trace.NewRedactor(ct), traceLogger)
+						// Resolved at emit time: a passthrough record is written when
+						// the tunnel closes, which can be long after a SIGHUP rotated
+						// the trace log and closed the handle this captured.
+						rec := trace.NewRecord(proxy.GenerateRequestID(), "passthrough", rule,
+							trace.NewRedactor(ct), func() *slog.Logger {
+								_, l := runtimeCfg.GetTrace()
+								return l
+							})
 						rec.SetConnect(host, hostname)
 						ctx.UserData = rec
 						// Decorate the production dialer rather than replacing it, so a
