@@ -254,7 +254,14 @@ func (r *Record) applyResponse(resp *http.Response) {
 	// records are emitted before the response body finishes streaming, so a
 	// failure that occurs mid-body is not reflected; enable body capture for the
 	// rule if that matters.
-	if resp.Body == nil || resp.Body == http.NoBody || !r.CaptureResponseBody() {
+	// A 101 is not a body at all: goproxy hands the upgraded connection to the
+	// client by asserting resp.Body.(io.ReadWriter) (https.go:550). Wrapping it
+	// leaves only Read and Close, the assertion fails, and goproxy drops the
+	// tunnel with a debug-level warning — so enabling body capture on a rule
+	// silently broke every MITM WebSocket upgrade to that host. It also tripped
+	// the same chunked re-framing this guard exists to prevent.
+	if resp.Body == nil || resp.Body == http.NoBody ||
+		resp.StatusCode == http.StatusSwitchingProtocols || !r.CaptureResponseBody() {
 		r.Emit()
 		return
 	}
