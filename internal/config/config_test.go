@@ -413,10 +413,26 @@ func TestWildcardToRegex(t *testing.T) {
 			noMatch: []string{"api.example.com", "xapi1.example.com"},
 		},
 		{
-			name:    "regex with tilde prefix unanchored",
-			pattern: `~\.internal\.`,
+			// Host patterns are anchored: an unanchored "~" pattern would make a
+			// whitelist entry fail open against an attacker-suffixed host.
+			// Substring matching is still available for trace URL rules via
+			// WildcardToURLRegex.
+			name:    "regex with tilde prefix is anchored",
+			pattern: `~.*\.internal\..*`,
 			matches: []string{"foo.internal.bar", "a.internal.b.c"},
 			noMatch: []string{"internal", "foointernal"},
+		},
+		{
+			name:    "regex with tilde prefix does not match suffixed host",
+			pattern: `~api\.corp\.com`,
+			matches: []string{"api.corp.com", "API.CORP.COM"},
+			noMatch: []string{"api.corp.com.attacker.net", "evil-api.corp.com"},
+		},
+		{
+			name:    "wildcard pattern matches case-insensitively",
+			pattern: "*.example.com",
+			matches: []string{"a.example.com", "A.EXAMPLE.COM", "deep.sub.Example.Com"},
+			noMatch: []string{"example.com", "notexample.com"},
 		},
 		{
 			name:    "regex with tilde prefix invalid",
@@ -1294,4 +1310,97 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestNormalizeHost(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"example.com", "example.com"},
+		{"EXAMPLE.COM", "example.com"},
+		{"Example.Com", "example.com"},
+		{"example.com.", "example.com"},
+		{"EXAMPLE.COM.", "example.com"},
+		{"", ""},
+		{".", ""},
+		{"127.0.0.1", "127.0.0.1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := NormalizeHost(tt.in); got != tt.want {
+				t.Errorf("NormalizeHost(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWildcardToURLRegexKeepsRawUnanchored pins the deliberate difference from
+// WildcardToRegex: trace URL rules select what to observe and grant no access,
+// so substring matching against the full URL is the intended behavior.
+func TestWildcardToURLRegexKeepsRawUnanchored(t *testing.T) {
+	re, err := WildcardToURLRegex(`~/v1/debug`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{
+		"https://other.host/v1/debug",
+		"https://api.example.com/v1/debug?x=1",
+		"https://API.EXAMPLE.COM/V1/DEBUG",
+	} {
+		if !re.MatchString(u) {
+			t.Errorf("URL pattern should match %q as a substring", u)
+		}
+	}
+	if re.MatchString("https://api.example.com/v2/other") {
+		t.Error("URL pattern must not match an unrelated path")
+	}
+}
+
+// TestExactMapKeysAreNormalized guards the fast path: a mixed-case domain in
+// YAML must still be reachable from a normalized lookup.
+func TestExactMapKeysAreNormalized(t *testing.T) {
+	rewrites, err := CompileRewrites([]RewriteRule{
+		{Domain: "API.Internal", TargetIP: "10.0.0.1"},
+		{Domain: "plain.example.com.", TargetIP: "10.0.0.2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rc := &RuntimeConfig{}
+	_ = rc.Update(Config{}, CompiledACL{}, rewrites, nil, nil, nil)
+	_, _, _, exact, _ := rc.Get()
+
+	for _, want := range []string{"api.internal", "plain.example.com"} {
+		if _, ok := exact[want]; !ok {
+			t.Errorf("exact map missing normalized key %q; got keys %v", want, keysOf(exact))
+		}
+	}
+}
+
+func keysOf(m map[string]*CompiledRewriteRule) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestValidateDetectsDuplicateAcrossSpellings ensures the duplicate check does
+// not treat two spellings of one domain as two distinct rules.
+func TestValidateDetectsDuplicateAcrossSpellings(t *testing.T) {
+	c := Config{}
+	c.Proxy.Port = "8080"
+	c.Proxy.MetricsPort = "9090"
+	c.Proxy.DefaultPolicy = "ALLOW"
+	c.Rewrites = []RewriteRule{
+		{Domain: "api.internal", TargetIP: "10.0.0.1"},
+		{Domain: "API.Internal", TargetIP: "10.0.0.2"},
+	}
+
+	if err := c.Validate(); err == nil {
+		t.Error("Validate() accepted two spellings of the same domain; the second rule is unreachable")
+	}
 }

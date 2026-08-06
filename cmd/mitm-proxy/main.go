@@ -249,13 +249,26 @@ func main() {
 				"user_agent", ctx.Req.Header.Get("User-Agent"),
 			)
 
-			// Check passthrough ACL: tunnel without MITM interception
 			_, currentACL, _, rewriteExact, _ := runtimeCfg.Get()
 			hostname := host
 			if h, _, err := net.SplitHostPort(host); err == nil {
 				hostname = h
 			}
-			if config.Matches(hostname, currentACL.Passthrough) {
+			hostname = config.NormalizeHost(hostname)
+
+			decision := proxy.DecideConnect(hostname, currentACL)
+
+			if decision == proxy.ConnectReject {
+				slog.Warn("BLACK-LISTED",
+					"host", hostname,
+					"client", ctx.Req.RemoteAddr)
+				metricDomain := proxy.NormalizeDomainForMetrics(hostname, rewriteExact, currentACL)
+				metrics.TrafficTotal.WithLabelValues(metricDomain, "BLACK-LISTED").Inc()
+				return goproxy.RejectConnect, host
+			}
+
+			// Passthrough: tunnel without MITM interception
+			if decision == proxy.ConnectPassthrough {
 				slog.Info("PASSTHROUGH",
 					"host", hostname,
 					"client", ctx.Req.RemoteAddr)
