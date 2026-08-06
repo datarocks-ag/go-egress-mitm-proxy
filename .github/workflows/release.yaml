@@ -56,7 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
@@ -134,7 +134,7 @@ jobs:
           build-args: VERSION=${{ steps.version.outputs.VERSION }}
 
       - name: Run Trivy vulnerability scanner (Docker image)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:scan
           format: 'table'
