@@ -40,6 +40,9 @@ import (
 // version is set at build time via -ldflags "-X main.version=<value>".
 var version = "dev"
 
+// shutdownTimeout bounds the drain period after SIGINT/SIGTERM.
+const shutdownTimeout = 30 * time.Second
+
 // slogProxyLogger adapts goproxy's Logger interface to route through slog.
 type slogProxyLogger struct{}
 
@@ -472,6 +475,15 @@ func main() {
 				}
 				continue
 			}
+			// Warn about settings that changed but cannot be applied without a
+			// restart, rather than reporting a clean reload that silently ignored them.
+			previousCfg, _, _, _, _ := runtimeCfg.Get()
+			if ignored := config.ReloadIgnoredFields(previousCfg, newCfg); len(ignored) > 0 {
+				slog.Warn("Configuration changes require a restart and were NOT applied",
+					"fields", ignored,
+					"hint", "certificate and listen-port changes take effect on restart only")
+			}
+
 			newTLSConfig := cert.BuildOutboundTLSConfig(newCfg)
 			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newTLSConfig, newBlockedLogger, newBlockedFile)
 			if oldFile != nil {
@@ -497,17 +509,51 @@ func main() {
 		}
 	}()
 
+	// Bind the proxy listener explicitly so client connections can be tracked.
+	// http.Server cannot drain them itself: goproxy hijacks the connection for
+	// every CONNECT and the server stops tracking hijacked connections, so
+	// Shutdown would return instantly with tunnels still live.
+	proxyLn, lnErr := (&net.ListenConfig{}).Listen(context.Background(), "tcp", proxyServer.Addr)
+	if lnErr != nil {
+		slog.Error("Failed to bind proxy port", "addr", proxyServer.Addr, "err", lnErr)
+		os.Exit(1)
+	}
+	trackedLn := proxy.NewTrackingListener(proxyLn)
+
+	// Closed when the drain finishes, so main waits for it instead of exiting
+	// mid-drain. Shutdown closes listeners first, which unblocks Serve on the
+	// main goroutine; without this join the process died before the drain ran.
+	shutdownDone := make(chan struct{})
+
 	// Graceful shutdown handler
 	go func() {
+		defer close(shutdownDone)
+
 		<-ctx.Done()
 		slog.Info("Shutdown signal received, draining connections...")
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Fail readiness first so load balancers stop sending new connections
+		// while the in-flight ones finish.
+		health.SetNotReady()
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 
 		if err := proxyServer.Shutdown(shutdownCtx); err != nil {
 			slog.Error("Proxy server shutdown error", "err", err)
 		}
+
+		// Shutdown has stopped accepting and drained non-hijacked connections;
+		// wait out the tunnels it cannot see, within the same budget.
+		if open := trackedLn.Open(); open > 0 {
+			slog.Info("Waiting for tunnels to close", "open_connections", open)
+			if !trackedLn.WaitForDrain(shutdownCtx) {
+				slog.Warn("Drain deadline reached with connections still open",
+					"open_connections", trackedLn.Open(),
+					"timeout", shutdownTimeout)
+			}
+		}
+
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 			slog.Error("Metrics server shutdown error", "err", err)
 		}
@@ -529,10 +575,17 @@ func main() {
 		"insecure_skip_verify", cfg.Proxy.InsecureSkipVerify,
 		"blocked_log_path", cfg.Proxy.BlockedLogPath)
 
-	if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("Proxy server error", "err", err)
+	health.SetReady()
+
+	if serveErr := proxyServer.Serve(trackedLn); serveErr != nil && serveErr != http.ErrServerClosed {
+		health.SetNotReady()
+		slog.Error("Proxy server error", "err", serveErr)
 		os.Exit(1)
 	}
+
+	// Serve returns as soon as Shutdown closes the listener, so wait for the
+	// drain to finish rather than exiting underneath it.
+	<-shutdownDone
 
 	slog.Info("Proxy server stopped")
 }

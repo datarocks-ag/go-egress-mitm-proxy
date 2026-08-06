@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sebastian Schmelzer / Data Rocks AG.
+// All rights reserved. Use of this source code is governed
+// by a MIT license that can be found in the LICENSE file.
+
 package health
 
 import (
@@ -7,36 +11,52 @@ import (
 	"testing"
 )
 
-func TestHealthHandler(t *testing.T) {
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+func statusOf(t *testing.T, h http.HandlerFunc) int {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	rec := httptest.NewRecorder()
+	h(rec, req)
+	return rec.Code
+}
 
-	HealthHandler(rec, req)
+// TestReadinessTracksLifecycle pins the behavior a load balancer depends on:
+// not ready before the proxy listener is bound, ready while serving, and not
+// ready again the moment shutdown begins — so traffic stops arriving at a pod
+// that is draining.
+func TestReadinessTracksLifecycle(t *testing.T) {
+	t.Cleanup(SetNotReady)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	SetNotReady()
+	if got := statusOf(t, ReadyHandler); got != http.StatusServiceUnavailable {
+		t.Errorf("before bind: /readyz = %d, want 503", got)
 	}
-	if rec.Body.String() != "ok" {
-		t.Errorf("body = %q, want %q", rec.Body.String(), "ok")
+
+	SetReady()
+	if got := statusOf(t, ReadyHandler); got != http.StatusOK {
+		t.Errorf("while serving: /readyz = %d, want 200", got)
 	}
-	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
-		t.Errorf("Content-Type = %q, want %q", ct, "text/plain")
+	if !IsReady() {
+		t.Error("IsReady() = false while serving")
+	}
+
+	SetNotReady()
+	if got := statusOf(t, ReadyHandler); got != http.StatusServiceUnavailable {
+		t.Errorf("while draining: /readyz = %d, want 503", got)
 	}
 }
 
-func TestReadyHandler(t *testing.T) {
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
-	rec := httptest.NewRecorder()
+// TestLivenessIsIndependentOfReadiness guards a deliberate distinction:
+// reporting unhealthy during a drain would have Kubernetes kill the pod
+// mid-drain, which is the opposite of graceful.
+func TestLivenessIsIndependentOfReadiness(t *testing.T) {
+	t.Cleanup(SetNotReady)
 
-	ReadyHandler(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if rec.Body.String() != "ready" {
-		t.Errorf("body = %q, want %q", rec.Body.String(), "ready")
-	}
-	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
-		t.Errorf("Content-Type = %q, want %q", ct, "text/plain")
+	SetNotReady()
+	if got := statusOf(t, HealthHandler); got != http.StatusOK {
+		t.Errorf("/healthz = %d while not ready, want 200", got)
 	}
 }
