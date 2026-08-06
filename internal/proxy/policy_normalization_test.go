@@ -220,3 +220,77 @@ func TestDecideConnectRejectsOnlyUninspectableTunnels(t *testing.T) {
 		})
 	}
 }
+
+// TestBlacklistOutranksRewrite pins the precedence that no test configured
+// before: a host present in both the rewrite table and the blacklist.
+//
+// Rewrites otherwise bypass the ACL by design. That is fine for the whitelist
+// and the default policy, but a denylist is not a preference — the host was
+// being forwarded to its target_ip with the rule's injected headers. Over HTTPS
+// this was unreachable only because DecideConnect rejected blacklisted hosts at
+// CONNECT time; narrowing that check removed the backstop and nothing in the
+// suite noticed, because no fixture put a host in both tables.
+func TestBlacklistOutranksRewrite(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.ACL.Blacklist = []string{"metadata.google.internal", "*.evil.example.com"}
+	cfg.Rewrites = []config.RewriteRule{
+		{
+			Domain:   "metadata.google.internal",
+			TargetIP: "169.254.169.254",
+			Headers:  map[string]string{"X-Injected": "s3cr3t"},
+		},
+		{
+			Domain:   "*.evil.example.com",
+			TargetIP: "10.0.0.9",
+			Headers:  map[string]string{"X-Injected": "s3cr3t"},
+		},
+		{
+			Domain:   "ok.example.com",
+			TargetIP: "10.0.0.1",
+			Headers:  map[string]string{"X-Injected": "fine"},
+		},
+	}
+
+	rc := runtimeFor(t, cfg)
+
+	for _, host := range []string{"metadata.google.internal", "sub.evil.example.com"} {
+		t.Run(host, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+host+"/x", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, resp := HandleRequest(req, nil, rc)
+			if resp == nil {
+				rw, _ := out.Context().Value(config.RewriteCtxKey).(RewriteResult)
+				t.Fatalf("blacklisted host was forwarded to %q with X-Injected=%q",
+					rw.TargetIP, out.Header.Get("X-Injected"))
+			}
+			resp.Body.Close() //nolint:errcheck // test cleanup
+
+			if _, ok := out.Context().Value(config.RewriteCtxKey).(RewriteResult); ok {
+				t.Error("a rewrite target was attached to a blacklisted request")
+			}
+			if got := out.Header.Get("X-Injected"); got != "" {
+				t.Errorf("X-Injected = %q; a blacklisted request must not receive injected headers", got)
+			}
+		})
+	}
+
+	// A rewrite that is not blacklisted must still apply.
+	t.Run("unblacklisted rewrite still applies", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://ok.example.com/x", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, resp := HandleRequest(req, nil, rc)
+		if resp != nil {
+			resp.Body.Close() //nolint:errcheck // test cleanup
+			t.Fatal("a non-blacklisted rewrite was blocked")
+		}
+		rw, ok := out.Context().Value(config.RewriteCtxKey).(RewriteResult)
+		if !ok || rw.TargetIP != "10.0.0.1" {
+			t.Errorf("rewrite did not apply: %+v", rw)
+		}
+	})
+}

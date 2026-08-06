@@ -69,9 +69,24 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 	action := "BLOCKED"
 	var matchedRewrite *config.CompiledRewriteRule
 
-	// Check rewrite rules first (highest priority, bypasses ACL)
+	// The blacklist outranks everything, including rewrites.
+	//
+	// Rewrites otherwise bypass the ACL, which is intended: a rewritten host is
+	// implicitly allowed without needing a whitelist entry. But a denylist is not
+	// a preference. A host in both tables used to be forwarded to its target_ip
+	// with the rule's injected headers -- over HTTPS that was unreachable only
+	// because DecideConnect rejected blacklisted hosts at CONNECT time, and
+	// narrowing that check removed the backstop. Checking the blacklist first
+	// makes the precedence explicit instead of dependent on which layer happens
+	// to look.
+	blacklisted := config.Matches(host, acl.Blacklist)
+
+	// Check rewrite rules (highest priority among the allow paths, bypasses the
+	// whitelist and the default policy)
 	// Fast path: exact match (only for domains without path_pattern rules)
-	if rw, ok := rewriteExact[host]; ok {
+	if blacklisted {
+		action = "BLACK-LISTED"
+	} else if rw, ok := rewriteExact[host]; ok {
 		matchedRewrite = rw
 		action = "REWRITTEN"
 	} else {
@@ -101,11 +116,9 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 		r = r.WithContext(context.WithValue(r.Context(), config.RewriteCtxKey, rw))
 	}
 
-	// Evaluate ACL if not rewritten
+	// Evaluate the remaining ACL stages if nothing above decided
 	if action == "BLOCKED" {
-		if config.Matches(host, acl.Blacklist) {
-			action = "BLACK-LISTED"
-		} else if config.Matches(host, acl.Whitelist) {
+		if config.Matches(host, acl.Whitelist) {
 			action = "WHITE-LISTED"
 		} else if cfg.Proxy.DefaultPolicy == "ALLOW" {
 			action = "ALLOWED-BY-DEFAULT"
@@ -172,12 +185,12 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 
 	// Block denied requests
 	if action == "BLACK-LISTED" || action == "BLOCKED" {
-		LogBlocked(runtimeCfg, BlockedRequest{
+		LogBlocked(r.Context(), runtimeCfg, BlockedRequest{
 			RequestID: requestID,
 			Client:    r.RemoteAddr,
 			Host:      host,
 			Method:    r.Method,
-			Path:      r.URL.Path,
+			Target:    r.URL.Path,
 			Action:    action,
 		})
 		if rec != nil {
@@ -584,8 +597,12 @@ type BlockedRequest struct {
 	Client    string
 	Host      string
 	Method    string
-	Path      string
-	Action    string
+	// Target is the request path for a forwarded request. A CONNECT carries
+	// host:port in its request-target rather than a path, so URL.Path is empty
+	// there; the CONNECT caller passes the authority instead of leaving the field
+	// blank.
+	Target string
+	Action string
 }
 
 // LogBlocked appends a blocked request to the audit log, if one is configured.
@@ -594,17 +611,17 @@ type BlockedRequest struct {
 // because a rejected tunnel never reaches HandleRequest, so routing that case
 // through here is the only way the log can hold what the documentation promises:
 // every BLACK-LISTED and BLOCKED request, including HTTPS.
-func LogBlocked(runtimeCfg *config.RuntimeConfig, req BlockedRequest) {
+func LogBlocked(ctx context.Context, runtimeCfg *config.RuntimeConfig, req BlockedRequest) {
 	bl := runtimeCfg.GetBlockedLogger()
 	if bl == nil {
 		return
 	}
-	bl.LogAttrs(context.Background(), slog.LevelInfo, "blocked",
+	bl.LogAttrs(ctx, slog.LevelInfo, "blocked",
 		slog.String("request_id", req.RequestID),
 		slog.String("client", req.Client),
 		slog.String("host", req.Host),
 		slog.String("method", req.Method),
-		slog.String("path", req.Path),
+		slog.String("target", req.Target),
 		slog.String("action", req.Action),
 	)
 }

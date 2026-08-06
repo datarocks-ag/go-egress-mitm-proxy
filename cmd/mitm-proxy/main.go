@@ -307,13 +307,16 @@ func main() {
 				// A rejected tunnel never reaches HandleRequest, so this is the only
 				// place the blocked-request audit log can learn about a blacklisted
 				// HTTPS host. Without it the log silently omits all of them.
-				proxy.LogBlocked(runtimeCfg, proxy.BlockedRequest{
+				proxy.LogBlocked(ctx.Req.Context(), runtimeCfg, proxy.BlockedRequest{
 					RequestID: requestID,
 					Client:    ctx.Req.RemoteAddr,
 					Host:      hostname,
 					Method:    ctx.Req.Method,
-					Path:      ctx.Req.URL.Path,
-					Action:    "BLACK-LISTED",
+					// A CONNECT carries host:port as its request-target, not a path,
+					// so URL.Path is empty here. Recording the authority keeps the
+					// audit entry from losing the target.
+					Target: host,
+					Action: "BLACK-LISTED",
 				})
 
 				// goproxy writes ctx.Resp to the hijacked client connection when it is
