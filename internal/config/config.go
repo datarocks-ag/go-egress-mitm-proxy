@@ -738,6 +738,13 @@ func WildcardToRegex(pattern string) (*regexp.Regexp, error) {
 	// pretending to enforce.
 	rest := pattern
 	if after, ok := strings.CutPrefix(pattern, "*."); ok {
+		if after == "" {
+			// "*." alone anchors to ^.+\.$ — it can only match a host ending in a
+			// dot, and NormalizeHost strips exactly that before matching, so it can
+			// never match anything. Same silent fail-open this check exists to
+			// prevent.
+			return nil, fmt.Errorf("invalid wildcard %q: %q matches nothing; use %q to match every host", pattern, "*.", "*")
+		}
 		rest = after
 	}
 	if strings.Contains(rest, "*") {

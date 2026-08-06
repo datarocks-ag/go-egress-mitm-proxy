@@ -1481,6 +1481,9 @@ func TestWildcardRejectsMidPatternStar(t *testing.T) {
 		"*evil.com",      // leading star without the dot
 		"evil.*",         // trailing
 		"*.*.evil.com",   // redundant second star
+		// "*." alone anchors to ^.+\.$, and NormalizeHost strips the trailing dot
+		// before matching, so it can never match — the same fail-open trap.
+		"*.",
 	}
 	for _, p := range rejected {
 		t.Run(p, func(t *testing.T) {
