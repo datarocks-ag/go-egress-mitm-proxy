@@ -1483,3 +1483,35 @@ func TestRunGencertCreatesOutputDirectory(t *testing.T) {
 		}
 	}
 }
+
+// TestRunGencertDoesNotLogPasswords keeps credentials out of the log stream.
+//
+// The client truststore hints are emitted at info level on stdout, so under CI
+// or an init container they land in a retained log. The truststore itself holds
+// only public CA certs, but --p12-password guards the CA private key and was
+// never echoed; matching that is what stops the habit spreading.
+func TestRunGencertDoesNotLogPasswords(t *testing.T) {
+	dir := t.TempDir()
+	const secret = "sup3rs3cret-truststore-pw"
+
+	output := captureLogs(t, func() {
+		err := RunGencert([]string{
+			"--type", "root", "--cn", "Log Test CA",
+			"--out-cert", filepath.Join(dir, "ca.crt"),
+			"--out-key", filepath.Join(dir, "ca.key"),
+			"--out-client-p12", filepath.Join(dir, "truststore.p12"),
+			"--client-p12-password", secret,
+		})
+		if err != nil {
+			t.Fatalf("RunGencert: %v", err)
+		}
+	})
+
+	if contains(output, secret) {
+		t.Errorf("the client truststore password appears in the log output:\n%s", output)
+	}
+	// The hints must still be useful.
+	if !contains(output, "javax.net.ssl.trustStore") {
+		t.Errorf("usage hint missing from output:\n%s", output)
+	}
+}

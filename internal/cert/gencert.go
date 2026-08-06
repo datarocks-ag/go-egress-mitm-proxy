@@ -349,8 +349,13 @@ Flags:
 			return fmt.Errorf("write client PKCS#12 truststore: %w", err)
 		}
 		slog.Info("Wrote client PKCS#12 truststore", "path", *outClientP12,
-			"usage_direct", fmt.Sprintf("-Djavax.net.ssl.trustStore=%s -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=%s", *outClientP12, *clientP12Password),
-			"usage_import", fmt.Sprintf("keytool -importkeystore -srckeystore %s -srcstoretype PKCS12 -srcstorepass %s -destkeystore truststore.jks -deststorepass changeit", *outClientP12, *clientP12Password),
+			// Placeholders rather than the value. These hints go to stdout at info
+			// level, so on CI or an init container they land in a retained log
+			// stream. The blast radius is small -- the truststore holds only public
+			// CA certs -- but --p12-password, which guards the CA private key, is
+			// never echoed, and an inconsistency like that is how the habit spreads.
+			"usage_direct", fmt.Sprintf("-Djavax.net.ssl.trustStore=%s -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=<client-p12-password>", *outClientP12),
+			"usage_import", fmt.Sprintf("keytool -importkeystore -srckeystore %s -srcstoretype PKCS12 -srcstorepass <client-p12-password> -destkeystore truststore.jks -deststorepass changeit", *outClientP12),
 		)
 	}
 
