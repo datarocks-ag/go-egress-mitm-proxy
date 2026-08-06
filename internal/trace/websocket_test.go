@@ -7,27 +7,12 @@ package trace
 import (
 	"bytes"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
 
 	"go-egress-proxy/internal/config"
 )
-
-// recordFor builds a Record whose rule has the given body-capture setting.
-func recordFor(t *testing.T, buf *bytes.Buffer, bodies config.BodyCaptureConfig) *Record {
-	t.Helper()
-
-	ct, err := config.CompileTrace(config.TraceConfig{
-		Enabled: true,
-		Rules:   []config.TraceRule{{Host: "*", Bodies: bodies}},
-	})
-	if err != nil {
-		t.Fatalf("CompileTrace: %v", err)
-	}
-	return NewRecord("tid", "mitm", &ct.Rules[0], NewRedactor(ct), StaticLogger(slog.New(slog.NewJSONHandler(buf, nil))))
-}
 
 // readWriteCloser stands in for the upgraded connection http.Transport returns
 // as the body of a 101, which goproxy asserts to io.ReadWriter.

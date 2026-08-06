@@ -182,6 +182,15 @@ func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, t
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// An abandoned dial can still be running after the request goroutine was
+	// satisfied by a pooled connection and applyResponse concluded the connection
+	// was reused. Accepting its values here would emit a record claiming both
+	// connection_reused and a connected_ip, describing a connection this request
+	// never used.
+	if r.connReused {
+		return
+	}
+
 	r.connectedIP = connectedIP
 	r.dialMillis = dialDur.Milliseconds()
 	r.tlsVersion = tlsVersion
@@ -192,6 +201,12 @@ func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, t
 func (r *Record) SetError(msg string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Same reasoning as SetTCP: a dial abandoned after the request completed on a
+	// pooled connection must not attach its failure to a request that succeeded.
+	if r.connReused {
+		return
+	}
 
 	r.errMsg = msg
 }

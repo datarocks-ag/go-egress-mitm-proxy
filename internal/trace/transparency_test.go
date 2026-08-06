@@ -6,11 +6,13 @@ package trace
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"go-egress-proxy/internal/config"
 )
@@ -62,6 +64,10 @@ func TestPrepareResponseDoesNotWrapNoBody(t *testing.T) {
 
 	if resp.Body != http.NoBody {
 		t.Error("http.NoBody was wrapped; the response would go out chunked in violation of RFC 9110")
+	}
+	// Skipping the wrapper means nothing else will emit this record.
+	if buf.Len() == 0 {
+		t.Error("record was not emitted for a NoBody response")
 	}
 }
 
@@ -128,5 +134,44 @@ func TestRecordResolvesLoggerAtEmitTime(t *testing.T) {
 	}
 	if after.Len() == 0 {
 		t.Error("record did not reach the post-rotation destination; a captured logger would have written to a closed file")
+	}
+}
+
+// TestLateDialUpdateDoesNotContradictConnectionReuse pins the ordering the mutex
+// alone did not fix.
+//
+// Guarding the fields made concurrent access safe, but an abandoned dial can
+// still arrive after applyResponse concluded the connection was reused, and the
+// record would then claim connection_reused alongside a connected_ip describing
+// a connection this request never used.
+func TestLateDialUpdateDoesNotContradictConnectionReuse(t *testing.T) {
+	var buf bytes.Buffer
+	rec := recordFor(t, &buf, config.BodyCaptureConfig{Enabled: false})
+
+	// A pooled connection: no dial happened, so applyResponse marks it reused.
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}
+	PrepareResponse(rec, resp)
+
+	// The abandoned dial completes afterwards.
+	rec.SetTCP("10.0.0.99", 42*time.Millisecond, "TLS1.3", "TLS_AES_128_GCM_SHA256")
+	rec.SetError("abandoned dial failed")
+
+	var out map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &out); err != nil {
+		t.Fatalf("trace record is not JSON: %v\n%s", err, buf.String())
+	}
+
+	tcp, _ := out["tcp"].(map[string]any)
+	if tcp == nil {
+		t.Fatal("no tcp group in record")
+	}
+	if tcp["connection_reused"] != true {
+		t.Errorf("connection_reused = %v, want true", tcp["connection_reused"])
+	}
+	if ip, ok := tcp["connected_ip"]; ok {
+		t.Errorf("connected_ip = %v present alongside connection_reused; the record describes a connection this request never used", ip)
+	}
+	if errMsg, ok := out["error"]; ok {
+		t.Errorf("error = %v attached to a request that succeeded on a pooled connection", errMsg)
 	}
 }
