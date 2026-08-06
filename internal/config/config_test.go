@@ -1404,3 +1404,67 @@ func TestValidateDetectsDuplicateAcrossSpellings(t *testing.T) {
 		t.Error("Validate() accepted two spellings of the same domain; the second rule is unreachable")
 	}
 }
+
+// TestReloadIgnoredFields pins which settings SIGHUP cannot apply. Reporting a
+// clean reload while silently discarding a rotated MITM CA is the failure mode
+// this guards: the proxy would keep signing leaves with the old CA until
+// restart, or until the CA expired and every client broke.
+func TestReloadIgnoredFields(t *testing.T) {
+	base := Config{}
+	base.Proxy.Port = "8080"
+	base.Proxy.MetricsPort = "9090"
+	base.Proxy.MitmCertPath = "/old/ca.crt"
+	base.Proxy.MitmOrg = "Old Org"
+	base.Proxy.DefaultPolicy = "BLOCK"
+
+	tests := []struct {
+		name   string
+		modify func(c *Config)
+		want   []string
+	}{
+		{
+			name:   "no changes",
+			modify: func(*Config) {},
+			want:   nil,
+		},
+		{
+			name:   "rotated MITM CA is not applied",
+			modify: func(c *Config) { c.Proxy.MitmCertPath = "/new/ca.crt" },
+			want:   []string{"proxy.mitm_cert_path"},
+		},
+		{
+			name:   "mitm_org is not applied",
+			modify: func(c *Config) { c.Proxy.MitmOrg = "New Org" },
+			want:   []string{"proxy.mitm_org"},
+		},
+		{
+			name:   "listen ports are not applied",
+			modify: func(c *Config) { c.Proxy.Port = "9999" },
+			want:   []string{"proxy.port"},
+		},
+		{
+			// Reloadable settings must not be reported as ignored, or the warning
+			// becomes noise operators learn to skip.
+			name:   "reloadable settings are not reported",
+			modify: func(c *Config) { c.Proxy.DefaultPolicy = "ALLOW" },
+			want:   nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newCfg := base
+			tt.modify(&newCfg)
+
+			got := ReloadIgnoredFields(base, newCfg)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ReloadIgnoredFields() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("ReloadIgnoredFields()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}

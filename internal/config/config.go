@@ -806,3 +806,40 @@ func LoadConfig(path string) (Config, error) {
 	}
 	return c, nil
 }
+
+// ReloadIgnoredFields returns the names of settings that differ between the
+// running config and a newly loaded one but which SIGHUP cannot apply.
+//
+// The reload rebuilds ACL, rewrites, trace rules, log files, the outbound TLS
+// config and the transport pool. It cannot rebuild anything captured once at
+// startup: the MITM CA is loaded into package state before the CONNECT handler
+// closes over it, the leaf-signing TLSConfig (including mitm_org) is built once
+// and its certificate cache outlives the reload, and the listen ports are baked
+// into the constructed http.Servers.
+//
+// Silently accepting a value that is never applied is the failure this guards
+// against. Rotating an expiring MITM CA, sending SIGHUP and seeing
+// "Configuration reloaded successfully" would otherwise leave the proxy signing
+// leaves with the old CA until restart.
+func ReloadIgnoredFields(oldCfg, newCfg Config) []string {
+	var changed []string
+
+	type field struct {
+		name     string
+		old, new string
+	}
+	for _, f := range []field{
+		{"proxy.port", oldCfg.Proxy.Port, newCfg.Proxy.Port},
+		{"proxy.metrics_port", oldCfg.Proxy.MetricsPort, newCfg.Proxy.MetricsPort},
+		{"proxy.mitm_cert_path", oldCfg.Proxy.MitmCertPath, newCfg.Proxy.MitmCertPath},
+		{"proxy.mitm_key_path", oldCfg.Proxy.MitmKeyPath, newCfg.Proxy.MitmKeyPath},
+		{"proxy.mitm_keystore_path", oldCfg.Proxy.MitmKeystorePath, newCfg.Proxy.MitmKeystorePath},
+		{"proxy.mitm_keystore_password", oldCfg.Proxy.MitmKeystorePassword, newCfg.Proxy.MitmKeystorePassword},
+		{"proxy.mitm_org", oldCfg.Proxy.MitmOrg, newCfg.Proxy.MitmOrg},
+	} {
+		if f.old != f.new {
+			changed = append(changed, f.name)
+		}
+	}
+	return changed
+}
