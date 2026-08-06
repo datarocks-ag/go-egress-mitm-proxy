@@ -53,7 +53,10 @@ jobs:
 
       - name: Upload coverage
         uses: codecov/codecov-action@v7
-        if: github.event_name != 'pull_request'
+        # This workflow triggers on pull_request only, so the previous
+        # "if: github.event_name != 'pull_request'" was always false: coverage
+        # was computed with -coverprofile and then discarded. PR coverage is the
+        # coverage worth seeing.
         with:
           files: coverage.out
           fail_ci_if_error: false

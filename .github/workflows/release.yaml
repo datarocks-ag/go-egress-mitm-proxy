@@ -7,6 +7,12 @@ on:
     branches: [main]
     tags: ['v*']
 
+# A merge to main and a v* tag on the same commit would otherwise run this
+# pipeline twice, including two image builds and two pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -22,10 +28,12 @@ jobs:
         with:
           go-version: '1.25'
 
+      # Same invocation as CI: the version pinned in go.mod's tool directive.
+      # The action with "version: latest" meant an upstream golangci-lint release
+      # could redden main for findings no PR could have caught, with no way to
+      # reproduce the failure locally.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: latest
+        run: go tool golangci-lint run
 
   test:
     name: Test
