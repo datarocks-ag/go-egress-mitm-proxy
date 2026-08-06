@@ -594,8 +594,8 @@ func TestOutboundHTTP2TransportWithDialTLSContext(t *testing.T) {
 }
 
 // startTLSServer creates a TLS server with a self-signed certificate signed by a generated CA.
-// Returns the listener address, CA cert pool (for trusted clients), and the CA cert (for building truststores).
-func startTLSServer(t *testing.T) (addr string, caPool *x509.CertPool, caCertPEM []byte) {
+// Returns the listener address and the CA cert pool (for trusted clients).
+func startTLSServer(t *testing.T) (addr string, caPool *x509.CertPool) {
 	t.Helper()
 
 	// Generate CA
@@ -620,8 +620,6 @@ func startTLSServer(t *testing.T) (addr string, caPool *x509.CertPool, caCertPEM
 	if err != nil {
 		t.Fatalf("parse CA cert: %v", err)
 	}
-	caCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
 	caPool = x509.NewCertPool()
 	caPool.AddCert(caCert)
 
@@ -675,11 +673,11 @@ func startTLSServer(t *testing.T) (addr string, caPool *x509.CertPool, caCertPEM
 		srv.Serve(ln) //nolint:errcheck // background test server
 	}()
 
-	return ln.Addr().String(), caPool, caCertPEM
+	return ln.Addr().String(), caPool
 }
 
 func TestMakeTLSDialer(t *testing.T) {
-	srvAddr, caPool, _ := startTLSServer(t)
+	srvAddr, caPool := startTLSServer(t)
 	srvHost, srvPort, err := net.SplitHostPort(srvAddr)
 	if err != nil {
 		t.Fatalf("split server addr: %v", err)

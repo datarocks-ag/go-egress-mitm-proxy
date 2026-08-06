@@ -55,6 +55,7 @@ internal/config/config.go      # Types, YAML loading, validation, env overrides,
 internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
 internal/cert/gencert.go       # gencert subcommand + key pair generation
 internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, domain metrics
+internal/proxy/transport.go    # Per-rewrite-target transport pool (correct connection-pool keying)
 internal/trace/trace.go        # Selective trace Record, redaction, body capture, aggregated emit
 internal/trace/conn.go         # Passthrough tunnel tracing dialer + byte-counting conn
 internal/metrics/metrics.go    # Prometheus metric vars (promauto registrations)
@@ -118,6 +119,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `MakeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
 - `MakeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
 - `NormalizeDomainForMetrics()` - Bounds metrics cardinality
+- `TransportPool` - One `http.Transport` per distinct upstream identity (`target_ip` + `target_host` + `insecure`). Go keys idle connections on the request URL's `host:port`, which is fixed before the dialers substitute the target, so a single shared transport would let rules for the same domain reuse each other's connections (misrouting traffic, and leaking `insecure` TLS connections to requests that require verification). `RoundTrip()` dispatches on the rewrite result stored in the request context; `Reset()` is called on SIGHUP so reloaded targets do not keep serving from stale pools.
 
 `internal/metrics`: All Prometheus metric vars (`TrafficTotal`, `RequestDuration`, etc.)
 
@@ -215,7 +217,10 @@ internal/cert/
   cert_test.go                 # Cert, signing, gencert, truststore tests
 internal/proxy/
   handler.go                   # Request handling, dialers, rewrite lookup, metrics recording
+  transport.go                 # Per-rewrite-target transport pool
   handler_test.go              # Handler, dialer, rewrite, metrics tests
+  transport_test.go            # Transport pool keying, reset, concurrency tests
+  pool_integration_test.go     # Connection-reuse correctness (target + insecure isolation)
   trace_handler_test.go        # Trace setup, header-diff, context threading tests
   trace_integration_test.go    # In-process end-to-end trace through goproxy + real dialer
 internal/trace/
