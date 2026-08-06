@@ -61,7 +61,10 @@ When the proxy intercepts a CONNECT tunnel, `goproxy` dynamically generates a TL
 
 1. **Client initiates CONNECT** -- The client sends an HTTP `CONNECT host:443` request to the proxy over plaintext HTTP.
 
-2. **Proxy evaluates passthrough ACL** -- Before performing MITM, the proxy checks if the host matches any `acl.passthrough` pattern. If matched, the proxy responds with `200 Connection Established` and creates a plain TCP tunnel — no TLS interception occurs, the client talks directly to the upstream server through the tunnel. The `PASSTHROUGH` action is logged and recorded in metrics. Steps 3–9 are skipped.
+2. **Proxy evaluates the CONNECT ACL** -- Before performing MITM, `DecideConnect` inspects the host.
+   - Matches `acl.passthrough` **and** `acl.blacklist`: the CONNECT is **rejected** with `403 Policy Blocked` written to the client connection, and the request is recorded in the blocked-request log. A passthrough tunnel is never inspected, so a denied host must not receive one. This is the only case refused at CONNECT time.
+   - Matches `acl.passthrough` only: the proxy responds with `200 Connection Established` and creates a plain TCP tunnel — no TLS interception occurs, the client talks directly to the upstream server through the tunnel. The `PASSTHROUGH` action is logged and recorded in metrics. Steps 3–9 are skipped.
+   - Otherwise: interception proceeds, including for blacklisted hosts. Nothing reaches the upstream before the request-stage ACL runs, and the client receives a readable 403.
 
 3. **Proxy accepts the tunnel (MITM)** -- For non-passthrough hosts, the proxy responds with `200 Connection Established`. The TCP tunnel is now open.
 

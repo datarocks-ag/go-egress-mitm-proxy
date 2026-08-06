@@ -118,11 +118,29 @@ Environment variable overrides follow 12-factor app principles:
 
 Pre-compiles patterns at startup for efficient runtime matching. ACL patterns support the same syntax as rewrite rules: exact match, wildcards (`*.example.com`), and raw regex (`~<pattern>`). Evaluation order:
 
-0. **Passthrough** - Checked at CONNECT stage (before TLS). Matching hosts are tunneled without MITM interception. No request inspection occurs.
+**At the CONNECT stage** (before TLS), `proxy.DecideConnect` chooses how the
+tunnel is handled:
+
+0a. **Passthrough + blacklist** - Rejected outright. A passthrough tunnel is
+    never inspected, so a passthrough pattern overlapping a blacklist entry
+    would otherwise hand out an uninspected tunnel to a denied host. This is the
+    only case refused at CONNECT time.
+0b. **Passthrough** - Tunneled without MITM interception. No request inspection
+    occurs, so later ACL stages never see it.
+0c. **Everything else** - Intercepted, including blacklisted hosts. Nothing is
+    forwarded upstream until the request stages below have run, so a blacklisted
+    host is still blocked — but the client receives a readable 403 rather than a
+    rejected CONNECT, which most clients surface as an opaque transport error.
+
+**Per request** (plain HTTP, and every intercepted HTTPS request):
+
 1. **Rewrite rules** - Exact match first (O(1) map lookup), then wildcard/regex patterns with optional `path_pattern` filtering
 2. **Blacklist** - Blocks request if matched
 3. **Whitelist** - Allows request if matched
 4. **Default policy** - `ALLOW` or `BLOCK` for unmatched domains
+
+Hostnames are normalized with `config.NormalizeHost` (lowercased, trailing dot
+stripped) before every one of these comparisons.
 
 ### Domain Pattern Matching
 
