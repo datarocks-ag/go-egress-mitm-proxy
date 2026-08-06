@@ -279,6 +279,9 @@ func main() {
 			return mitmAction, host
 		}))
 
+	// Per-rewrite-target transport pool; built below once proxyHandler.Tr exists.
+	var transportPool *proxy.TransportPool
+
 	// Register the request handler for policy enforcement
 	proxyHandler.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		// Wrap the transport to convert errors into synthetic HTTP responses.
@@ -286,8 +289,11 @@ func main() {
 		// writing a response (causing EOF on the client). By catching errors here
 		// and returning synthetic 502/504 responses, the MITM handler writes them
 		// to the client normally.
+		//
+		// The pool dispatches on the rewrite result that HandleRequest stores on the
+		// request context, so req here is the post-handler request, not r.
 		ctx.RoundTripper = goproxy.RoundTripperFunc(func(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
-			resp, err := proxyHandler.Tr.RoundTrip(req)
+			resp, err := transportPool.RoundTrip(req)
 			if err != nil {
 				status, reason := proxy.UpstreamErrorResponse(err)
 				slog.Warn("Upstream connection error",
@@ -370,6 +376,15 @@ func main() {
 		DialContext:           proxy.MakeDialer(runtimeCfg),
 		DialTLSContext:        proxy.MakeTLSDialer(runtimeCfg),
 	}
+
+	// Give each rewrite target its own connection pool. Go keys idle connections on
+	// the request URL's host:port, which is computed before our dialers substitute
+	// the target address, so a single transport would let rules for the same domain
+	// reuse each other's connections. See proxy.TransportPool.
+	//
+	// Assigned here (after proxyHandler.Tr is built) but captured by the request
+	// handler registered above; the handler only runs once the server is serving.
+	transportPool = proxy.NewTransportPool(proxyHandler.Tr)
 
 	// Setup metrics and health endpoints
 	metricsMux := http.NewServeMux()
@@ -454,6 +469,9 @@ func main() {
 					slog.Warn("Failed to close rotated trace log file", "err", err)
 				}
 			}
+			// Rewrite targets may now resolve elsewhere; drop pooled connections to
+			// the previous targets instead of letting them serve until IdleConnTimeout.
+			transportPool.Reset()
 			metrics.ConfigReloads.Inc()
 			slog.Info("Configuration reloaded successfully",
 				"rewrites", len(newRewrites),

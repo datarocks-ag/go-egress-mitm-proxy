@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries summarize each release at a high level; see the linked pull requests and
 git history for the full detail.
 
+## [Unreleased]
+
+### Fixed
+- **Connection pool no longer ignores the rewrite target.** Go keys idle
+  connections on the request URL's `host:port`, which is fixed before the
+  split-brain dialers substitute the target address. Rules for the same domain
+  that differed only by `target_ip`/`target_host` — notably `path_pattern`
+  rules — therefore shared one pool key and reused each other's connections, so
+  a request could be silently served by the wrong backend. Each distinct upstream
+  identity now gets its own `http.Transport` (`proxy.TransportPool`), keeping
+  pooling and HTTP/2 intact while making the pool key correct.
+- **Per-rewrite `insecure` no longer leaks across requests.** The same defect let
+  a connection negotiated with `InsecureSkipVerify: true` be handed to a later
+  request that required full certificate verification, silently bypassing it.
+  Verification mode is now part of the transport identity.
+- SIGHUP reload drops pooled connections to the previous rewrite targets instead
+  of letting them serve until `IdleConnTimeout` (90s) expires.
+
 ## [3.0.0] - 2026-06-03
 
 ### Added
