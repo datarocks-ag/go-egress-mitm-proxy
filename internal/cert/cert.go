@@ -8,9 +8,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -240,6 +242,17 @@ func MitmTLSConfigFromCA(ca *tls.Certificate, org string, store *CertStore) func
 	if store == nil {
 		store = sharedDefaultStore()
 	}
+
+	// Qualify cache keys with the signing CA and Organization, computed once.
+	//
+	// A leaf is only interchangeable with another leaf for the same hostname if
+	// it was signed by the same CA with the same subject. Keying on hostname
+	// alone meant two callers with different CAs shared entries: the second
+	// received the first's certificate, wrong issuer and wrong Organization.
+	// Latent in production, which has one CA and one call site, but the store is
+	// process-wide and nothing prevents a second caller.
+	keyPrefix := caCacheKeyPrefix(ca, org)
+
 	return func(host string, _ *goproxy.ProxyCtx) (*tls.Config, error) {
 		// Strip port if present
 		hostname, _, err := net.SplitHostPort(host)
@@ -247,7 +260,7 @@ func MitmTLSConfigFromCA(ca *tls.Certificate, org string, store *CertStore) func
 			hostname = host
 		}
 
-		cert, err := store.Fetch(hostname, func() (*tls.Certificate, error) {
+		cert, err := store.Fetch(keyPrefix+"\x00"+hostname, func() (*tls.Certificate, error) {
 			return SignHost(*ca, []string{hostname}, org)
 		})
 		if err != nil {
@@ -259,6 +272,16 @@ func MitmTLSConfigFromCA(ca *tls.Certificate, org string, store *CertStore) func
 			MinVersion:   tls.VersionTLS12,
 		}, nil
 	}
+}
+
+// caCacheKeyPrefix identifies the signing identity a cached leaf belongs to.
+func caCacheKeyPrefix(ca *tls.Certificate, org string) string {
+	h := sha256.New()
+	for _, der := range ca.Certificate {
+		h.Write(der)
+	}
+	h.Write([]byte(org))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 var (

@@ -6,11 +6,14 @@ package cert
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/elazarl/goproxy"
 )
 
 // stubGen returns a generator producing a distinguishable certificate and
@@ -280,5 +283,51 @@ func TestCertStoreConcurrentSameHostSignsOnceWithoutHoldingLock(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 1 {
 		t.Errorf("generator called %d times for one host under concurrency, want 1", calls)
+	}
+}
+
+// TestMitmTLSConfigKeysCacheByCA pins that cached leaves belong to a signing
+// identity, not just a hostname.
+//
+// A leaf is interchangeable with another only if the same CA signed it with the
+// same subject. Keyed on hostname alone, a second caller with a different CA
+// received the first caller's certificate -- wrong issuer, wrong Organization.
+// Latent in production, which has one CA and one call site, but the store is
+// process-wide and nothing stops a second caller appearing.
+func TestMitmTLSConfigKeysCacheByCA(t *testing.T) {
+	caA := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	caB := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+
+	shared := NewCertStore(10, time.Hour)
+	fnA := MitmTLSConfigFromCA(&caA, "Org A", shared)
+	fnB := MitmTLSConfigFromCA(&caB, "Org B", shared)
+
+	leafFor := func(fn func(string, *goproxy.ProxyCtx) (*tls.Config, error)) *x509.Certificate {
+		t.Helper()
+		cfg, err := fn("shared.example.com", nil)
+		if err != nil {
+			t.Fatalf("build TLS config: %v", err)
+		}
+		leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return leaf
+	}
+
+	leafA := leafFor(fnA)
+	leafB := leafFor(fnB)
+
+	if len(leafB.Subject.Organization) == 0 || leafB.Subject.Organization[0] != "Org B" {
+		t.Errorf("second CA got Organization %v, want [Org B] — it was served the first CA's cached leaf",
+			leafB.Subject.Organization)
+	}
+	if leafA.SerialNumber.Cmp(leafB.SerialNumber) == 0 {
+		t.Error("both CAs share one cached certificate; the cache key ignores the signing identity")
+	}
+
+	// Same CA and host must still hit the cache.
+	if again := leafFor(fnA); again.SerialNumber.Cmp(leafA.SerialNumber) != 0 {
+		t.Error("same CA and host re-signed; qualifying the key must not defeat caching")
 	}
 }

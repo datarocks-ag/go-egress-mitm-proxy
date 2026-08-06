@@ -617,7 +617,7 @@ func TestSignHostIPAddress(t *testing.T) {
 func TestMitmTLSConfigFromCA(t *testing.T) {
 	ca := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 
-	tlsConfigFn := MitmTLSConfigFromCA(&ca, "Test MITM Org", nil)
+	tlsConfigFn := MitmTLSConfigFromCA(&ca, "Test MITM Org", NewCertStore(10, time.Hour))
 
 	// First call — generates cert
 	cfg1, err := tlsConfigFn("example.com:443", nil)
