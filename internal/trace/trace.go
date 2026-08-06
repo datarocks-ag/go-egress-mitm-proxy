@@ -104,6 +104,13 @@ type Record struct {
 	connectHost string
 	sni         string
 
+	// mu guards the fields the dialer writes. http.Transport dials on its own
+	// goroutine (go t.dialConnFor(w)); when the request goroutine is instead
+	// satisfied by a freed idle connection, the abandoned dial keeps running and
+	// still calls SetTCP/SetError — potentially while the request goroutine is
+	// already emitting. Request cancellation produces the same overlap.
+	// bytesUp/bytesDown are atomics for the equivalent reason on the tunnel path.
+	mu          sync.Mutex
 	connectedIP string
 	dialMillis  int64
 	connReused  bool
@@ -156,6 +163,9 @@ func (r *Record) SetConnect(host, sni string) {
 
 // SetTCP records the established connection's resolved IP, dial duration, and TLS details.
 func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, tlsCipher string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.connectedIP = connectedIP
 	r.dialMillis = dialDur.Milliseconds()
 	r.tlsVersion = tlsVersion
@@ -164,6 +174,9 @@ func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, t
 
 // SetError records an upstream/dial error for the trace.
 func (r *Record) SetError(msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.errMsg = msg
 }
 
@@ -214,9 +227,11 @@ func (r *Record) applyResponse(resp *http.Response) {
 
 	// A MITM response with no recorded dial means the upstream connection was
 	// reused from the pool; its remote IP is not observable for this request.
+	r.mu.Lock()
 	if r.mode == "mitm" && r.connectedIP == "" && r.errMsg == "" {
 		r.connReused = true
 	}
+	r.mu.Unlock()
 
 	// Wrap the body only when bytes actually need teeing.
 	//
@@ -281,16 +296,23 @@ func (r *Record) emit() {
 	}
 	attrs = append(attrs, slog.Group("connect", connect...))
 
+	// Snapshot under the lock: an abandoned dial may still be writing these.
+	r.mu.Lock()
+	connectedIP, dialMillis := r.connectedIP, r.dialMillis
+	connReused, tlsVersion, tlsCipher := r.connReused, r.tlsVersion, r.tlsCipher
+	errMsg := r.errMsg
+	r.mu.Unlock()
+
 	tcp := []any{}
-	if r.connectedIP != "" {
-		tcp = append(tcp, slog.String("connected_ip", r.connectedIP))
-		tcp = append(tcp, slog.Int64("dial_ms", r.dialMillis))
+	if connectedIP != "" {
+		tcp = append(tcp, slog.String("connected_ip", connectedIP))
+		tcp = append(tcp, slog.Int64("dial_ms", dialMillis))
 	}
-	if r.connReused {
+	if connReused {
 		tcp = append(tcp, slog.Bool("connection_reused", true))
 	}
-	if r.tlsVersion != "" {
-		tcp = append(tcp, slog.String("tls_version", r.tlsVersion), slog.String("tls_cipher", r.tlsCipher))
+	if tlsVersion != "" {
+		tcp = append(tcp, slog.String("tls_version", tlsVersion), slog.String("tls_cipher", tlsCipher))
 	}
 	if up, down := r.bytesUp.Load(), r.bytesDown.Load(); up != 0 || down != 0 {
 		tcp = append(tcp, slog.Int64("bytes_up", up), slog.Int64("bytes_down", down))
@@ -339,8 +361,8 @@ func (r *Record) emit() {
 		attrs = append(attrs, slog.Group("response", resp...))
 	}
 
-	if r.errMsg != "" {
-		attrs = append(attrs, slog.String("error", r.errMsg))
+	if errMsg != "" {
+		attrs = append(attrs, slog.String("error", errMsg))
 	}
 
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "trace", toAttrs(attrs)...)
