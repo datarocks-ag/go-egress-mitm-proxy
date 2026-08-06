@@ -46,12 +46,20 @@ func loadMITMFromPEM(certPath, keyPath string) error {
 		return fmt.Errorf("read key: %w", err)
 	}
 
-	goproxy.GoproxyCa, err = tls.X509KeyPair(caCert, caKey)
+	ca, err := tls.X509KeyPair(caCert, caKey)
 	if err != nil {
 		return fmt.Errorf("parse keypair: %w", err)
 	}
+	if err := validateCA(ca); err != nil {
+		return err
+	}
 
-	return validateMITMCA()
+	// Assigned only after validation. Writing the global first meant a parse
+	// failure replaced the loaded CA with a zero tls.Certificate, and a
+	// validation failure left an unusable one installed -- a failed load
+	// destroying working state.
+	goproxy.GoproxyCa = ca
+	return nil
 }
 
 func loadMITMFromKeystore(keystorePath, password string) error {
@@ -65,22 +73,34 @@ func loadMITMFromKeystore(keystorePath, password string) error {
 		return fmt.Errorf("decode keystore: %w", err)
 	}
 
-	goproxy.GoproxyCa = tls.Certificate{
+	ca := tls.Certificate{
 		Certificate: [][]byte{cert.Raw},
 		PrivateKey:  privateKey,
 		Leaf:        cert,
 	}
+	if err := validateCA(ca); err != nil {
+		return err
+	}
 
-	return validateMITMCA()
+	// Assigned only after validation; see loadMITMFromPEM.
+	goproxy.GoproxyCa = ca
+	return nil
 }
 
-// validateMITMCA checks that the loaded MITM certificate is actually a CA certificate.
-// A non-CA certificate would silently produce per-domain certs that clients reject.
-func validateMITMCA() error {
-	leaf := goproxy.GoproxyCa.Leaf
+// validateCA reports whether ca is usable for signing MITM leaf certificates.
+//
+// It takes the candidate rather than reading the global so a caller can check
+// before installing it. The CA check matters because a non-CA certificate loads
+// and signs perfectly well; the leaves it produces are simply rejected by every
+// client.
+func validateCA(ca tls.Certificate) error {
+	if len(ca.Certificate) == 0 {
+		return errors.New("MITM certificate contains no certificates")
+	}
+	leaf := ca.Leaf
 	if leaf == nil {
 		var err error
-		leaf, err = x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		leaf, err = x509.ParseCertificate(ca.Certificate[0])
 		if err != nil {
 			return fmt.Errorf("parse MITM certificate for validation: %w", err)
 		}

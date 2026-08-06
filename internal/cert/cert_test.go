@@ -1246,7 +1246,17 @@ func TestLoadMITMCertificateFromPEMAndKeystore(t *testing.T) {
 	origCa := goproxy.GoproxyCa
 	t.Cleanup(func() { goproxy.GoproxyCa = origCa })
 
+	// goproxy.GoproxyCa is package-global. Restoring it per subtest keeps each
+	// one independent, so a later subtest cannot pass on state an earlier one
+	// left behind.
+	reset := func(t *testing.T) {
+		t.Helper()
+		goproxy.GoproxyCa = origCa
+	}
+
 	t.Run("PEM cert and key", func(t *testing.T) {
+		reset(t)
+
 		dir := t.TempDir()
 		writeTestCAPEM(t, dir, "PEM CA", "PEM Org")
 
@@ -1270,6 +1280,8 @@ func TestLoadMITMCertificateFromPEMAndKeystore(t *testing.T) {
 	})
 
 	t.Run("PKCS#12 keystore", func(t *testing.T) {
+		reset(t)
+
 		if _, err := exec.LookPath("openssl"); err != nil {
 			t.Skip("openssl not available")
 		}
@@ -1289,6 +1301,9 @@ func TestLoadMITMCertificateFromPEMAndKeystore(t *testing.T) {
 	})
 
 	t.Run("wrong keystore password is an error", func(t *testing.T) {
+		reset(t)
+		before := goproxy.GoproxyCa
+
 		if _, err := exec.LookPath("openssl"); err != nil {
 			t.Skip("openssl not available")
 		}
@@ -1302,9 +1317,18 @@ func TestLoadMITMCertificateFromPEMAndKeystore(t *testing.T) {
 		if err := LoadMITMCertificate(cfg); err == nil {
 			t.Error("LoadMITMCertificate accepted a wrong keystore password")
 		}
+		// A failed load must not disturb the CA already in use. The loaders
+		// previously wrote the global before validating, so a parse failure
+		// replaced a working CA with a zero value.
+		if !sameCert(goproxy.GoproxyCa, before) {
+			t.Error("a failed keystore load replaced the installed CA")
+		}
 	})
 
 	t.Run("missing PEM files are an error", func(t *testing.T) {
+		reset(t)
+		before := goproxy.GoproxyCa
+
 		cfg := config.Config{}
 		cfg.Proxy.MitmCertPath = "/nonexistent/ca.crt"
 		cfg.Proxy.MitmKeyPath = "/nonexistent/ca.key"
@@ -1312,7 +1336,80 @@ func TestLoadMITMCertificateFromPEMAndKeystore(t *testing.T) {
 		if err := LoadMITMCertificate(cfg); err == nil {
 			t.Error("LoadMITMCertificate accepted nonexistent PEM paths")
 		}
+		if !sameCert(goproxy.GoproxyCa, before) {
+			t.Error("a failed PEM load replaced the installed CA")
+		}
 	})
+
+	t.Run("non-CA certificate is rejected without being installed", func(t *testing.T) {
+		reset(t)
+		before := goproxy.GoproxyCa
+
+		// A leaf certificate: loads and signs fine, but every client rejects the
+		// per-domain certs it would produce.
+		dir := t.TempDir()
+		writeTestLeafPEM(t, dir)
+
+		cfg := config.Config{}
+		cfg.Proxy.MitmCertPath = filepath.Join(dir, "leaf.crt")
+		cfg.Proxy.MitmKeyPath = filepath.Join(dir, "leaf.key")
+
+		if err := LoadMITMCertificate(cfg); err == nil {
+			t.Error("LoadMITMCertificate accepted a non-CA certificate")
+		}
+		if !sameCert(goproxy.GoproxyCa, before) {
+			t.Error("a rejected non-CA certificate was installed anyway")
+		}
+	})
+}
+
+// sameCert reports whether two tls.Certificates hold identical DER chains.
+func sameCert(a, b tls.Certificate) bool {
+	if len(a.Certificate) != len(b.Certificate) {
+		return false
+	}
+	for i := range a.Certificate {
+		if !bytes.Equal(a.Certificate[i], b.Certificate[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// writeTestLeafPEM writes a non-CA (IsCA=false) certificate and key.
+func writeTestLeafPEM(t *testing.T, dir string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               pkix.Name{CommonName: "Not A CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  false,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	if err := os.WriteFile(filepath.Join(dir, "leaf.crt"), certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "leaf.key"), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestBuildOutboundTLSConfigDecisions covers the function that decides RootCAs,

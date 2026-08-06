@@ -204,8 +204,16 @@ func TestTransportPoolResetClosesIdleConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck // drain so the conn is pooled
-	resp.Body.Close()              //nolint:errcheck // test cleanup
+	// The assertion below depends on this drain succeeding: an undrained body
+	// means the connection never becomes idle, which would surface as
+	// "Reset() did not close the pooled idle connection" and point at the wrong
+	// thing entirely.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain response body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close response body: %v", err)
+	}
 
 	if got := closes.Load(); got != 0 {
 		t.Fatalf("connection closed before Reset() (%d closes); it should be pooled as idle", got)
