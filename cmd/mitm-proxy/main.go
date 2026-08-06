@@ -43,6 +43,14 @@ var version = "dev"
 // shutdownTimeout bounds the drain period after SIGINT/SIGTERM.
 const shutdownTimeout = 30 * time.Second
 
+// Outbound connection pool sizing. These apply per transport, and TransportPool
+// clones the base transport once per distinct rewrite target.
+const (
+	maxIdleConnsPerTransport = 32
+	maxIdleConnsPerHost      = 10
+	maxConnsPerHost          = 64
+)
+
 // slogProxyLogger adapts goproxy's Logger interface to route through slog.
 type slogProxyLogger struct{}
 
@@ -64,6 +72,16 @@ func normalizeResponseProto(resp *http.Response) {
 		resp.ProtoMajor = 1
 		resp.ProtoMinor = 1
 	}
+}
+
+// firstSetEnv returns the value of the first non-empty variable among names.
+func firstSetEnv(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func printUsage() {
@@ -238,6 +256,24 @@ func main() {
 
 	// Initialize the proxy server
 	proxyHandler := goproxy.NewProxyHttpServer()
+
+	// NewProxyHttpServer sets ConnectDial from HTTP_PROXY/HTTPS_PROXY in the
+	// environment. connectDial short-circuits to it, so with either variable set
+	// no CONNECT ever reaches proxy.dial -- and therefore neither ctx.Dialer nor
+	// MakeDialer runs: no target_ip substitution, no trace dialer, no dial
+	// metrics, and NO_PROXY ignored. Plain HTTP meanwhile goes through
+	// proxyHandler.Tr, which has no Proxy func, so the two paths diverge.
+	//
+	// Platform teams inject these cluster-wide routinely, and the symptom is
+	// "rewrites stopped working on the new cluster" with nothing in the logs.
+	// This proxy resolves its own upstreams; clear them and say so.
+	if v := firstSetEnv("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"); v != "" {
+		slog.Warn("Ignoring upstream proxy environment variables; this proxy dials upstreams directly",
+			"value", v)
+	}
+	proxyHandler.ConnectDial = nil
+	proxyHandler.ConnectDialWithReq = nil
+
 	proxyHandler.Logger = &slogProxyLogger{}
 	proxyHandler.Verbose = slog.Default().Enabled(context.Background(), slog.LevelDebug)
 
@@ -397,11 +433,18 @@ func main() {
 	// Configure the outbound HTTP transport with connection pooling and TLS settings.
 	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
 	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
+	// MaxIdleConns is per-transport, and TransportPool clones this one per rewrite
+	// target, so the process-wide idle ceiling is (targets + 1) x MaxIdleConns.
+	// Sized per transport accordingly rather than leaving the old global figure to
+	// multiply. MaxConnsPerHost bounds *active* connections, which nothing did
+	// before: for a split-brain proxy many client hostnames collapse onto one
+	// target_ip, which is exactly the ephemeral-port-exhaustion case.
 	proxyHandler.Tr = &http.Transport{
 		TLSClientConfig:       baseTLSConfig,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConns:          maxIdleConnsPerTransport,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DialContext:           proxy.MakeDialer(runtimeCfg),
@@ -430,12 +473,21 @@ func main() {
 		WriteTimeout: 5 * time.Second,
 	}
 
+	// A forward proxy streams arbitrary bodies, so whole-request deadlines are the
+	// wrong shape. ReadTimeout/WriteTimeout are absolute, armed when the request
+	// line is read, and hijackLocked clears the deadline on hijack -- so every
+	// CONNECT tunnel (all HTTPS, MITM and passthrough) was exempt while plain HTTP
+	// was severed at 60s mid-body. A large package download over HTTP was cut; the
+	// identical request over HTTPS was unbounded. Nobody would predict that from
+	// the config.
+	//
+	// ReadHeaderTimeout keeps slowloris protection without capping body transfer,
+	// and IdleTimeout bounds keep-alive connections.
 	proxyServer := &http.Server{
-		Addr:         ":" + cfg.Proxy.Port,
-		Handler:      proxyHandler,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              ":" + cfg.Proxy.Port,
+		Handler:           proxyHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start metrics server in background

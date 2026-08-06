@@ -65,7 +65,9 @@ func transportKey(rw RewriteResult) string {
 // For returns the transport owning connections for the given rewrite result.
 // Unmatched rewrites get the base transport.
 func (p *TransportPool) For(rw RewriteResult) *http.Transport {
-	if !rw.Matched {
+	// A rule that only rewrites headers or the scheme dials exactly as the base
+	// transport does, so it can share the base pool rather than getting its own.
+	if !rw.Matched || (rw.TargetIP == "" && rw.TargetHost == "" && !rw.Insecure) {
 		return p.base
 	}
 
@@ -136,3 +138,12 @@ func (p *TransportPool) CloseIdleConnections() {
 
 // Ensure TransportPool satisfies the standard RoundTripper contract.
 var _ http.RoundTripper = (*TransportPool)(nil)
+
+// Len reports how many per-target transports exist, excluding the base.
+// Exposed so pool growth is observable rather than being discovered through
+// "cannot assign requested address".
+func (p *TransportPool) Len() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.transports)
+}
