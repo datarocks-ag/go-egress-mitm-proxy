@@ -43,11 +43,29 @@ var version = "dev"
 // shutdownTimeout bounds the drain period after SIGINT/SIGTERM.
 const shutdownTimeout = 30 * time.Second
 
-// preStopGrace is how long the proxy keeps serving after failing readiness and
-// before it closes the listener, so load balancers notice and route away first.
-// Sized at two probe intervals of the shipped Kubernetes manifest (5s).
-// shutdownTimeout + preStopGrace must stay under terminationGracePeriodSeconds.
-const preStopGrace = 10 * time.Second
+// defaultPreStopGrace is how long the proxy keeps serving after failing
+// readiness and before it closes the listener, so load balancers notice and
+// route away first. Sized at two probe intervals of the shipped Kubernetes
+// manifest (5s). This plus shutdownTimeout must stay under
+// terminationGracePeriodSeconds.
+const defaultPreStopGrace = 10 * time.Second
+
+// preStopGrace reads PROXY_PRESTOP_GRACE, so deployments that already sleep in a
+// preStop hook can set it to 0 rather than paying the wait twice. Tests set it
+// to 0 to avoid adding the delay to every container teardown.
+func preStopGrace() time.Duration {
+	raw := os.Getenv("PROXY_PRESTOP_GRACE")
+	if raw == "" {
+		return defaultPreStopGrace
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		slog.Warn("Invalid PROXY_PRESTOP_GRACE; using the default",
+			"value", raw, "default", defaultPreStopGrace)
+		return defaultPreStopGrace
+	}
+	return d
+}
 
 // Outbound connection pool sizing. These apply per transport, and TransportPool
 // clones the base transport once per distinct rewrite target.
@@ -612,10 +630,10 @@ func main() {
 		// so the default covers two intervals. It is inside
 		// terminationGracePeriodSeconds together with the drain budget.
 		health.SetNotReady()
-		if preStopGrace > 0 {
+		if grace := preStopGrace(); grace > 0 {
 			slog.Info("Readiness failed; serving briefly so traffic can move away",
-				"grace", preStopGrace)
-			time.Sleep(preStopGrace)
+				"grace", grace)
+			time.Sleep(grace)
 		}
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)

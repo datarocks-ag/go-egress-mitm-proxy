@@ -268,6 +268,11 @@ func TestE2E(t *testing.T) {
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			// No pre-stop grace in tests. In production the proxy keeps serving for
+			// two probe intervals after failing readiness so load balancers route
+			// away first; here it would only add that delay to every container
+			// teardown, for no coverage.
+			Env: map[string]string{"PROXY_PRESTOP_GRACE": "0"},
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(certsDir, "ca.crt"),
@@ -972,6 +977,11 @@ rewrites:
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			// No pre-stop grace in tests. In production the proxy keeps serving for
+			// two probe intervals after failing readiness so load balancers route
+			// away first; here it would only add that delay to every container
+			// teardown, for no coverage.
+			Env: map[string]string{"PROXY_PRESTOP_GRACE": "0"},
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
@@ -1199,6 +1209,11 @@ acl:
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			// No pre-stop grace in tests. In production the proxy keeps serving for
+			// two probe intervals after failing readiness so load balancers route
+			// away first; here it would only add that delay to every container
+			// teardown, for no coverage.
+			Env: map[string]string{"PROXY_PRESTOP_GRACE": "0"},
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
@@ -1436,6 +1451,11 @@ acl:
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			// No pre-stop grace in tests. In production the proxy keeps serving for
+			// two probe intervals after failing readiness so load balancers route
+			// away first; here it would only add that delay to every container
+			// teardown, for no coverage.
+			Env: map[string]string{"PROXY_PRESTOP_GRACE": "0"},
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
