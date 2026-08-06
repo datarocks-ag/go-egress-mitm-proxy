@@ -55,6 +55,7 @@ internal/config/config.go      # Types, YAML loading, validation, env overrides,
 internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
 internal/cert/gencert.go       # gencert subcommand + key pair generation
 internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, domain metrics
+internal/proxy/connect.go      # CONNECT-stage handler: policy dispatch, reject, passthrough trace wiring
 internal/proxy/transport.go    # Per-rewrite-target transport pool (correct connection-pool keying)
 internal/proxy/listener.go     # Connection-tracking listener (drains hijacked CONNECT tunnels)
 internal/cert/store.go         # Bounded, TTL'd MITM leaf certificate cache
@@ -125,6 +126,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `MakeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
 - `MakeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
 - `NormalizeDomainForMetrics()` - Bounds metrics cardinality
+- `NewConnectHandler()` - The CONNECT-stage handler: normalization, `DecideConnect` dispatch, metric labeling, blocked-request auditing and passthrough trace wiring. Extracted from `main()` because as an anonymous closure none of it was reachable from a test — which is how a downgraded tunnel went unnoticed
 - `DecideConnect()` - ACL policy for a CONNECT target. Rejects **only** a host that is both passthrough and blacklisted: passthrough accepts an uninspected tunnel that never reaches `HandleRequest`, so a denied host must not get one. Every other host is intercepted, blacklisted or not — nothing is forwarded upstream before `HandleRequest` applies policy, and the client gets a readable 403 instead of a rejected CONNECT that clients surface as an opaque transport error
 - `LogBlocked()` - Shared blocked-request audit log emission, used by both the request path and the CONNECT reject path
 - `NormalizeResponseProto()` - Forces HTTP/1.1 framing so goproxy's `resp.Write()` cannot emit an unusable status line
@@ -232,6 +234,7 @@ internal/cert/
   cert_test.go                 # Cert, signing, gencert, truststore tests
 internal/proxy/
   handler.go                   # Request handling, dialers, rewrite lookup, metrics recording
+  connect.go                   # CONNECT-stage handler (extracted from main for testability)
   transport.go                 # Per-rewrite-target transport pool
   handler_test.go              # Handler, dialer, rewrite, metrics tests
   transport_test.go            # Transport pool keying, reset, concurrency tests
