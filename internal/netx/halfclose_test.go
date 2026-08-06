@@ -32,12 +32,17 @@ func localTCP(t *testing.T) net.Conn {
 	}
 	t.Cleanup(func() { ln.Close() }) //nolint:errcheck // test cleanup
 
+	// Hand the accepted conn back rather than registering its cleanup inside the
+	// goroutine: t.Cleanup called after the test finishes panics, which would
+	// make this flaky whenever the accept lands late.
+	accepted := make(chan net.Conn, 1)
 	go func() {
 		conn, acceptErr := ln.Accept()
 		if acceptErr != nil {
+			close(accepted)
 			return
 		}
-		t.Cleanup(func() { conn.Close() }) //nolint:errcheck // test cleanup
+		accepted <- conn
 	}()
 
 	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", ln.Addr().String())
@@ -45,6 +50,10 @@ func localTCP(t *testing.T) net.Conn {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() }) //nolint:errcheck // test cleanup
+
+	if server, ok := <-accepted; ok {
+		t.Cleanup(func() { server.Close() }) //nolint:errcheck // test cleanup
+	}
 	return conn
 }
 
