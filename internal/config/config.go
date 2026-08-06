@@ -83,12 +83,16 @@ type Config struct {
 // When enabled, requests matching any rule are logged as a single aggregated
 // JSON record covering the TCP/TLS, request, and response layers.
 type TraceConfig struct {
-	Enabled       bool        `yaml:"enabled"`        // Master switch; when false tracing is fully short-circuited
-	LogPath       string      `yaml:"log_path"`       // Optional dedicated JSON-lines file; empty = main log stream
-	RedactHeaders []string    `yaml:"redact_headers"` // Header names to mask, in addition to the built-in defaults
-	RedactQuery   bool        `yaml:"redact_query"`   // Mask URL query-string values
-	LogSecrets    bool        `yaml:"log_secrets"`    // Escape hatch: disable all redaction and log verbatim
-	Rules         []TraceRule `yaml:"rules"`          // OR across rules; within a rule host AND url must both match
+	Enabled       bool     `yaml:"enabled"`        // Master switch; when false tracing is fully short-circuited
+	LogPath       string   `yaml:"log_path"`       // Optional dedicated JSON-lines file; empty = main log stream
+	RedactHeaders []string `yaml:"redact_headers"` // Header names to mask, in addition to the built-in defaults
+	// RedactQuery masks URL query-string values. Defaults to true when omitted:
+	// query strings routinely carry tokens, api keys and presigned signatures,
+	// and trace records are written to disk. A pointer so an explicit
+	// "redact_query: false" is distinguishable from an absent key.
+	RedactQuery *bool       `yaml:"redact_query"`
+	LogSecrets  bool        `yaml:"log_secrets"` // Escape hatch: disable all redaction and log verbatim
+	Rules       []TraceRule `yaml:"rules"`       // OR across rules; within a rule host AND url must both match
 }
 
 // TraceRule selects requests to trace by host and/or URL, with per-rule body capture.
@@ -168,7 +172,7 @@ func (ct CompiledTrace) Match(host, fullURL string, hasURL bool) *CompiledTraceR
 func CompileTrace(tc TraceConfig) (CompiledTrace, error) {
 	ct := CompiledTrace{
 		Enabled:       tc.Enabled,
-		RedactQuery:   tc.RedactQuery,
+		RedactQuery:   tc.RedactQuery == nil || *tc.RedactQuery,
 		LogSecrets:    tc.LogSecrets,
 		RedactHeaders: make(map[string]bool),
 	}

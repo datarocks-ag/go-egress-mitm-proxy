@@ -356,7 +356,12 @@ flowchart LR
 - Metrics cardinality bounded to prevent OOM attacks
 - Request IDs are cryptographically random (8 bytes)
 - Blocked request log file created with 0600 permissions
-- Trace log file created with 0600 permissions; trace redaction is secure-by-default (sensitive headers and query values masked unless `log_secrets` is set)
+- Trace log file created with 0600 permissions. Trace redaction is
+  secure-by-default: the built-in sensitive headers and URL query values are
+  masked unless explicitly disabled (`redact_query: false`) or globally disabled
+  (`log_secrets: true`). Request and response **bodies are not redacted** — body
+  capture is opt-in per rule and logs payloads verbatim, which is documented at
+  the `bodies` setting.
 
 ### Configuration Security
 

@@ -144,7 +144,7 @@ trace:
   # redact_headers extends it. Set log_secrets: true to disable ALL redaction.
   redact_headers:
     - "X-Api-Key"
-  redact_query: true      # mask ?token=... query-string values
+  redact_query: true      # mask ?token=... query-string values (default: true)
   log_secrets: false      # escape hatch: true logs everything verbatim
 
   rules:

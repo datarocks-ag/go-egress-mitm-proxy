@@ -1520,3 +1520,40 @@ func TestCompileRewritesRejectsUnmatchablePattern(t *testing.T) {
 		t.Error("CompileRewrites accepted a domain pattern that can never match")
 	}
 }
+
+// TestRedactQueryDefaultsToMasked pins the secure default.
+//
+// Query strings routinely carry tokens, api keys and presigned signatures, and
+// trace records are written to disk. The docs described redaction as
+// secure-by-default including query values while the code left it off unless
+// asked, so an operator enabling tracing to debug a host got those values
+// verbatim.
+func TestRedactQueryDefaultsToMasked(t *testing.T) {
+	yes, no := true, false
+
+	tests := []struct {
+		name string
+		set  *bool
+		want bool
+	}{
+		{"omitted defaults to masked", nil, true},
+		{"explicit true", &yes, true},
+		{"explicit false opts out", &no, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ct, err := CompileTrace(TraceConfig{
+				Enabled:     true,
+				RedactQuery: tt.set,
+				Rules:       []TraceRule{{Host: "*"}},
+			})
+			if err != nil {
+				t.Fatalf("CompileTrace: %v", err)
+			}
+			if ct.RedactQuery != tt.want {
+				t.Errorf("RedactQuery = %v, want %v", ct.RedactQuery, tt.want)
+			}
+		})
+	}
+}
