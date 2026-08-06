@@ -50,6 +50,28 @@ func NewConnectHandler(
 		case ConnectReject:
 			return rejectConnect(runtimeCfg, ctx, host, hostname, metricDomain), host
 
+		case ConnectMITM:
+			// A blacklisted host is intercepted rather than refused so HandleRequest
+			// can answer with a readable 403. But that leaves the denial recorded
+			// only if the client completes the TLS handshake with our certificate --
+			// a pinning SDK or a JVM truststore never will, and goproxy routes that
+			// failure to debug level. It also downgrades what used to be a WARN to
+			// HandleRequest's Info-level ACCESS line, which the default warn level
+			// drops.
+			//
+			// Record the attempt here so a denial is observable regardless of
+			// whether the client cooperates with interception. The distinct action
+			// label avoids double-counting the BLACK-LISTED that HandleRequest
+			// records when the handshake does succeed.
+			if config.Matches(hostname, currentACL.Blacklist) {
+				slog.Warn("BLACK-LISTED",
+					"host", hostname,
+					"client", ctx.Req.RemoteAddr,
+					"stage", "connect")
+				metrics.TrafficTotal.WithLabelValues(metricDomain, "BLACK-LISTED-CONNECT").Inc()
+			}
+			return mitmAction, host
+
 		case ConnectPassthrough:
 			slog.Info("PASSTHROUGH",
 				"host", hostname,

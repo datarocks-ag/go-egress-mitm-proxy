@@ -7,10 +7,13 @@ on:
     branches: [main]
     tags: ['v*']
 
-# A merge to main and a v* tag on the same commit would otherwise run this
-# pipeline twice, including two image builds and two pushes.
+# Keyed on the commit, not the ref. A merge to main and a v* tag on the same
+# commit arrive as refs/heads/main and refs/tags/v..., which are different
+# groups — so keying on github.ref left exactly the duplicate this is meant to
+# prevent: two image builds and two pushes for one commit. cancel-in-progress
+# stays false because a run already pushing should finish.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -28,10 +31,12 @@ jobs:
         with:
           go-version: '1.25'
 
-      # Same invocation as CI: the version pinned in go.mod's tool directive.
-      # The action with "version: latest" meant an upstream golangci-lint release
-      # could redden main for findings no PR could have caught, with no way to
-      # reproduce the failure locally.
+      # Same invocation as CI. golangci-lint is a go.mod tool dependency
+      # (`tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint`), so
+      # `go tool` resolves and builds it from the pinned module version — no
+      # separate install step, and nothing to drift. The action with
+      # "version: latest" meant an upstream release could redden main for
+      # findings no PR could have caught, with no way to reproduce locally.
       - name: golangci-lint
         run: go tool golangci-lint run
 

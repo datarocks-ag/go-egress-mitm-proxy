@@ -13,8 +13,10 @@ import (
 	"testing"
 
 	"github.com/elazarl/goproxy"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"go-egress-proxy/internal/config"
+	"go-egress-proxy/internal/metrics"
 	"go-egress-proxy/internal/trace"
 )
 
@@ -208,5 +210,41 @@ func TestConnectHandlerSkipsTraceWhenNoRuleMatches(t *testing.T) {
 	}
 	if ctx.Dialer != nil {
 		t.Error("tracing dialer wired for a host no rule matches")
+	}
+}
+
+// TestConnectHandlerRecordsBlacklistedMITM pins that a denial is observable
+// without the client cooperating with interception.
+//
+// A blacklisted host that is not passthrough is intercepted so HandleRequest can
+// answer 403. But a client that refuses our certificate — a pinning SDK, a JVM
+// truststore — never reaches HandleRequest, and goproxy logs that failure at
+// debug. Recording at CONNECT time means the attempt appears regardless. The
+// label is distinct so it does not double-count the BLACK-LISTED that
+// HandleRequest records when the handshake does succeed.
+func TestConnectHandlerRecordsBlacklistedMITM(t *testing.T) {
+	cfg := config.Config{}
+	cfg.ACL.Blacklist = []string{"denied.example.com"}
+
+	rc := runtimeFor(t, cfg)
+
+	const domain = "example.com"
+	before := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues(domain, "BLACK-LISTED-CONNECT"))
+
+	action, _ := NewConnectHandler(rc, testMitm, testPassthrough)("denied.example.com:443",
+		connectCtx(t, "denied.example.com:443"))
+
+	if action != testMitm {
+		t.Fatalf("action = %v, want MITM; the host is not passthrough", action)
+	}
+	if delta := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues(domain, "BLACK-LISTED-CONNECT")) - before; delta != 1 {
+		t.Errorf("BLACK-LISTED-CONNECT moved by %v, want 1; a denial the client never completes is unrecorded", delta)
+	}
+
+	// A host that is not blacklisted must not be recorded.
+	clean := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues("_other", "BLACK-LISTED-CONNECT"))
+	NewConnectHandler(rc, testMitm, testPassthrough)("fine.example.org:443", connectCtx(t, "fine.example.org:443"))
+	if got := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues("_other", "BLACK-LISTED-CONNECT")); got != clean {
+		t.Error("a non-blacklisted host was recorded as a CONNECT denial")
 	}
 }
