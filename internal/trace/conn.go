@@ -7,6 +7,8 @@ package trace
 import (
 	"context"
 	"net"
+
+	"go-egress-proxy/internal/netx"
 )
 
 // DialFunc is the dial signature used by goproxy's ctx.Dialer and by
@@ -52,37 +54,11 @@ type countingConn struct {
 	rec *Record
 }
 
-// halfClosableConn preserves CloseRead/CloseWrite for connections that support
-// them. Embedding net.Conn alone would hide those methods, and goproxy type-
-// asserts for them (halfClosable, https.go:180) to pick its tunnel copy loop.
-// Failing that assertion drops the tunnel onto a path where the first finished
-// direction fully closes the peer, truncating any protocol that half-closes its
-// write side, and it also loses io.Copy's splice fast path.
-//
-// The two types exist so the assertion result stays honest: a conn that cannot
-// half-close must not advertise that it can.
-type halfClosableConn struct {
-	*countingConn
-	hc halfCloser
-}
-
-// halfCloser is the half-close half of goproxy's halfClosable interface.
-type halfCloser interface {
-	CloseRead() error
-	CloseWrite() error
-}
-
-func (c *halfClosableConn) CloseRead() error  { return c.hc.CloseRead() }
-func (c *halfClosableConn) CloseWrite() error { return c.hc.CloseWrite() }
-
-// wrapConn returns a counting wrapper that advertises half-close support only
-// when the underlying connection actually has it.
+// wrapConn returns a counting wrapper that keeps half-close support when the
+// underlying connection has it. See netx.PreserveHalfClose for why that matters
+// and why the logic is shared with the client end of the tunnel.
 func wrapConn(conn net.Conn, rec *Record) net.Conn {
-	cc := &countingConn{Conn: conn, rec: rec}
-	if hc, ok := conn.(halfCloser); ok {
-		return &halfClosableConn{countingConn: cc, hc: hc}
-	}
-	return cc
+	return netx.PreserveHalfClose(conn, &countingConn{Conn: conn, rec: rec})
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
