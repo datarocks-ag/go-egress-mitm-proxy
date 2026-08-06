@@ -22,6 +22,8 @@ import (
 
 	"github.com/elazarl/goproxy"
 	gopkcs12 "software.sslmate.com/src/go-pkcs12"
+
+	"go-egress-proxy/internal/config"
 )
 
 // generateTestCert creates a self-signed CA certificate valid for the given duration.
@@ -1233,4 +1235,225 @@ func TestSignHostAttachesFullChain(t *testing.T) {
 	}); err != nil {
 		t.Errorf("root-only client could not verify the presented chain: %v", err)
 	}
+}
+
+// TestLoadMITMCertificateFromPEMAndKeystore covers the dispatch and both
+// branches of the loader. go tool cover reported LoadMITMCertificate and
+// loadMITMFromKeystore at 0.0%: the entire PKCS#12 path and the keystore-vs-PEM
+// choice were unexecuted, on a proxy where a bad load means minting leaves every
+// client rejects.
+func TestLoadMITMCertificateFromPEMAndKeystore(t *testing.T) {
+	origCa := goproxy.GoproxyCa
+	t.Cleanup(func() { goproxy.GoproxyCa = origCa })
+
+	// goproxy.GoproxyCa is package-global. Restoring it per subtest keeps each
+	// one independent, so a later subtest cannot pass on state an earlier one
+	// left behind.
+	reset := func(t *testing.T) {
+		t.Helper()
+		goproxy.GoproxyCa = origCa
+	}
+
+	t.Run("PEM cert and key", func(t *testing.T) {
+		reset(t)
+
+		dir := t.TempDir()
+		writeTestCAPEM(t, dir, "PEM CA", "PEM Org")
+
+		cfg := config.Config{}
+		cfg.Proxy.MitmCertPath = filepath.Join(dir, "ca.crt")
+		cfg.Proxy.MitmKeyPath = filepath.Join(dir, "ca.key")
+
+		if err := LoadMITMCertificate(cfg); err != nil {
+			t.Fatalf("LoadMITMCertificate: %v", err)
+		}
+		if len(goproxy.GoproxyCa.Certificate) == 0 {
+			t.Fatal("CA was not installed")
+		}
+		leaf, err := x509.ParseCertificate(goproxy.GoproxyCa.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if leaf.Subject.CommonName != "PEM CA" {
+			t.Errorf("CommonName = %q, want %q", leaf.Subject.CommonName, "PEM CA")
+		}
+	})
+
+	t.Run("PKCS#12 keystore", func(t *testing.T) {
+		reset(t)
+
+		if _, err := exec.LookPath("openssl"); err != nil {
+			t.Skip("openssl not available")
+		}
+		dir := t.TempDir()
+		_, p12Path := generateTestP12(t, dir, "P12 CA", "P12 Org", "changeit")
+
+		cfg := config.Config{}
+		cfg.Proxy.MitmKeystorePath = p12Path
+		cfg.Proxy.MitmKeystorePassword = "changeit"
+
+		if err := LoadMITMCertificate(cfg); err != nil {
+			t.Fatalf("LoadMITMCertificate from keystore: %v", err)
+		}
+		if len(goproxy.GoproxyCa.Certificate) == 0 {
+			t.Fatal("CA was not installed from the keystore")
+		}
+	})
+
+	t.Run("wrong keystore password is an error", func(t *testing.T) {
+		reset(t)
+		before := goproxy.GoproxyCa
+
+		if _, err := exec.LookPath("openssl"); err != nil {
+			t.Skip("openssl not available")
+		}
+		dir := t.TempDir()
+		_, p12Path := generateTestP12(t, dir, "P12 CA", "P12 Org", "changeit")
+
+		cfg := config.Config{}
+		cfg.Proxy.MitmKeystorePath = p12Path
+		cfg.Proxy.MitmKeystorePassword = "wrong"
+
+		if err := LoadMITMCertificate(cfg); err == nil {
+			t.Error("LoadMITMCertificate accepted a wrong keystore password")
+		}
+		// A failed load must not disturb the CA already in use. The loaders
+		// previously wrote the global before validating, so a parse failure
+		// replaced a working CA with a zero value.
+		if !sameCert(goproxy.GoproxyCa, before) {
+			t.Error("a failed keystore load replaced the installed CA")
+		}
+	})
+
+	t.Run("missing PEM files are an error", func(t *testing.T) {
+		reset(t)
+		before := goproxy.GoproxyCa
+
+		cfg := config.Config{}
+		cfg.Proxy.MitmCertPath = "/nonexistent/ca.crt"
+		cfg.Proxy.MitmKeyPath = "/nonexistent/ca.key"
+
+		if err := LoadMITMCertificate(cfg); err == nil {
+			t.Error("LoadMITMCertificate accepted nonexistent PEM paths")
+		}
+		if !sameCert(goproxy.GoproxyCa, before) {
+			t.Error("a failed PEM load replaced the installed CA")
+		}
+	})
+
+	t.Run("non-CA certificate is rejected without being installed", func(t *testing.T) {
+		reset(t)
+		before := goproxy.GoproxyCa
+
+		// A leaf certificate: loads and signs fine, but every client rejects the
+		// per-domain certs it would produce.
+		dir := t.TempDir()
+		writeTestLeafPEM(t, dir)
+
+		cfg := config.Config{}
+		cfg.Proxy.MitmCertPath = filepath.Join(dir, "leaf.crt")
+		cfg.Proxy.MitmKeyPath = filepath.Join(dir, "leaf.key")
+
+		if err := LoadMITMCertificate(cfg); err == nil {
+			t.Error("LoadMITMCertificate accepted a non-CA certificate")
+		}
+		if !sameCert(goproxy.GoproxyCa, before) {
+			t.Error("a rejected non-CA certificate was installed anyway")
+		}
+	})
+}
+
+// sameCert reports whether two tls.Certificates hold identical DER chains.
+func sameCert(a, b tls.Certificate) bool {
+	if len(a.Certificate) != len(b.Certificate) {
+		return false
+	}
+	for i := range a.Certificate {
+		if !bytes.Equal(a.Certificate[i], b.Certificate[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// writeTestLeafPEM writes a non-CA (IsCA=false) certificate and key.
+func writeTestLeafPEM(t *testing.T, dir string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               pkix.Name{CommonName: "Not A CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  false,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	if err := os.WriteFile(filepath.Join(dir, "leaf.crt"), certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "leaf.key"), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBuildOutboundTLSConfigDecisions covers the function that decides RootCAs,
+// MinVersion, NextProtos and InsecureSkipVerify for every upstream connection.
+// It was at 0.0% coverage.
+func TestBuildOutboundTLSConfigDecisions(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		tlsCfg, err := BuildOutboundTLSConfig(config.Config{})
+		if err != nil {
+			t.Fatalf("BuildOutboundTLSConfig: %v", err)
+		}
+		if tlsCfg.MinVersion != tls.VersionTLS12 {
+			t.Errorf("MinVersion = %d, want TLS 1.2", tlsCfg.MinVersion)
+		}
+		if !slices.Contains(tlsCfg.NextProtos, "h2") {
+			t.Errorf("NextProtos = %v, want it to contain h2", tlsCfg.NextProtos)
+		}
+		if tlsCfg.InsecureSkipVerify {
+			t.Error("InsecureSkipVerify must default to false")
+		}
+		if tlsCfg.RootCAs == nil {
+			t.Error("RootCAs should be populated from the system pool")
+		}
+	})
+
+	t.Run("global insecure_skip_verify", func(t *testing.T) {
+		cfg := config.Config{}
+		cfg.Proxy.InsecureSkipVerify = true
+
+		tlsCfg, err := BuildOutboundTLSConfig(cfg)
+		if err != nil {
+			t.Fatalf("BuildOutboundTLSConfig: %v", err)
+		}
+		if !tlsCfg.InsecureSkipVerify {
+			t.Error("InsecureSkipVerify was not honored")
+		}
+	})
+
+	t.Run("unloadable CA source aborts", func(t *testing.T) {
+		cfg := config.Config{}
+		cfg.Proxy.OutgoingCABundle = "/nonexistent/bundle.pem"
+
+		if _, err := BuildOutboundTLSConfig(cfg); err == nil {
+			t.Error("BuildOutboundTLSConfig accepted an unloadable CA bundle")
+		}
+	})
 }

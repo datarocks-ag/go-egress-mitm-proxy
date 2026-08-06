@@ -60,20 +60,6 @@ func (l *slogProxyLogger) Printf(format string, v ...any) {
 	}
 }
 
-// normalizeResponseProto forces HTTP/1.1 framing so goproxy's resp.Write()
-// never serializes an unusable status line. Two cases need fixing:
-//  1. goproxy.NewResponse() leaves Proto fields at zero → "HTTP/0.0"
-//  2. Upstream HTTP/2 responses have Proto "HTTP/2.0"
-//
-// Both cause "Unsupported HTTP version" errors in clients on MITM tunnels.
-func normalizeResponseProto(resp *http.Response) {
-	if resp.ProtoMajor != 1 {
-		resp.Proto = "HTTP/1.1"
-		resp.ProtoMajor = 1
-		resp.ProtoMinor = 1
-	}
-}
-
 // firstSetEnv returns the value of the first non-empty variable among names.
 func firstSetEnv(names ...string) string {
 	for _, n := range names {
@@ -384,7 +370,7 @@ func main() {
 			rec = v
 		}
 		if resp != nil {
-			normalizeResponseProto(resp)
+			proxy.NormalizeResponseProto(resp)
 			proxy.RecordResponseMetrics(resp)
 			if rec != nil {
 				trace.PrepareResponse(rec, resp)
@@ -401,7 +387,7 @@ func main() {
 				goproxy.ContentTypeText,
 				status,
 				reason)
-			normalizeResponseProto(errResp)
+			proxy.NormalizeResponseProto(errResp)
 			if rec != nil {
 				rec.SetError(ctx.Error.Error())
 				trace.PrepareResponse(rec, errResp)
@@ -439,17 +425,13 @@ func main() {
 	// multiply. MaxConnsPerHost bounds *active* connections, which nothing did
 	// before: for a split-brain proxy many client hostnames collapse onto one
 	// target_ip, which is exactly the ephemeral-port-exhaustion case.
-	proxyHandler.Tr = &http.Transport{
-		TLSClientConfig:       baseTLSConfig,
-		ForceAttemptHTTP2:     true,
+	proxyHandler.Tr = proxy.NewOutboundTransport(baseTLSConfig, runtimeCfg, proxy.OutboundTransportOptions{
 		MaxIdleConns:          maxIdleConnsPerTransport,
 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
 		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-		DialContext:           proxy.MakeDialer(runtimeCfg),
-		DialTLSContext:        proxy.MakeTLSDialer(runtimeCfg),
-	}
+	})
 
 	// Give each rewrite target its own connection pool. Go keys idle connections on
 	// the request URL's host:port, which is computed before our dialers substitute

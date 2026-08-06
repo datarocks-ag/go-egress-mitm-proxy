@@ -523,3 +523,53 @@ func DecideConnect(hostname string, acl config.CompiledACL) ConnectDecision {
 		return ConnectMITM
 	}
 }
+
+// NormalizeResponseProto rewrites non-HTTP/1.x responses to HTTP/1.1 so
+// goproxy's resp.Write() never serializes an unusable status line. Two cases
+// need fixing:
+//  1. goproxy.NewResponse() leaves the Proto fields at zero, yielding "HTTP/0.0"
+//  2. Upstream HTTP/2 responses carry Proto "HTTP/2.0"
+//
+// Both cause "Unsupported HTTP version" errors in clients on MITM tunnels.
+//
+// HTTP/1.0 and HTTP/1.1 responses are left exactly as they are: both serialize
+// to a valid status line, and rewriting 1.0 to 1.1 would misreport what the
+// upstream actually spoke.
+func NormalizeResponseProto(resp *http.Response) {
+	if resp == nil || resp.ProtoMajor == 1 {
+		return
+	}
+	resp.Proto = "HTTP/1.1"
+	resp.ProtoMajor = 1
+	resp.ProtoMinor = 1
+}
+
+// NewOutboundTransport builds the upstream transport.
+//
+// Extracted from main so the real construction is reachable from tests; the
+// previous tests built an http.Transport literal inside the test and asserted
+// the fields they had just set, exercising no repository code at all.
+func NewOutboundTransport(baseTLS *tls.Config, runtimeCfg *config.RuntimeConfig, opts OutboundTransportOptions) *http.Transport {
+	return &http.Transport{
+		TLSClientConfig:       baseTLS,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          opts.MaxIdleConns,
+		MaxIdleConnsPerHost:   opts.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       opts.MaxConnsPerHost,
+		IdleConnTimeout:       opts.IdleConnTimeout,
+		ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
+		DialContext:           MakeDialer(runtimeCfg),
+		DialTLSContext:        MakeTLSDialer(runtimeCfg),
+	}
+}
+
+// OutboundTransportOptions carries the pool and timeout sizing for
+// NewOutboundTransport. These apply per transport: TransportPool clones the
+// result once per distinct rewrite target.
+type OutboundTransportOptions struct {
+	MaxIdleConns          int
+	MaxIdleConnsPerHost   int
+	MaxConnsPerHost       int
+	IdleConnTimeout       time.Duration
+	ResponseHeaderTimeout time.Duration
+}

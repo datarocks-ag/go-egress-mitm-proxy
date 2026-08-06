@@ -109,10 +109,14 @@ func (p *TransportPool) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // Reset drops every per-target transport and closes its idle connections.
 //
-// Call this after a config reload: rewrite targets may now point elsewhere, and
-// pooled connections to the previous target would otherwise keep serving requests
-// until IdleConnTimeout expires. In-flight requests are unaffected — they retain
-// the connection they are already using.
+// Call this after a config reload. Swapping the map is what makes the old
+// transports unreachable from For/ForRequest/RoundTrip, so no request can land
+// on a stale target once Reset returns; closing the idle connections is about
+// releasing sockets and their persistConn goroutines immediately instead of
+// leaving them to IdleConnTimeout (90s) per reload.
+//
+// In-flight requests are unaffected: they retain the connection they are
+// already using.
 func (p *TransportPool) Reset() {
 	p.mu.Lock()
 	old := p.transports

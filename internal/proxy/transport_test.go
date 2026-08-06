@@ -6,9 +6,14 @@ package proxy
 
 import (
 	"context"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"go-egress-proxy/internal/config"
 )
@@ -156,4 +161,84 @@ func TestTransportPoolConcurrentForIsStable(t *testing.T) {
 			t.Fatalf("goroutine %d got a different transport; For() is not stable under concurrency", i)
 		}
 	}
+}
+
+// TestTransportPoolResetClosesIdleConnections covers the half of Reset() that a
+// pointer comparison cannot see. Verified by mutation: replacing the close loop
+// with `_ = old` makes this test fail. Without it the whole suite stayed green,
+// so idle sockets and their persistConn goroutines could linger for
+// IdleConnTimeout (90s) per SIGHUP with nothing noticing.
+//
+// The assertion observes Close() on the connection directly rather than probing
+// socket state, which is subject to timing and platform-specific error values.
+func TestTransportPoolResetClosesIdleConnections(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var closes atomic.Int64
+	base := &http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &closeCountingConn{Conn: conn, closes: &closes}, nil
+		},
+	}
+
+	pool := NewTransportPool(base)
+	rw := RewriteResult{TargetIP: "127.0.0.1", Matched: true}
+	tr := pool.For(rw)
+
+	// Make a request so the transport holds a pooled idle connection.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	// The assertion below depends on this drain succeeding: an undrained body
+	// means the connection never becomes idle, which would surface as
+	// "Reset() did not close the pooled idle connection" and point at the wrong
+	// thing entirely.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain response body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close response body: %v", err)
+	}
+
+	if got := closes.Load(); got != 0 {
+		t.Fatalf("connection closed before Reset() (%d closes); it should be pooled as idle", got)
+	}
+
+	pool.Reset()
+
+	// CloseIdleConnections is synchronous for connections already parked as idle.
+	if got := closes.Load(); got == 0 {
+		t.Error("Reset() did not close the pooled idle connection")
+	}
+
+	// And a fresh transport is handed out.
+	if pool.For(rw) == tr {
+		t.Error("Reset() did not drop the per-target transport")
+	}
+}
+
+// closeCountingConn records how many times the connection was closed.
+type closeCountingConn struct {
+	net.Conn
+	closes *atomic.Int64
+}
+
+func (c *closeCountingConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
 }
