@@ -187,13 +187,13 @@ DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
     // Check context first (path-based rewrites)
     rw, ok := ctx.Value(config.RewriteCtxKey).(proxy.RewriteResult)
     if !ok {
-        rw = lookupRewrite(host, rewrites, rewriteExact)
+        rw = proxy.LookupRewrite(host, rewrites, rewriteExact)
     }
 
-    if rw.targetIP != "" {
-        addr = net.JoinHostPort(rw.targetIP, port)
-    } else if rw.targetHost != "" {
-        addr = net.JoinHostPort(rw.targetHost, port)
+    if rw.TargetIP != "" {
+        addr = net.JoinHostPort(rw.TargetIP, port)
+    } else if rw.TargetHost != "" {
+        addr = net.JoinHostPort(rw.TargetHost, port)
     }
 
     return dialer.DialContext(ctx, network, addr)
@@ -278,9 +278,9 @@ flowchart LR
     end
 
     subgraph main.go
-        load["loadConfig()<br/>Read YAML → ApplyEnvOverrides() → Validate()"]
+        load["LoadConfig()<br/>Read YAML → ApplyEnvOverrides() → Validate()"]
         compile["CompileACL() → CompiledACL<br/>CompileRewrites() → []CompiledRewriteRule"]
-        bllog["openBlockedLog()"]
+        bllog["OpenBlockedLog()"]
         rtcfg["RuntimeConfig.Update()"]
 
         subgraph proxy ["goproxy.ProxyHttpServer"]

@@ -3,7 +3,15 @@ kind: Deployment
 metadata:
   name: my-app
 spec:
+  # selector and template.metadata.labels are required for apps/v1 Deployments
+  # and must match; without them kubectl apply fails validation.
+  selector:
+    matchLabels:
+      app: my-app
   template:
+    metadata:
+      labels:
+        app: my-app
     spec:
       # Must exceed the proxy's 30s drain budget, or the kubelet SIGKILLs it
       # mid-drain and the graceful shutdown is wasted.
