@@ -143,13 +143,20 @@ jobs:
       # throwaway ":scan" image was built and scanned while a second
       # build-push-action rebuilt and pushed independently, so the published
       # artifact was never the one the scanner looked at.
+      # Built once, tagged with both the final tags and a fixed local scan tag.
+      # The scan tag is a stable reference into this same image, so the scanner
+      # does not depend on the order or contents of the generated tag list;
+      # indexing tags[0] would break the moment the tag rules changed. It is
+      # local-only and never pushed.
       - name: Build Docker image
         uses: docker/build-push-action@v7
         with:
           context: .
           load: true
           push: false
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ env.IMAGE_NAME }}:scan
           labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ steps.version.outputs.VERSION }}
           cache-from: type=gha
@@ -158,7 +165,7 @@ jobs:
       - name: Run Trivy vulnerability scanner (Docker image)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          image-ref: ${{ env.IMAGE_NAME }}:scan
           format: 'table'
           output: 'trivy-docker-results.txt'
           severity: 'CRITICAL,HIGH'
@@ -196,12 +203,18 @@ jobs:
       # built tags guarantees the published digest is the scanned digest.
       - name: Push image
         if: startsWith(github.ref, 'refs/tags/v')
+        # Tags arrive via env rather than being interpolated into the script:
+        # ${{ }} substitution happens before the shell sees the line, so a value
+        # containing shell metacharacters would be executed. A here-string also
+        # avoids the subshell and the transformations echo can apply.
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "${{ steps.meta.outputs.tags }}" | while read -r tag; do
+          while IFS= read -r tag; do
             [ -n "$tag" ] || continue
-            echo "Pushing $tag"
+            printf 'Pushing %s\n' "$tag"
             docker push "$tag"
-          done
+          done <<< "$IMAGE_TAGS"
 
   release:
     name: GitHub Release
