@@ -201,8 +201,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build base TLS configuration for outbound connections.
-	baseTLSConfig := cert.BuildOutboundTLSConfig(cfg)
+	// Build base TLS configuration for outbound connections. A configured CA
+	// source that cannot be loaded is fatal: continuing would install a degraded
+	// pool that fails every upstream verification with no clear cause.
+	baseTLSConfig, err := cert.BuildOutboundTLSConfig(cfg)
+	if err != nil {
+		slog.Error("Failed to build outbound TLS configuration", "err", err)
+		os.Exit(1)
+	}
 
 	// Initialize runtime config (thread-safe, reloadable)
 	runtimeCfg := &config.RuntimeConfig{}
@@ -235,12 +241,18 @@ func main() {
 	proxyHandler.Logger = &slogProxyLogger{}
 	proxyHandler.Verbose = slog.Default().Enabled(context.Background(), slog.LevelDebug)
 
+	// One bounded, TTL'd cache shared by both signing paths. Without it goproxy
+	// re-signs on every CONNECT (a fresh RSA key pair each time for an RSA CA),
+	// and the mitm_org path used an unbounded cache that never expired.
+	certStore := cert.NewCertStore(cert.DefaultCertCacheSize, cert.DefaultCertTTL)
+	proxyHandler.CertStore = certStore
+
 	mitmAction := &goproxy.ConnectAction{
 		Action:    goproxy.ConnectMitm,
 		TLSConfig: goproxy.TLSConfigFromCA(&goproxy.GoproxyCa),
 	}
 	if cfg.Proxy.MitmOrg != "" {
-		mitmAction.TLSConfig = cert.MitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg)
+		mitmAction.TLSConfig = cert.MitmTLSConfigFromCA(&goproxy.GoproxyCa, cfg.Proxy.MitmOrg, certStore)
 	}
 	passthroughAction := &goproxy.ConnectAction{Action: goproxy.ConnectAccept}
 	proxyHandler.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
@@ -484,7 +496,24 @@ func main() {
 					"hint", "certificate and listen-port changes take effect on restart only")
 			}
 
-			newTLSConfig := cert.BuildOutboundTLSConfig(newCfg)
+			newTLSConfig, tlsErr := cert.BuildOutboundTLSConfig(newCfg)
+			if tlsErr != nil {
+				slog.Error("Failed to build outbound TLS configuration on reload; keeping previous configuration",
+					"err", tlsErr)
+				metrics.ConfigLoadErrors.Inc()
+				// Release the log files opened above, since this reload is abandoned.
+				if newBlockedFile != nil {
+					if closeErr := newBlockedFile.Close(); closeErr != nil {
+						slog.Warn("Failed to close blocked log file after reload error", "err", closeErr)
+					}
+				}
+				if newTraceFile != nil {
+					if closeErr := newTraceFile.Close(); closeErr != nil {
+						slog.Warn("Failed to close trace log file after reload error", "err", closeErr)
+					}
+				}
+				continue
+			}
 			oldFile := runtimeCfg.Update(newCfg, newACL, newRewrites, newTLSConfig, newBlockedLogger, newBlockedFile)
 			if oldFile != nil {
 				if err := oldFile.Close(); err != nil {

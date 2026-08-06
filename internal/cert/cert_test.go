@@ -391,35 +391,41 @@ func TestLoadCertPoolWithTruststore(t *testing.T) {
 	certPath, p12Path := generateTestP12(t, dir, "Pool Test CA", "Test Org", "pooltest")
 
 	t.Run("pool with truststore only", func(t *testing.T) {
-		pool := LoadCertPool("", nil, p12Path, "pooltest")
+		pool, err := LoadCertPool("", nil, p12Path, "pooltest")
+		if err != nil {
+			t.Fatalf("LoadCertPool() error = %v", err)
+		}
 		if pool == nil {
 			t.Fatal("LoadCertPool() returned nil")
 		}
 	})
 
 	t.Run("pool with PEM bundle and truststore", func(t *testing.T) {
-		pool := LoadCertPool(certPath, nil, p12Path, "pooltest")
+		pool, err := LoadCertPool(certPath, nil, p12Path, "pooltest")
+		if err != nil {
+			t.Fatalf("LoadCertPool() error = %v", err)
+		}
 		if pool == nil {
 			t.Fatal("LoadCertPool() returned nil")
 		}
 	})
 
 	t.Run("pool with no extra certs", func(t *testing.T) {
-		pool := LoadCertPool("", nil, "", "")
+		pool, err := LoadCertPool("", nil, "", "")
+		if err != nil {
+			t.Fatalf("LoadCertPool() error = %v", err)
+		}
 		if pool == nil {
 			t.Fatal("LoadCertPool() returned nil")
 		}
 	})
 
-	t.Run("pool with bad truststore path logs warning", func(t *testing.T) {
-		output := captureLogs(t, func() {
-			pool := LoadCertPool("", nil, "/nonexistent/truststore.p12", "pass")
-			if pool == nil {
-				t.Fatal("LoadCertPool() returned nil")
-			}
-		})
-		if !contains(output, "Failed to load truststore") {
-			t.Errorf("expected warning about failed truststore load, got: %s", output)
+	t.Run("unloadable truststore is an error", func(t *testing.T) {
+		// Previously warned and continued, producing a silently degraded pool:
+		// upstream verification then failed for every request with only a WARN
+		// sitting next to a success message.
+		if _, err := LoadCertPool("", nil, "/nonexistent/truststore.p12", "pass"); err == nil {
+			t.Error("LoadCertPool() accepted an unloadable truststore; a configured CA source must fail loudly")
 		}
 	})
 }
@@ -458,44 +464,38 @@ func TestLoadCertPoolWithCertPaths(t *testing.T) {
 	cert2 := writePEMCert(t, dir, "ca2")
 
 	t.Run("individual cert files appended", func(t *testing.T) {
-		pool := LoadCertPool("", []string{cert1, cert2}, "", "")
+		pool, err := LoadCertPool("", []string{cert1, cert2}, "", "")
+		if err != nil {
+			t.Fatalf("LoadCertPool() error = %v", err)
+		}
 		if pool == nil {
 			t.Fatal("LoadCertPool() returned nil")
 		}
 	})
 
 	t.Run("combined bundle and cert files", func(t *testing.T) {
-		pool := LoadCertPool(cert1, []string{cert2}, "", "")
+		pool, err := LoadCertPool(cert1, []string{cert2}, "", "")
+		if err != nil {
+			t.Fatalf("LoadCertPool() error = %v", err)
+		}
 		if pool == nil {
 			t.Fatal("LoadCertPool() returned nil")
 		}
 	})
 
-	t.Run("unreadable cert path logs warning", func(t *testing.T) {
-		output := captureLogs(t, func() {
-			pool := LoadCertPool("", []string{"/nonexistent/cert.crt"}, "", "")
-			if pool == nil {
-				t.Fatal("LoadCertPool() returned nil")
-			}
-		})
-		if !contains(output, "Failed to read CA cert") {
-			t.Errorf("expected warning about unreadable cert, got: %s", output)
+	t.Run("unreadable cert path is an error", func(t *testing.T) {
+		if _, err := LoadCertPool("", []string{"/nonexistent/cert.crt"}, "", ""); err == nil {
+			t.Error("LoadCertPool() accepted an unreadable CA cert path")
 		}
 	})
 
-	t.Run("invalid PEM content logs warning", func(t *testing.T) {
+	t.Run("invalid PEM content is an error", func(t *testing.T) {
 		badPath := filepath.Join(dir, "bad.crt")
 		if err := os.WriteFile(badPath, []byte("not-a-pem"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		output := captureLogs(t, func() {
-			pool := LoadCertPool("", []string{badPath}, "", "")
-			if pool == nil {
-				t.Fatal("LoadCertPool() returned nil")
-			}
-		})
-		if !contains(output, "Failed to parse CA cert") {
-			t.Errorf("expected warning about invalid PEM, got: %s", output)
+		if _, err := LoadCertPool("", []string{badPath}, "", ""); err == nil {
+			t.Error("LoadCertPool() accepted a file containing no usable PEM certificates")
 		}
 	})
 }
@@ -615,7 +615,7 @@ func TestSignHostIPAddress(t *testing.T) {
 func TestMitmTLSConfigFromCA(t *testing.T) {
 	ca := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 
-	tlsConfigFn := MitmTLSConfigFromCA(&ca, "Test MITM Org")
+	tlsConfigFn := MitmTLSConfigFromCA(&ca, "Test MITM Org", nil)
 
 	// First call — generates cert
 	cfg1, err := tlsConfigFn("example.com:443", nil)
@@ -1139,5 +1139,98 @@ func TestRunGencertIntermediateClientTrustBundle(t *testing.T) {
 	}
 	if len(certs) != 1 || certs[0].Subject.CommonName != "Root CA" {
 		t.Errorf("truststore should contain root CA, got %v", certs)
+	}
+}
+
+// TestSignHostAttachesFullChain pins the multi-level chain fix. SignHost
+// previously attached only ca.Certificate[0], so with a root -> int1 -> int2
+// hierarchy the proxy presented leaf + int2 only and a root-only client could
+// not build a path: every handshake failed with "unknown authority".
+func TestSignHostAttachesFullChain(t *testing.T) {
+	// Build a two-level CA whose tls.Certificate carries both CA certs, the shape
+	// gencert --out-chain produces.
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Chain Root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCert, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	intKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "Chain Intermediate"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	intDER, err := x509.CreateCertificate(rand.Reader, intTmpl, rootCert, &intKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ca := tls.Certificate{
+		Certificate: [][]byte{intDER, rootDER}, // intermediate + parent, as in a chain file
+		PrivateKey:  intKey,
+	}
+
+	leaf, err := SignHost(ca, []string{"host.example.com"}, "Test Org")
+	if err != nil {
+		t.Fatalf("SignHost: %v", err)
+	}
+
+	if len(leaf.Certificate) != 3 {
+		t.Fatalf("presented %d certificates, want 3 (leaf + intermediate + root)", len(leaf.Certificate))
+	}
+
+	// A client trusting only the root must be able to build a path from what the
+	// proxy presents.
+	roots := x509.NewCertPool()
+	roots.AddCert(rootCert)
+	// Intermediates only. x509.Verify tolerates a root in this pool, so including
+	// it would let the test pass on verifier leniency rather than on the chain
+	// the proxy actually presents.
+	intermediates := x509.NewCertPool()
+	for _, der := range leaf.Certificate[1:] {
+		if bytes.Equal(der, rootDER) {
+			continue
+		}
+		c, parseErr := x509.ParseCertificate(der)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		intermediates.AddCert(c)
+	}
+	leafCert, err := x509.ParseCertificate(leaf.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leafCert.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		DNSName:       "host.example.com",
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}); err != nil {
+		t.Errorf("root-only client could not verify the presented chain: %v", err)
 	}
 }
