@@ -483,6 +483,17 @@ func main() {
 	//
 	// ReadHeaderTimeout keeps slowloris protection without capping body transfer,
 	// and IdleTimeout bounds keep-alive connections.
+	//
+	// Known gap: a client that streams a body slowly but steadily is not bounded
+	// by time. That is inherent -- any deadline large enough for a legitimate
+	// multi-gigabyte transfer is also large enough for a slow sender, and this is
+	// a proxy for arbitrary payloads. Two things that look like fixes are not:
+	// re-adding an absolute ReadTimeout severs legitimate long transfers (the bug
+	// this replaced), and refreshing a deadline per read from a wrapped
+	// net.Conn overrides the header deadline http.Server sets on the same
+	// connection (server.go SetReadDeadline(hdrDeadline)), silently disabling the
+	// slowloris protection above. Bounding concurrent client connections is the
+	// lever that actually applies here, and is left as a deployment concern.
 	proxyServer := &http.Server{
 		Addr:              ":" + cfg.Proxy.Port,
 		Handler:           proxyHandler,

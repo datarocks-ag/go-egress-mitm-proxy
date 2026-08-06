@@ -45,8 +45,16 @@ func TestTLSHandshakeIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Shorten the handshake bound for this test. Production keeps
+	// DefaultTLSHandshakeTimeout; asserting the behavior does not need to cost
+	// ten seconds of CI time.
+	original := tlsHandshakeTimeout
+	tlsHandshakeTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { tlsHandshakeTimeout = original })
+
 	rc := &config.RuntimeConfig{}
 	cfg := config.Config{}
+	// Update returns the previous blocked-log file handle, not an error.
 	_ = rc.Update(cfg, config.CompiledACL{}, nil, &tls.Config{MinVersion: tls.VersionTLS12}, nil, nil)
 
 	rw := RewriteResult{TargetIP: "127.0.0.1", Matched: true}
@@ -54,7 +62,7 @@ func TestTLSHandshakeIsBounded(t *testing.T) {
 
 	// Bound the test well above the handshake timeout so a hang is distinguishable
 	// from a timely failure.
-	ctx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout+20*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	start := time.Now()
@@ -65,7 +73,7 @@ func TestTLSHandshakeIsBounded(t *testing.T) {
 		conn.Close() //nolint:errcheck // test cleanup
 		t.Fatal("handshake succeeded against a silent server")
 	}
-	if elapsed >= tlsHandshakeTimeout+10*time.Second {
+	if elapsed >= 10*time.Second {
 		t.Errorf("handshake took %v; it must be bounded by %v", elapsed, tlsHandshakeTimeout)
 	}
 	if !errors.Is(dialErr, context.DeadlineExceeded) {

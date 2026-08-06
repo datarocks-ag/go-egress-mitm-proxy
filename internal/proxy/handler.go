@@ -22,10 +22,16 @@ import (
 	"go-egress-proxy/internal/trace"
 )
 
-// tlsHandshakeTimeout bounds the upstream TLS handshake performed by
+// DefaultTLSHandshakeTimeout bounds the upstream TLS handshake performed by
 // MakeTLSDialer. It is separate from the 5s TCP dial timeout, which a target
 // that accepts the connection and then stalls has already passed.
-const tlsHandshakeTimeout = 10 * time.Second
+const DefaultTLSHandshakeTimeout = 10 * time.Second
+
+// tlsHandshakeTimeout is the value actually used. It is a variable rather than a
+// constant purely so tests can lower it: asserting that a stalled handshake is
+// bounded otherwise costs the full timeout in wall-clock time on every CI run.
+// Production never reassigns it.
+var tlsHandshakeTimeout = DefaultTLSHandshakeTimeout
 
 // RewriteResult holds the outcome of a rewrite rule lookup.
 type RewriteResult struct {
