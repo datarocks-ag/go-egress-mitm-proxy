@@ -201,30 +201,17 @@ func TestConnectionPoolLeaksInsecureSkipVerify(t *testing.T) {
 		t.Fatalf("split server addr: %v", err)
 	}
 
-	// Both rules target the same backend and the same hostname, so they share the
-	// "rewrite-trusted.test:<port>" idle-pool key. Only `insecure` differs.
-	rewrites := []config.CompiledRewriteRule{
-		{
-			Pattern:     regexp.MustCompile(`^rewrite-trusted\.test$`),
-			PathPattern: regexp.MustCompile(`^/lax/`),
-			TargetIP:    srvHost,
-			Original:    "rewrite-trusted.test",
-			Insecure:    true,
-		},
-		{
-			Pattern:     regexp.MustCompile(`^rewrite-trusted\.test$`),
-			PathPattern: regexp.MustCompile(`^/strict/`),
-			TargetIP:    srvHost,
-			Original:    "rewrite-trusted.test",
-			Insecure:    false,
-		},
-	}
-
+	// No rewrite rules are configured: the helper below puts a RewriteResult
+	// directly onto the request context, exactly as HandleRequest does for a
+	// path-based rule, and MakeTLSDialer reads the context before consulting the
+	// runtime config. Rules here would never be matched, so carrying them would
+	// only imply this test pins the path_pattern -> RewriteResult chain, which it
+	// does not. TestConnectionPoolIgnoresRewriteTarget covers that end to end.
 	rc := &config.RuntimeConfig{}
 	cfg := config.Config{}
 	// Empty RootCAs = system pool, which does not trust the generated test CA.
 	baseTLS := &tls.Config{MinVersion: tls.VersionTLS12}
-	_ = rc.Update(cfg, config.CompiledACL{}, rewrites, baseTLS, nil, nil)
+	_ = rc.Update(cfg, config.CompiledACL{}, nil, baseTLS, nil, nil)
 
 	// Wrap the real TLS dialer to record the verification mode of each handshake.
 	baseTLSDialer := MakeTLSDialer(rc)

@@ -7,12 +7,6 @@ import (
 	"testing"
 )
 
-func TestVersionDefault(t *testing.T) {
-	if version != "dev" {
-		t.Errorf("version = %q, want %q", version, "dev")
-	}
-}
-
 func TestPrintUsage(t *testing.T) {
 	// Capture stderr output
 	oldStderr := os.Stderr

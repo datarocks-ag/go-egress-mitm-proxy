@@ -91,27 +91,6 @@ func TestGenerateRequestID(t *testing.T) {
 	}
 }
 
-func TestOutboundHTTP2TransportConfiguration(t *testing.T) {
-	baseTLS := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
-	}
-	tr := &http.Transport{
-		TLSClientConfig:   baseTLS,
-		ForceAttemptHTTP2: true,
-	}
-
-	if tr.TLSClientConfig == nil {
-		t.Fatal("TLSClientConfig should not be nil")
-	}
-	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
-		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
-	}
-	if !tr.ForceAttemptHTTP2 {
-		t.Error("ForceAttemptHTTP2 should be true")
-	}
-}
-
 func TestLookupRewrite(t *testing.T) {
 	rewrites := []config.CompiledRewriteRule{
 		{
@@ -565,36 +544,6 @@ func TestDialerUsesContextRewrite(t *testing.T) {
 	conn.Close() //nolint:errcheck // test cleanup
 }
 
-func TestOutboundHTTP2TransportWithDialTLSContext(t *testing.T) {
-	baseTLS := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
-	}
-
-	tr := &http.Transport{
-		TLSClientConfig:   baseTLS,
-		ForceAttemptHTTP2: true,
-		DialTLSContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-			return nil, nil // stub for test
-		},
-	}
-
-	if tr.TLSClientConfig == nil {
-		t.Fatal("TLSClientConfig should not be nil")
-	}
-	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") {
-		t.Errorf("TLSClientConfig.NextProtos = %v, want it to contain \"h2\"", tr.TLSClientConfig.NextProtos)
-	}
-	if !tr.ForceAttemptHTTP2 {
-		t.Error("ForceAttemptHTTP2 should be true")
-	}
-	if tr.DialTLSContext == nil {
-		t.Error("DialTLSContext should be set")
-	}
-}
-
-// startTLSServer creates a TLS server with a self-signed certificate signed by a generated CA.
-// Returns the listener address and the CA cert pool (for trusted clients).
 func startTLSServer(t *testing.T) (addr string, caPool *x509.CertPool) {
 	t.Helper()
 
@@ -817,22 +766,25 @@ func TestHandleRequestWhitelistWildcardHTTPAndHTTPS(t *testing.T) {
 	}
 }
 
-func TestResponseProtoNormalization(t *testing.T) {
-	// goproxy writes MITM responses via resp.Write() which serializes
-	// ProtoMajor/ProtoMinor into the status line. The OnResponse handler
-	// must normalize non-HTTP/1.x responses to prevent "Unsupported HTTP
-	// version" errors. Two cases:
-	//   1) goproxy.NewResponse() leaves Proto at zero -> "HTTP/0.0"
-	//   2) Upstream HTTP/2 -> Proto "HTTP/2.0"
+func TestNormalizeResponseProto(t *testing.T) {
+	// Calls the real NormalizeResponseProto. The previous version copied the
+	// function body into the test, so the production code -- which prevents
+	// "Unsupported HTTP version" on MITM tunnels and runs on both the success and
+	// synthetic-error paths -- was never executed by the suite. That matters most
+	// right after the goproxy HTTP/2 rework.
 	tests := []struct {
 		name       string
 		proto      string
 		protoMajor int
 		protoMinor int
+		wantProto  string
+		wantMajor  int
+		wantMinor  int
 	}{
-		{"goproxy.NewResponse zero values", "", 0, 0},
-		{"upstream HTTP/2", "HTTP/2.0", 2, 0},
-		{"HTTP/1.1 unchanged", "HTTP/1.1", 1, 1},
+		{"goproxy.NewResponse zero values", "", 0, 0, "HTTP/1.1", 1, 1},
+		{"upstream HTTP/2", "HTTP/2.0", 2, 0, "HTTP/1.1", 1, 1},
+		{"HTTP/1.1 unchanged", "HTTP/1.1", 1, 1, "HTTP/1.1", 1, 1},
+		{"HTTP/1.0 left alone", "HTTP/1.0", 1, 0, "HTTP/1.0", 1, 0},
 	}
 
 	for _, tt := range tests {
@@ -843,24 +795,24 @@ func TestResponseProtoNormalization(t *testing.T) {
 				ProtoMinor: tt.protoMinor,
 			}
 
-			// Apply the same normalization as the OnResponse handler.
-			if resp.ProtoMajor != 1 {
-				resp.Proto = "HTTP/1.1"
-				resp.ProtoMajor = 1
-				resp.ProtoMinor = 1
-			}
+			NormalizeResponseProto(resp)
 
-			if resp.Proto != "HTTP/1.1" {
-				t.Errorf("Proto = %q, want %q", resp.Proto, "HTTP/1.1")
+			if resp.Proto != tt.wantProto {
+				t.Errorf("Proto = %q, want %q", resp.Proto, tt.wantProto)
 			}
-			if resp.ProtoMajor != 1 {
-				t.Errorf("ProtoMajor = %d, want 1", resp.ProtoMajor)
+			if resp.ProtoMajor != tt.wantMajor {
+				t.Errorf("ProtoMajor = %d, want %d", resp.ProtoMajor, tt.wantMajor)
 			}
-			if resp.ProtoMinor != 1 {
-				t.Errorf("ProtoMinor = %d, want 1", resp.ProtoMinor)
+			if resp.ProtoMinor != tt.wantMinor {
+				t.Errorf("ProtoMinor = %d, want %d", resp.ProtoMinor, tt.wantMinor)
 			}
 		})
 	}
+}
+
+func TestNormalizeResponseProtoNilIsSafe(t *testing.T) {
+	// The OnResponse handler can be reached with a nil response.
+	NormalizeResponseProto(nil)
 }
 
 // timeoutError implements net.Error with Timeout() == true.
@@ -976,5 +928,55 @@ func TestMakeTLSDialerInvalidAddress(t *testing.T) {
 	_, err := dialer(context.Background(), "tcp", "no-port")
 	if err == nil {
 		t.Fatal("expected error for invalid address")
+	}
+}
+
+// TestNewOutboundTransport exercises the real construction used by main.
+// The tests this replaces built an http.Transport literal inside the test and
+// asserted the fields they had just set, so zero repository code ran and the
+// actual transport was uncovered.
+func TestNewOutboundTransport(t *testing.T) {
+	baseTLS := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+	rc := &config.RuntimeConfig{}
+	_ = rc.Update(config.Config{}, config.CompiledACL{}, nil, baseTLS, nil, nil)
+
+	opts := OutboundTransportOptions{
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       64,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	tr := NewOutboundTransport(baseTLS, rc, opts)
+
+	if tr.TLSClientConfig != baseTLS {
+		t.Error("TLSClientConfig was not carried through")
+	}
+	if !slices.Contains(tr.TLSClientConfig.NextProtos, "h2") || !tr.ForceAttemptHTTP2 {
+		t.Error("HTTP/2 must stay enabled with custom dial functions set")
+	}
+	if tr.DialContext == nil {
+		t.Error("DialContext must be set, or split-brain DNS does not apply to plain HTTP")
+	}
+	if tr.DialTLSContext == nil {
+		t.Error("DialTLSContext must be set, or per-rewrite insecure does not apply")
+	}
+
+	// MaxConnsPerHost is the ephemeral-port guard: many client hostnames collapse
+	// onto one target_ip in a split-brain proxy.
+	if tr.MaxConnsPerHost != opts.MaxConnsPerHost {
+		t.Errorf("MaxConnsPerHost = %d, want %d", tr.MaxConnsPerHost, opts.MaxConnsPerHost)
+	}
+	if tr.MaxIdleConns != opts.MaxIdleConns {
+		t.Errorf("MaxIdleConns = %d, want %d", tr.MaxIdleConns, opts.MaxIdleConns)
+	}
+	if tr.MaxIdleConnsPerHost != opts.MaxIdleConnsPerHost {
+		t.Errorf("MaxIdleConnsPerHost = %d, want %d", tr.MaxIdleConnsPerHost, opts.MaxIdleConnsPerHost)
+	}
+	if tr.ResponseHeaderTimeout != opts.ResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, opts.ResponseHeaderTimeout)
 	}
 }
