@@ -54,7 +54,11 @@ cmd/mitm-proxy/main.go        # CLI entrypoint: arg parsing, signal handling, wi
 internal/config/config.go      # Types, YAML loading, validation, env overrides, ACL/rewrite compilation
 internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
 internal/cert/gencert.go       # gencert subcommand + key pair generation
+internal/netx/halfclose.go     # Half-close preservation shared by proxy and trace
 internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, domain metrics
+internal/proxy/connect.go      # CONNECT decision handling, reject responses, passthrough trace wiring
+internal/proxy/listener.go     # Connection-tracking listener for CONNECT-tunnel drain
+internal/proxy/transport.go    # Per-rewrite-target upstream transport pool
 internal/proxy/connect.go      # CONNECT-stage handler: policy dispatch, reject, passthrough trace wiring
 internal/proxy/transport.go    # Per-rewrite-target transport pool (correct connection-pool keying)
 internal/proxy/listener.go     # Connection-tracking listener (drains hijacked CONNECT tunnels)
@@ -70,11 +74,12 @@ e2e_test.go                    # End-to-end tests (build tag: e2e, uses testcont
 ```
 metrics     → (none)
 health      → (none)
-config      → metrics
+netx        → (none)
+config      → (none)
 cert        → config
-trace       → config, metrics
-proxy       → config, metrics, cert, trace
-cmd/main    → config, cert, proxy, metrics, health, trace
+trace       → config, metrics, netx
+proxy       → config, metrics, netx, trace
+cmd/main    → cert, config, health, metrics, proxy, trace
 ```
 
 **Request Flow:**
@@ -252,7 +257,7 @@ internal/health/
 e2e_test.go                    # End-to-end tests (build tag: e2e, Docker-based)
 Makefile                       # Build and dev commands
 .golangci.yml                  # Linter configuration
-.github/workflows/ci.yaml     # CI pipeline (branch pushes + PRs to main)
+.github/workflows/ci.yaml     # CI pipeline (pull requests targeting main)
 .github/workflows/release.yaml # Release pipeline (main pushes/tags; publishes on v* tags)
 .github/dependabot.yml         # Dependency updates
 docker-compose.yaml            # Local dev environment

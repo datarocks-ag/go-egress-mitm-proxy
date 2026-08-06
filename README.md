@@ -190,6 +190,31 @@ Each rewrite rule supports these fields:
 | `drop_headers` | no | List of header names to remove before forwarding |
 | `insecure` | no | Skip upstream TLS verification for this target only |
 
+### Domain Pattern Semantics
+
+ACL entries, rewrite `domain` values and trace `host` values share one syntax.
+Two properties matter for denylists, because getting them wrong fails open
+silently — the config loads, `validate` passes, and the entry enforces nothing.
+
+| Pattern | Matches | Does **not** match |
+|---------|---------|--------------------|
+| `example.com` | `example.com`, `EXAMPLE.com`, `example.com.` | `api.example.com` |
+| `*.example.com` | `api.example.com`, `a.b.example.com` | `example.com` (the apex) |
+| `*` | every host | — |
+| `~^(.+\.)?example\.com$` | the apex and any subdomain | `example.com.evil.net` |
+
+- **A `*.` wildcard does not cover the apex.** To deny a domain and everything
+  under it, list both `example.com` and `*.example.com`, or use one `~` pattern.
+- **`~` patterns are anchored**, wrapped as `(?i)^(?:...)$`. They are not
+  substring matches: `~api\.corp\.com` does not match
+  `api.corp.com.attacker.net`. Patterns that already carry `^`/`$` are
+  unaffected. (Trace `url` patterns are the deliberate exception and remain
+  substring matches.)
+- Matching is case-insensitive, and a trailing dot is stripped before matching,
+  so `EXAMPLE.com.` cannot slip past an entry for `example.com`.
+- A `*` anywhere other than a leading `*.` label is a load error rather than a
+  pattern that matches nothing.
+
 ### Response Status Codes
 
 | Code | Meaning | When |
@@ -462,7 +487,7 @@ For deep debugging of a specific subset of traffic, configure a `trace:` block. 
 trace:
   enabled: true
   log_path: "/var/log/mitm-proxy/trace.jsonl"  # optional; omit to use the main log stream
-  redact_query: true                            # mask ?token=... query-string values
+  redact_query: true                            # mask ?token=... query values (default: true)
   redact_headers:                               # extends the built-in masked set
     - "X-Api-Key"
   log_secrets: false                            # escape hatch: true logs everything verbatim
@@ -493,7 +518,7 @@ Each record captures:
 
 **Matching:** rules are OR'd; within a single rule, `host` and `url` must both match (use separate rules for OR). `host`/`url` use the same convention as ACL/rewrites (wildcard, or `~` for raw regex).
 
-**Redaction is secure-by-default.** `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always masked; `redact_headers` extends the set and `redact_query` masks query values. Set `log_secrets: true` to disable all redaction (use with care — these logs may be shipped/retained).
+**Redaction is secure-by-default.** `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always masked; `redact_headers` extends the set, and `redact_query` masks query-string values and **defaults to `true`** — set it to `false` to opt out. Set `log_secrets: true` to disable all redaction (use with care — these logs may be shipped/retained).
 
 **Passthrough hosts** (non-MITM tunnels) are traced TCP-only: connected IP, dial timing, and bytes transferred. Headers and bodies are inherently invisible because the traffic is not intercepted.
 

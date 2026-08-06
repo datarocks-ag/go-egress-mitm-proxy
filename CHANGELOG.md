@@ -76,22 +76,52 @@ Findings from a full multi-lens code review of `main`, grouped by area:
 - `gencert` creates its output directories, so the documented Quick Start works
   on a fresh clone.
 
+### Breaking
+- **Configs containing a misplaced `*` no longer load.** Only a leading `*.`
+  label is expanded; a `*` anywhere else survived escaping and was then anchored,
+  so `api.*.evil.com` compiled to a pattern that matched nothing. On a blacklist
+  that fails open — the entry blocked nothing, `validate` reported the file as
+  valid, and every host it was meant to deny was `ALLOWED-BY-DEFAULT`. Such a
+  pattern is now a load error naming the offending entry. The bare `*.` form is
+  rejected for the same reason. Use a `~` prefix for a raw regex if you need a
+  `*` elsewhere. **Run `mitm-proxy validate --config <file>` before upgrading:**
+  a config that silently under-enforced will now refuse to start.
+
 ### Changed
 - Server timeouts: `ReadTimeout`/`WriteTimeout` replaced with
   `ReadHeaderTimeout`. The old absolute deadlines severed plain-HTTP transfers
   at 60s mid-body while leaving every CONNECT tunnel unbounded, since hijacking
   clears the deadline.
-- `MaxConnsPerHost` is now set, bounding active upstream connections; idle
-  connection limits are sized per transport rather than assuming one global pool.
+- Idle connection limits are sized per transport rather than assuming a single
+  global pool, since `TransportPool` clones a transport per rewrite target.
+  `MaxConnsPerHost` is deliberately left unset: Go keys it on the request URL
+  host, which is computed before the dialer substitutes `target_ip`, so it does
+  not bound sockets to a shared upstream IP — and on reaching the cap it parks
+  requests with no deadline, trading a bound for unbounded latency.
+  `TransportPool.Len()` makes pool growth observable instead.
 - The example configuration ships with `trace.enabled: false`. It is the file the
   Quick Start copies, and the previous default both failed validation (its
   `log_path` parent directory does not exist) and captured full headers and
   bodies by default.
 - `cert.BuildOutboundTLSConfig` and `cert.LoadCertPool` now return errors.
+- `trace.redact_query` defaults to `true`. Query strings routinely carry tokens
+  in `?access_token=`/`?sig=` form, so the safe setting is the one you get by
+  omitting the field; set `redact_query: false` to opt out.
+- Trace records reach the main log stream at the default (warn) verbosity. They
+  are written at info, so with no `trace.log_path` set they were previously
+  discarded by the default handler while `proxy_trace_records_total` still
+  counted them — the counter and the log disagreed permanently. The main-stream
+  trace logger now always admits info, and the counter only advances when a
+  record is actually written.
 - Kubernetes example manifests: corrected the config mount path (the container
   read `/app/config.yaml` while the ConfigMap mounted at `/root/config.yaml`, so
   it exited on start), fixed a whitelist pattern that could never match, and
   added readiness/liveness probes with a grace period exceeding the drain budget.
+
+### Added
+- `PROXY_PRESTOP_GRACE` (default `10s`): how long to keep serving after `/readyz`
+  starts failing on SIGTERM, so load balancers observe the failure and route away
+  before the listener closes. Set `0` when a `preStop` hook already sleeps.
 
 ## [3.0.0] - 2026-06-03
 
