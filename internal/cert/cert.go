@@ -18,7 +18,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -191,17 +190,30 @@ func SignHost(ca tls.Certificate, hosts []string, org string) (*tls.Certificate,
 		return nil, fmt.Errorf("sign certificate: %w", err)
 	}
 
+	// Attach the full CA chain, not just ca.Certificate[0]. With a
+	// root -> int1 -> int2 hierarchy, gencert --out-chain emits three certs;
+	// presenting only leaf + int2 leaves a root-only client unable to build a
+	// path, and every handshake fails with "unknown authority".
+	chain := make([][]byte, 0, 1+len(ca.Certificate))
+	chain = append(chain, certDER)
+	chain = append(chain, ca.Certificate...)
+
 	return &tls.Certificate{
-		Certificate: [][]byte{certDER, ca.Certificate[0]},
+		Certificate: chain,
 		PrivateKey:  privKey,
 	}, nil
 }
 
-// MitmTLSConfigFromCA returns a TLS config callback that generates leaf certificates
-// with the specified Organization, using the given CA. A sync.Map cache avoids
-// regenerating certificates for the same host.
-func MitmTLSConfigFromCA(ca *tls.Certificate, org string) func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
-	certCache := &sync.Map{}
+// MitmTLSConfigFromCA returns a TLS config callback that generates leaf
+// certificates with the specified Organization, using the given CA.
+//
+// store bounds and expires the cache; pass the same store used for
+// proxy.CertStore so both signing paths share one caching policy instead of the
+// policy depending on whether mitm_org happens to be set.
+func MitmTLSConfigFromCA(ca *tls.Certificate, org string, store *CertStore) func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
+	if store == nil {
+		store = NewCertStore(DefaultCertCacheSize, DefaultCertTTL)
+	}
 	return func(host string, _ *goproxy.ProxyCtx) (*tls.Config, error) {
 		// Strip port if present
 		hostname, _, err := net.SplitHostPort(host)
@@ -209,20 +221,13 @@ func MitmTLSConfigFromCA(ca *tls.Certificate, org string) func(host string, ctx 
 			hostname = host
 		}
 
-		if cached, ok := certCache.Load(hostname); ok {
-			cert := cached.(*tls.Certificate) //nolint:errcheck // stored type is always *tls.Certificate
-			return &tls.Config{
-				Certificates: []tls.Certificate{*cert},
-				MinVersion:   tls.VersionTLS12,
-			}, nil
-		}
-
-		cert, err := SignHost(*ca, []string{hostname}, org)
+		cert, err := store.Fetch(hostname, func() (*tls.Certificate, error) {
+			return SignHost(*ca, []string{hostname}, org)
+		})
 		if err != nil {
 			return nil, err
 		}
 
-		certCache.Store(hostname, cert)
 		return &tls.Config{
 			Certificates: []tls.Certificate{*cert},
 			MinVersion:   tls.VersionTLS12,
@@ -230,9 +235,20 @@ func MitmTLSConfigFromCA(ca *tls.Certificate, org string) func(host string, ctx 
 	}
 }
 
-// LoadCertPool loads the system CA pool, optionally appends a PEM CA bundle, individual CA cert
-// files, and/or certificates from a PKCS#12 truststore. All sources are additive.
-func LoadCertPool(caBundle string, certPaths []string, truststorePath, truststorePassword string) *x509.CertPool {
+// LoadCertPool loads the system CA pool, optionally appending a PEM CA bundle,
+// individual CA cert files, and/or certificates from a PKCS#12 truststore. All
+// sources are additive.
+//
+// A configured CA source that cannot be loaded is an error, not a warning. It
+// previously warned and continued, so a typo'd path or an undecodable truststore
+// produced a silently degraded pool: upstream verification then failed for every
+// request, which is fail-closed and therefore safe, but the operator saw a WARN
+// next to "Configuration reloaded successfully" and an incremented success
+// counter. Failing loudly is what makes that diagnosable.
+//
+// A missing *system* pool is still only a warning: it is not something the
+// operator configured, and the explicit sources may well be sufficient.
+func LoadCertPool(caBundle string, certPaths []string, truststorePath, truststorePassword string) (*x509.CertPool, error) {
 	pool, err := x509.SystemCertPool()
 	if err != nil {
 		slog.Warn("Failed to load system cert pool, using empty pool", "err", err)
@@ -241,9 +257,10 @@ func LoadCertPool(caBundle string, certPaths []string, truststorePath, truststor
 	if caBundle != "" {
 		ca, readErr := os.ReadFile(caBundle)
 		if readErr != nil {
-			slog.Warn("Failed to read CA bundle", "path", caBundle, "err", readErr)
-		} else if !pool.AppendCertsFromPEM(ca) {
-			slog.Warn("Failed to parse CA bundle", "path", caBundle)
+			return nil, fmt.Errorf("read CA bundle %q: %w", caBundle, readErr)
+		}
+		if !pool.AppendCertsFromPEM(ca) {
+			return nil, fmt.Errorf("CA bundle %q contains no usable PEM certificates", caBundle)
 		}
 	}
 	for _, p := range certPaths {
@@ -252,31 +269,37 @@ func LoadCertPool(caBundle string, certPaths []string, truststorePath, truststor
 		}
 		ca, readErr := os.ReadFile(p)
 		if readErr != nil {
-			slog.Warn("Failed to read CA cert", "path", p, "err", readErr)
-			continue
+			return nil, fmt.Errorf("read CA cert %q: %w", p, readErr)
 		}
 		if !pool.AppendCertsFromPEM(ca) {
-			slog.Warn("Failed to parse CA cert", "path", p)
+			return nil, fmt.Errorf("CA cert %q contains no usable PEM certificates", p)
 		}
 	}
 	if truststorePath != "" {
 		certs, tsErr := LoadTruststoreCerts(truststorePath, truststorePassword)
 		if tsErr != nil {
-			slog.Warn("Failed to load truststore", "path", truststorePath, "err", tsErr)
-		} else {
-			for _, cert := range certs {
-				pool.AddCert(cert)
-			}
-			slog.Info("Loaded truststore certificates", "path", truststorePath, "count", len(certs))
+			return nil, fmt.Errorf("load truststore %q: %w", truststorePath, tsErr)
 		}
+		for _, cert := range certs {
+			pool.AddCert(cert)
+		}
+		slog.Info("Loaded truststore certificates", "path", truststorePath, "count", len(certs))
 	}
-	return pool
+	return pool, nil
 }
 
-// BuildOutboundTLSConfig builds a tls.Config for outbound connections from the given proxy config.
-func BuildOutboundTLSConfig(cfg config.Config) *tls.Config {
+// BuildOutboundTLSConfig builds a tls.Config for outbound connections from the
+// given proxy config. It fails when a configured CA source cannot be loaded, so
+// startup aborts and a reload keeps the previous config instead of installing a
+// degraded pool.
+func BuildOutboundTLSConfig(cfg config.Config) (*tls.Config, error) {
+	pool, err := LoadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingCA, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword)
+	if err != nil {
+		return nil, err
+	}
+
 	tlsCfg := &tls.Config{
-		RootCAs:    LoadCertPool(cfg.Proxy.OutgoingCABundle, cfg.Proxy.OutgoingCA, cfg.Proxy.OutgoingTruststorePath, cfg.Proxy.OutgoingTruststorePassword),
+		RootCAs:    pool,
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2", "http/1.1"},
 	}
@@ -284,7 +307,7 @@ func BuildOutboundTLSConfig(cfg config.Config) *tls.Config {
 		slog.Warn("Global insecure_skip_verify is ENABLED — upstream TLS certificate verification is disabled")
 		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: user-configured global insecure for dev/test
 	}
-	return tlsCfg
+	return tlsCfg, nil
 }
 
 // LoadTruststoreCerts extracts CA certificates from a PKCS#12 (.p12) truststore.
