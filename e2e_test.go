@@ -500,9 +500,11 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("https_blacklisted_returns_403", func(t *testing.T) {
-		// HTTPS to blacklisted.example.com through the MITM proxy.
-		// The proxy does AlwaysMitm (CONNECT accepted, TLS established),
-		// then handleRequest sees the blacklisted domain and returns 403.
+		// HTTPS to blacklisted.example.com through the proxy. The blacklist is now
+		// evaluated at CONNECT time, before any tunnel is established, so the 403
+		// is written to the raw client connection instead of through the MITM'd
+		// request. The client-visible outcome is unchanged, which is the point:
+		// rejecting earlier must not turn a documented 403 into a dropped socket.
 		resp, err := doGet(ctx, tlsClient, "https://blacklisted.example.com/")
 		if err != nil {
 			t.Fatalf("request failed: %v", err)

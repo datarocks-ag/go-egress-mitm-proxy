@@ -179,13 +179,21 @@ func TestRawRegexAlternationSurvivesAnchoring(t *testing.T) {
 	}
 }
 
-// TestDecideConnectChecksBlacklistBeforePassthrough pins the ordering. An
-// accepted passthrough tunnel never reaches HandleRequest, so if passthrough
-// were tested first a broad passthrough pattern would void overlapping
-// blacklist entries entirely.
-func TestDecideConnectChecksBlacklistBeforePassthrough(t *testing.T) {
+// TestDecideConnectRejectsOnlyUninspectableTunnels pins which hosts are refused
+// at CONNECT time and which are intercepted instead.
+//
+// Rejection exists for one case: a host that would be tunneled without
+// interception. Passthrough returns ConnectAccept and never reaches
+// HandleRequest, so a passthrough pattern overlapping a blacklist entry would
+// hand out an uninspected tunnel to a denied host.
+//
+// A blacklisted host that is *not* passthrough is still MITM'd. Nothing is
+// forwarded upstream before HandleRequest applies policy, so it is blocked
+// either way -- but the client gets a readable 403 instead of a rejected
+// CONNECT, which Go surfaces as an opaque transport error.
+func TestDecideConnectRejectsOnlyUninspectableTunnels(t *testing.T) {
 	cfg := config.Config{}
-	cfg.ACL.Blacklist = []string{"leaked.vault.internal"}
+	cfg.ACL.Blacklist = []string{"leaked.vault.internal", "evil.example.com"}
 	cfg.ACL.Passthrough = []string{"*.vault.internal"} // the README's recommended shape
 
 	acl, err := config.CompileACL(cfg)
@@ -197,9 +205,10 @@ func TestDecideConnectChecksBlacklistBeforePassthrough(t *testing.T) {
 		host string
 		want ConnectDecision
 	}{
-		{"leaked.vault.internal", ConnectReject},  // in both lists: blacklist wins
+		{"leaked.vault.internal", ConnectReject},  // passthrough + blacklist: must not tunnel
 		{"LEAKED.Vault.Internal", ConnectReject},  // and regardless of spelling
 		{"ok.vault.internal", ConnectPassthrough}, // passthrough only
+		{"evil.example.com", ConnectMITM},         // blacklisted, but inspectable: 403 via HandleRequest
 		{"api.example.com", ConnectMITM},          // neither
 	}
 

@@ -125,7 +125,8 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `MakeDialer()` - Custom DialContext for plain HTTP split-brain DNS; reads context-based rewrites first
 - `MakeTLSDialer()` - Custom DialTLSContext for HTTPS with per-rewrite InsecureSkipVerify; reads context-based rewrites first
 - `NormalizeDomainForMetrics()` - Bounds metrics cardinality
-- `DecideConnect()` - ACL policy for a CONNECT target. **The blacklist is checked before passthrough**, and the order is load-bearing: a passthrough match accepts the tunnel, and an accepted tunnel never reaches `HandleRequest`, where every other blacklist check happens
+- `DecideConnect()` - ACL policy for a CONNECT target. Rejects **only** a host that is both passthrough and blacklisted: passthrough accepts an uninspected tunnel that never reaches `HandleRequest`, so a denied host must not get one. Every other host is intercepted, blacklisted or not — nothing is forwarded upstream before `HandleRequest` applies policy, and the client gets a readable 403 instead of a rejected CONNECT that clients surface as an opaque transport error
+- `LogBlocked()` - Shared blocked-request audit log emission, used by both the request path and the CONNECT reject path
 - `NormalizeResponseProto()` - Forces HTTP/1.1 framing so goproxy's `resp.Write()` cannot emit an unusable status line
 - `NewOutboundTransport()` - Builds the upstream transport (extracted from main so the real construction is testable)
 - `TrackingListener` - Counts client connections at the listener. `http.Server` cannot drain this proxy's main traffic class, because goproxy hijacks the connection for every CONNECT and the server stops tracking hijacked connections
@@ -146,7 +147,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - Per-rewrite `target_scheme`: optional `"http"` or `"https"` to change the request scheme before forwarding (e.g., HTTPS client → HTTP backend)
 - Per-rewrite `drop_headers`: list of header names to strip from the request before forwarding (case-insensitive via `r.Header.Del()`)
 - Per-rewrite `path_pattern`: optional regex matched against `r.URL.Path` for path-based routing (rules evaluated in YAML order, first match wins; passed to dialers via request context)
-- Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation
+- Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation. Written from `proxy.LogBlocked`, called from both the request path and the CONNECT reject path — a rejected tunnel never reaches `HandleRequest`, so without the second call site the log would silently omit those hosts
 - Selective request tracing (`trace:` block, see below)
 - Hot reload via SIGHUP signal
 

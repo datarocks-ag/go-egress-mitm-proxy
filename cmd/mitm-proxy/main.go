@@ -296,11 +296,38 @@ func main() {
 			decision := proxy.DecideConnect(hostname, currentACL)
 
 			if decision == proxy.ConnectReject {
+				requestID := proxy.GenerateRequestID()
 				slog.Warn("BLACK-LISTED",
+					"request_id", requestID,
 					"host", hostname,
 					"client", ctx.Req.RemoteAddr)
 				metricDomain := proxy.NormalizeDomainForMetrics(hostname, rewriteExact, currentACL)
 				metrics.TrafficTotal.WithLabelValues(metricDomain, "BLACK-LISTED").Inc()
+
+				// A rejected tunnel never reaches HandleRequest, so this is the only
+				// place the blocked-request audit log can learn about a blacklisted
+				// HTTPS host. Without it the log silently omits all of them.
+				proxy.LogBlocked(runtimeCfg, proxy.BlockedRequest{
+					RequestID: requestID,
+					Client:    ctx.Req.RemoteAddr,
+					Host:      hostname,
+					Method:    ctx.Req.Method,
+					Path:      ctx.Req.URL.Path,
+					Action:    "BLACK-LISTED",
+				})
+
+				// goproxy writes ctx.Resp to the hijacked client connection when it is
+				// set, and closes the socket silently when it is not. Leaving it unset
+				// turned a documented 403 into "unexpected EOF" for every blacklisted
+				// HTTPS host. NewResponse leaves the Proto fields zeroed, which would
+				// serialize as "HTTP/0.0"; normalizing is what makes the status line
+				// usable on a raw connection.
+				//nolint:bodyclose // synthetic response; goproxy writes and closes it
+				rejectResp := goproxy.NewResponse(ctx.Req,
+					goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
+				proxy.NormalizeResponseProto(rejectResp)
+				ctx.Resp = rejectResp
+
 				return goproxy.RejectConnect, host
 			}
 
