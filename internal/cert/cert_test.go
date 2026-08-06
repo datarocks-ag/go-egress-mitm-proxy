@@ -1207,8 +1207,14 @@ func TestSignHostAttachesFullChain(t *testing.T) {
 	// proxy presents.
 	roots := x509.NewCertPool()
 	roots.AddCert(rootCert)
+	// Intermediates only. x509.Verify tolerates a root in this pool, so including
+	// it would let the test pass on verifier leniency rather than on the chain
+	// the proxy actually presents.
 	intermediates := x509.NewCertPool()
 	for _, der := range leaf.Certificate[1:] {
+		if bytes.Equal(der, rootDER) {
+			continue
+		}
 		c, parseErr := x509.ParseCertificate(der)
 		if parseErr != nil {
 			t.Fatal(parseErr)

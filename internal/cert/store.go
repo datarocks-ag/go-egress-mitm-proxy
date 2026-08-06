@@ -46,8 +46,21 @@ type CertStore struct {
 	entries map[string]*list.Element
 	order   *list.List // front = most recently used
 
+	// inflight tracks generations in progress, keyed by hostname, so concurrent
+	// first-use of one host signs once without the lock being held across gen().
+	inflight map[string]*inflightGen
+
 	// now is overridable so TTL expiry is testable without sleeping.
 	now func() time.Time
+}
+
+// inflightGen lets callers wait on a generation another goroutine started.
+// cert and err are written before done is closed, which is the happens-before
+// edge for every waiter.
+type inflightGen struct {
+	done chan struct{}
+	cert *tls.Certificate
+	err  error
 }
 
 type certEntry struct {
@@ -66,47 +79,93 @@ func NewCertStore(maxSize int, ttl time.Duration) *CertStore {
 		ttl = DefaultCertTTL
 	}
 	return &CertStore{
-		maxSize: maxSize,
-		ttl:     ttl,
-		entries: make(map[string]*list.Element, maxSize),
-		order:   list.New(),
-		now:     time.Now,
+		maxSize:  maxSize,
+		ttl:      ttl,
+		entries:  make(map[string]*list.Element, maxSize),
+		order:    list.New(),
+		inflight: make(map[string]*inflightGen),
+		now:      time.Now,
 	}
 }
 
 // Fetch returns the cached certificate for hostname, generating and storing one
 // via gen on a miss or when the cached entry has expired.
 //
-// This is goproxy's CertStorage contract. gen is called with the lock held so
-// concurrent CONNECTs to the same new host sign once rather than racing to
-// produce duplicates — signing is the expensive operation this store exists to
-// avoid.
+// This is goproxy's CertStorage contract.
+//
+// gen runs *without* the store lock held. Signing is slow -- an RSA CA means a
+// fresh RSA-2048 key pair, tens of milliseconds -- and holding one global mutex
+// across it would stall every other Fetch, including cache hits for unrelated
+// hosts, behind a single cold host. Concurrent first-use of the *same* host
+// still signs only once: the first caller registers an in-flight generation and
+// the rest wait on it.
 func (s *CertStore) Fetch(hostname string, gen func() (*tls.Certificate, error)) (*tls.Certificate, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	if elem, ok := s.entries[hostname]; ok {
-		entry := elem.Value.(*certEntry) //nolint:errcheck // stored type is always *certEntry
-		if s.now().Before(entry.expiresAt) {
-			s.order.MoveToFront(elem)
-			return entry.cert, nil
-		}
-		// Expired: drop it and fall through to regenerate.
-		s.order.Remove(elem)
-		delete(s.entries, hostname)
+	if cert, ok := s.lookupLocked(hostname); ok {
+		s.mu.Unlock()
+		return cert, nil
 	}
+
+	if call, ok := s.inflight[hostname]; ok {
+		s.mu.Unlock()
+		<-call.done
+		return call.cert, call.err
+	}
+
+	call := &inflightGen{done: make(chan struct{})}
+	s.inflight[hostname] = call
+	s.mu.Unlock()
 
 	cert, err := gen()
-	if err != nil {
-		return nil, err
+
+	s.mu.Lock()
+	delete(s.inflight, hostname)
+	if err == nil {
+		s.insertLocked(hostname, cert)
+	}
+	s.mu.Unlock()
+
+	// Publish before closing: waiters read these only after done is closed.
+	call.cert, call.err = cert, err
+	close(call.done)
+
+	return cert, err
+}
+
+// lookupLocked returns a live cached certificate, dropping it if it has expired.
+// Callers must hold s.mu.
+func (s *CertStore) lookupLocked(hostname string) (*tls.Certificate, bool) {
+	elem, ok := s.entries[hostname]
+	if !ok {
+		return nil, false
+	}
+	entry, ok := elem.Value.(*certEntry)
+	if !ok {
+		return nil, false // unreachable: only *certEntry is ever stored
+	}
+	if !s.now().Before(entry.expiresAt) {
+		s.order.Remove(elem)
+		delete(s.entries, hostname)
+		return nil, false
+	}
+	s.order.MoveToFront(elem)
+	return entry.cert, true
+}
+
+// insertLocked adds a certificate and evicts the least recently used entries
+// until the store is within its bound. Callers must hold s.mu.
+func (s *CertStore) insertLocked(hostname string, cert *tls.Certificate) {
+	// A concurrent Fetch for the same host may have inserted already.
+	if elem, ok := s.entries[hostname]; ok {
+		s.order.Remove(elem)
 	}
 
-	elem := s.order.PushFront(&certEntry{
+	s.entries[hostname] = s.order.PushFront(&certEntry{
 		hostname:  hostname,
 		cert:      cert,
 		expiresAt: s.now().Add(s.ttl),
 	})
-	s.entries[hostname] = elem
 
 	for s.order.Len() > s.maxSize {
 		oldest := s.order.Back()
@@ -114,10 +173,10 @@ func (s *CertStore) Fetch(hostname string, gen func() (*tls.Certificate, error))
 			break
 		}
 		s.order.Remove(oldest)
-		delete(s.entries, oldest.Value.(*certEntry).hostname) //nolint:errcheck // stored type is always *certEntry
+		if entry, ok := oldest.Value.(*certEntry); ok {
+			delete(s.entries, entry.hostname)
+		}
 	}
-
-	return cert, nil
 }
 
 // Len reports how many certificates are currently cached.
@@ -134,4 +193,7 @@ func (s *CertStore) Clear() {
 	defer s.mu.Unlock()
 	s.entries = make(map[string]*list.Element, s.maxSize)
 	s.order.Init()
+	// In-flight generations are deliberately left alone: they will complete and
+	// insert a certificate signed by the current CA, which is what a caller
+	// waiting on them should get.
 }

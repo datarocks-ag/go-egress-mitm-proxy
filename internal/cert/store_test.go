@@ -195,3 +195,90 @@ func TestCertStoreConcurrentFetchSignsOnce(t *testing.T) {
 		t.Errorf("generator called %d times under concurrent first-use, want 1", calls)
 	}
 }
+
+// TestCertStoreSlowGenerationDoesNotBlockOtherHosts pins the head-of-line
+// property. Signing is slow -- an RSA CA means a fresh key pair per call -- so
+// holding one global lock across it would stall every other Fetch, including
+// cache hits for unrelated hosts, behind a single cold host.
+func TestCertStoreSlowGenerationDoesNotBlockOtherHosts(t *testing.T) {
+	s := NewCertStore(10, time.Hour)
+
+	// Warm a cache entry for a second host.
+	warm := 0
+	if _, err := s.Fetch("warm.example.com", stubGen(&warm)); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	slowStarted := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := s.Fetch("slow.example.com", func() (*tls.Certificate, error) {
+			close(slowStarted)
+			<-release // hold the generation open
+			return &tls.Certificate{Certificate: [][]byte{[]byte("slow")}}, nil
+		}); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	<-slowStarted
+
+	// While that generation is in flight, an unrelated cache hit must complete.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := s.Fetch("warm.example.com", stubGen(&warm)); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("a cache hit blocked behind an unrelated in-flight generation")
+	}
+
+	close(release)
+	wg.Wait()
+}
+
+// TestCertStoreConcurrentSameHostSignsOnceWithoutHoldingLock complements the
+// above: same-host concurrency must still collapse to a single signature, even
+// though the lock is no longer held across gen().
+func TestCertStoreConcurrentSameHostSignsOnceWithoutHoldingLock(t *testing.T) {
+	s := NewCertStore(10, time.Hour)
+
+	var mu sync.Mutex
+	calls := 0
+	counted := 0
+	gen := func() (*tls.Certificate, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		// Stay in flight long enough for the other goroutines to arrive.
+		time.Sleep(50 * time.Millisecond)
+		return stubGen(&counted)()
+	}
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Fetch("burst.example.com", gen); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Errorf("generator called %d times for one host under concurrency, want 1", calls)
+	}
+}

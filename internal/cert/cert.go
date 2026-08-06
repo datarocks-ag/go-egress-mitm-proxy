@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -210,9 +211,14 @@ func SignHost(ca tls.Certificate, hosts []string, org string) (*tls.Certificate,
 // store bounds and expires the cache; pass the same store used for
 // proxy.CertStore so both signing paths share one caching policy instead of the
 // policy depending on whether mitm_org happens to be set.
+//
+// A nil store falls back to a package-level shared default rather than a fresh
+// one. Minting a new cache per call would quietly reintroduce exactly the
+// divergence this parameter exists to remove -- two signing paths with separate
+// caches -- and would do it invisibly.
 func MitmTLSConfigFromCA(ca *tls.Certificate, org string, store *CertStore) func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
 	if store == nil {
-		store = NewCertStore(DefaultCertCacheSize, DefaultCertTTL)
+		store = sharedDefaultStore()
 	}
 	return func(host string, _ *goproxy.ProxyCtx) (*tls.Config, error) {
 		// Strip port if present
@@ -233,6 +239,20 @@ func MitmTLSConfigFromCA(ca *tls.Certificate, org string, store *CertStore) func
 			MinVersion:   tls.VersionTLS12,
 		}, nil
 	}
+}
+
+var (
+	defaultStoreOnce sync.Once
+	defaultStore     *CertStore
+)
+
+// sharedDefaultStore returns the process-wide fallback certificate cache, so
+// every caller that does not supply one still converges on a single cache.
+func sharedDefaultStore() *CertStore {
+	defaultStoreOnce.Do(func() {
+		defaultStore = NewCertStore(DefaultCertCacheSize, DefaultCertTTL)
+	})
+	return defaultStore
 }
 
 // LoadCertPool loads the system CA pool, optionally appending a PEM CA bundle,
