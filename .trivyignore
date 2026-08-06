@@ -1,0 +1,12 @@
+# Vulnerabilities accepted for this repository.
+#
+# The Security Scan job fails the build on CRITICAL/HIGH findings that have a
+# fix available (ignore-unfixed is on). When a finding is genuinely not
+# applicable or cannot be actioned yet, record it here with a reason and a date
+# so the exception is reviewable rather than invisible.
+#
+# Format: one CVE ID per line.
+#
+# Example:
+#   # CVE-2026-12345 - in a code path this proxy never reaches (reviewed 2026-08-06)
+#   CVE-2026-12345
