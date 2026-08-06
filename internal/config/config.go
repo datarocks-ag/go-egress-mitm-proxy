@@ -192,7 +192,7 @@ func CompileTrace(tc TraceConfig) (CompiledTrace, error) {
 			cr.Host = re
 		}
 		if r.URL != "" {
-			re, err := WildcardToRegex(r.URL)
+			re, err := WildcardToURLRegex(r.URL)
 			if err != nil {
 				return CompiledTrace{}, fmt.Errorf("invalid trace url[%d] %q: %w", i, r.URL, err)
 			}
@@ -283,18 +283,21 @@ func (rc *RuntimeConfig) Update(cfg Config, acl CompiledACL, rewrites []Compiled
 	// Collect domains that have at least one path-based rule.
 	// These domains must be excluded from the exact map so that all their rules
 	// are evaluated sequentially (preserving YAML order / first-match-wins).
+	// Keys are normalized because lookups come from NormalizeHost; a config
+	// author writing "API.Internal" must still match a request for "api.internal".
 	domainsWithPath := make(map[string]bool)
 	for i := range rewrites {
 		if rewrites[i].PathPattern != nil {
-			domainsWithPath[rewrites[i].Original] = true
+			domainsWithPath[NormalizeHost(rewrites[i].Original)] = true
 		}
 	}
 
 	exactMap := make(map[string]*CompiledRewriteRule)
 	for i := range rewrites {
-		if !strings.Contains(rewrites[i].Original, "*") && !domainsWithPath[rewrites[i].Original] {
-			if _, exists := exactMap[rewrites[i].Original]; !exists {
-				exactMap[rewrites[i].Original] = &rewrites[i]
+		key := NormalizeHost(rewrites[i].Original)
+		if !strings.Contains(key, "*") && !domainsWithPath[key] {
+			if _, exists := exactMap[key]; !exists {
+				exactMap[key] = &rewrites[i]
 			}
 		}
 	}
@@ -476,15 +479,18 @@ func (c *Config) Validate() error {
 	// Detect duplicate exact domains without path_pattern (second rule would be unreachable).
 	// Domains with path_pattern are exempt because multiple path-based rules on the same
 	// domain is the intended usage (first-match-wins).
-	seen := make(map[string]int) // domain -> first index
+	// Compared normalized, so "api.internal" and "API.Internal" are recognized as
+	// the same rule rather than silently producing one unreachable duplicate.
+	seen := make(map[string]int) // normalized domain -> first index
 	for i, rw := range c.Rewrites {
 		if rw.PathPattern != "" {
 			continue
 		}
-		if first, ok := seen[rw.Domain]; ok {
+		key := NormalizeHost(rw.Domain)
+		if first, ok := seen[key]; ok {
 			return fmt.Errorf("rewrites[%d]: duplicate domain %q without path_pattern (first at rewrites[%d]); second rule is unreachable", i, rw.Domain, first)
 		}
-		seen[rw.Domain] = i
+		seen[key] = i
 	}
 
 	return nil
@@ -686,23 +692,42 @@ func CompileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 	return compiled, nil
 }
 
+// NormalizeHost canonicalises a hostname for policy matching.
+//
+// DNS names are case-insensitive and a trailing dot denotes the same FQDN, so
+// "EVIL.example.com" and "evil.example.com." address exactly the host that
+// "evil.example.com" does. Matching the raw value would let either form slip
+// past a blacklist, or miss a rewrite rule and leak the request to public DNS.
+// Every policy decision must compare normalized values on both sides.
+func NormalizeHost(host string) string {
+	return strings.ToLower(strings.TrimSuffix(host, "."))
+}
+
 // WildcardToRegex converts a domain pattern with wildcards to a regex.
+//
+// Patterns are matched against hosts normalized by [NormalizeHost], so pattern
+// literals are lowercased here to keep both sides consistent. Raw regex
+// patterns are the caller's responsibility: they are compiled case-sensitively
+// and are not lowercased, since a user-supplied regex may intentionally use
+// character classes.
+//
 // Supports:
 //   - Exact match: "example.com" -> "^example\.com$"
 //   - Wildcard: "*.example.com" -> "^.+\.example\.com$" (matches any subdomain depth)
 //   - Full wildcard: "*" -> ".*"
-//   - Raw regex: "~<regex>" -> compiled as-is (no escaping/anchoring)
+//   - Raw regex: "~<regex>" -> compiled case-insensitively, anchored if not already
 func WildcardToRegex(pattern string) (*regexp.Regexp, error) {
 	if strings.HasPrefix(pattern, "~") {
-		return regexp.Compile(pattern[1:])
+		return compileRawRegex(pattern[1:])
 	}
 
 	if pattern == "*" {
 		return regexp.Compile(".*")
 	}
 
-	// Escape regex special characters except *
-	escaped := regexp.QuoteMeta(pattern)
+	// Escape regex special characters except *. Lowercase first: hosts are
+	// normalized before matching, so an uppercase pattern would never match.
+	escaped := regexp.QuoteMeta(strings.ToLower(pattern))
 
 	// Replace \* with appropriate regex
 	// *.example.com -> matches any subdomain depth (e.g. a.b.c.example.com)
@@ -710,10 +735,53 @@ func WildcardToRegex(pattern string) (*regexp.Regexp, error) {
 		escaped = `.+\.` + escaped[4:]
 	}
 
-	// Anchor the pattern
-	escaped = "^" + escaped + "$"
+	// Anchor the pattern, and compile case-insensitively. Callers normalize hosts
+	// via NormalizeHost before matching, so (?i) is redundant on that path — it is
+	// here so a future call site that forgets to normalize fails closed (still
+	// matching the blacklist) rather than open.
+	escaped = "(?i)^" + escaped + "$"
 
 	return regexp.Compile(escaped)
+}
+
+// compileRawRegex compiles a user-supplied "~" pattern.
+//
+// Two adjustments make raw patterns behave like the wildcard forms:
+//
+// Case-insensitive, because hosts are lowercased by [NormalizeHost] before
+// matching, so a raw pattern containing uppercase would silently never match.
+//
+// Anchored, because Match uses MatchString, which succeeds on any substring.
+// Unanchored, "~api\.corp\.com" would match "api.corp.com.attacker.net" — a
+// whitelist entry that fails open, and a rewrite that captures unintended hosts
+// along with that rule's injected headers. Wrapping in a non-capturing group
+// keeps alternations intact and is a no-op for already-anchored patterns.
+func compileRawRegex(expr string) (*regexp.Regexp, error) {
+	// Validate the user's expression first so errors point at what they wrote.
+	if _, err := regexp.Compile(expr); err != nil {
+		return nil, err
+	}
+	return regexp.Compile("(?i)^(?:" + expr + ")$")
+}
+
+// WildcardToURLRegex compiles a pattern intended to match a full request URL
+// (scheme://host/path?query) rather than a bare hostname.
+//
+// It differs from [WildcardToRegex] in one way: raw "~" patterns are left
+// unanchored. Matching a substring of a URL is the intended semantic for trace
+// rules — "~/v1/debug" should select that path on any host — whereas anchoring
+// a host pattern is what stops a whitelist entry from matching
+// "api.corp.com.attacker.net". URL patterns select what to observe and grant no
+// access, so the fail-open concern that motivates anchoring does not apply.
+func WildcardToURLRegex(pattern string) (*regexp.Regexp, error) {
+	if strings.HasPrefix(pattern, "~") {
+		expr := pattern[1:]
+		if _, err := regexp.Compile(expr); err != nil {
+			return nil, err
+		}
+		return regexp.Compile("(?i)" + expr)
+	}
+	return WildcardToRegex(pattern)
 }
 
 // LoadConfig reads and validates the configuration file.

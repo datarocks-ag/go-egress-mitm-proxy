@@ -54,7 +54,7 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 
 	cfg, acl, rewrites, rewriteExact, _ := runtimeCfg.Get()
 
-	host := r.URL.Hostname()
+	host := config.NormalizeHost(r.URL.Hostname())
 	action := "BLOCKED"
 	var matchedRewrite *config.CompiledRewriteRule
 
@@ -222,7 +222,7 @@ func setupTrace(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.Runt
 	if !ct.Enabled {
 		return nil
 	}
-	host := r.URL.Hostname()
+	host := config.NormalizeHost(r.URL.Hostname())
 	rule := ct.Match(host, r.URL.String(), true)
 	if rule == nil {
 		return nil
@@ -267,6 +267,7 @@ func RecordResponseMetrics(resp *http.Response) {
 // Rules with PathPattern are skipped because the dialer has no access to the HTTP request path;
 // those are resolved in HandleRequest and passed via request context instead.
 func LookupRewrite(host string, rewrites []config.CompiledRewriteRule, rewriteExact map[string]*config.CompiledRewriteRule) RewriteResult {
+	host = config.NormalizeHost(host)
 	if rw, ok := rewriteExact[host]; ok {
 		return RewriteResult{TargetIP: rw.TargetIP, TargetHost: rw.TargetHost, Insecure: rw.Insecure, Matched: true}
 	}
@@ -438,6 +439,7 @@ func GenerateRequestID() string {
 // Known rewrite domains are tracked individually, ACL-matched domains by base domain,
 // and unknown domains are grouped as "_other".
 func NormalizeDomainForMetrics(host string, rewriteExact map[string]*config.CompiledRewriteRule, acl config.CompiledACL) string {
+	host = config.NormalizeHost(host)
 	// Known rewrite targets get their own label
 	if _, ok := rewriteExact[host]; ok {
 		return host
@@ -460,4 +462,37 @@ func ExtractBaseDomain(host string) string {
 		return host
 	}
 	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+// ConnectDecision is the policy outcome for a CONNECT request, decided before
+// any tunnel is established.
+type ConnectDecision int
+
+const (
+	// ConnectMITM intercepts the tunnel and applies the full request pipeline.
+	ConnectMITM ConnectDecision = iota
+	// ConnectPassthrough tunnels TCP without TLS interception.
+	ConnectPassthrough
+	// ConnectReject refuses the tunnel outright.
+	ConnectReject
+)
+
+// DecideConnect applies ACL policy to a CONNECT target.
+//
+// hostname must already be normalized via config.NormalizeHost.
+//
+// The blacklist is evaluated before passthrough, and the ordering is
+// load-bearing: a passthrough match accepts the tunnel, and an accepted tunnel
+// never reaches HandleRequest, which is where every other blacklist check
+// happens. Testing passthrough first would let any passthrough pattern silently
+// void the blacklist entries it overlaps.
+func DecideConnect(hostname string, acl config.CompiledACL) ConnectDecision {
+	switch {
+	case config.Matches(hostname, acl.Blacklist):
+		return ConnectReject
+	case config.Matches(hostname, acl.Passthrough):
+		return ConnectPassthrough
+	default:
+		return ConnectMITM
+	}
 }
