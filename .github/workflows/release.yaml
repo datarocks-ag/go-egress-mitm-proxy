@@ -64,8 +64,10 @@ jobs:
           output: 'trivy-results.txt'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          exit-code: '1'
 
       - name: Publish Trivy results to summary
+        if: always()
         run: |
           if [[ -s trivy-results.txt ]]; then
             {
@@ -125,23 +127,46 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build Docker image for scanning
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      # Build once, locally, with the final tags. The image that gets scanned
+      # below is then byte-for-byte the image that gets pushed. Previously a
+      # throwaway ":scan" image was built and scanned while a second
+      # build-push-action rebuilt and pushed independently, so the published
+      # artifact was never the one the scanner looked at.
+      - name: Build Docker image
         uses: docker/build-push-action@v7
         with:
           context: .
           load: true
-          tags: ${{ env.IMAGE_NAME }}:scan
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ steps.version.outputs.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Run Trivy vulnerability scanner (Docker image)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:scan
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           format: 'table'
           output: 'trivy-docker-results.txt'
           severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
 
       - name: Publish Trivy results to summary
+        if: always()
         run: |
           if [[ -s trivy-docker-results.txt ]]; then
             {
@@ -166,30 +191,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-
-      # Publish to ghcr.io only for v* tags. Merges to main still build and Trivy-scan
-      # the image, they just do not push it.
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: VERSION=${{ steps.version.outputs.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # Publish to ghcr.io only for v* tags. Merges to main still build and
+      # Trivy-scan the image, they just do not push it. Pushing the locally
+      # built tags guarantees the published digest is the scanned digest.
+      - name: Push image
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "${{ steps.meta.outputs.tags }}" | while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Pushing $tag"
+            docker push "$tag"
+          done
 
   release:
     name: GitHub Release

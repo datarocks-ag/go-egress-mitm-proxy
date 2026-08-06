@@ -71,8 +71,16 @@ jobs:
           output: 'trivy-results.txt'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          # Without exit-code the action always exits 0, so this job was green
+          # whatever it found -- a hard dependency of build and test-e2e that
+          # read as a gate and was decorative. Record accepted risk in
+          # .trivyignore rather than by ignoring the result.
+          exit-code: '1'
 
       - name: Publish Trivy results to summary
+        # always(): the scan step now fails the job on a finding, and the
+        # findings are the thing you need to see when it does.
+        if: always()
         run: |
           if [[ -s trivy-results.txt ]]; then
             {
