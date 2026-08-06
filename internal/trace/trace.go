@@ -218,15 +218,25 @@ func (r *Record) applyResponse(resp *http.Response) {
 		r.connReused = true
 	}
 
-	// Always wrap the body so the aggregated record is emitted once the response
-	// finishes streaming; tee bytes only when body capture is enabled.
-	if resp.Body == nil {
+	// Wrap the body only when bytes actually need teeing.
+	//
+	// goproxy compares resp.Body against the original to decide whether a handler
+	// modified the response (https.go:518-527); when they differ it clears
+	// Content-Length and forces chunked transfer encoding. Wrapping
+	// unconditionally — purely to get a Close hook for Emit — therefore re-framed
+	// every traced response, turning an observability switch into something that
+	// changes the bytes the client receives. For a 204/304 it was worse: Go leaves
+	// resp.Body as http.NoBody, the wrapper hid that, and the response went out
+	// chunked in violation of RFC 9110.
+	//
+	// With capture off there is nothing to tee, so emit now: status and headers
+	// are already recorded and the request body has been read.
+	if resp.Body == nil || resp.Body == http.NoBody || !r.CaptureResponseBody() {
 		r.Emit()
 		return
 	}
-	if r.CaptureResponseBody() {
-		r.respBody = &bodyBuffer{max: r.bodies.MaxResponseBytes}
-	}
+
+	r.respBody = &bodyBuffer{max: r.bodies.MaxResponseBytes}
 	resp.Body = &captureReadCloser{rc: resp.Body, buf: r.respBody, onClose: r.Emit}
 }
 
@@ -340,7 +350,15 @@ func toAttrs(args []any) []slog.Attr {
 }
 
 // bodyBuffer captures up to max bytes of a body while counting the total seen.
+// bodyBuffer accumulates a capped copy of a request or response body.
+//
+// Access is mutex-guarded because the two ends genuinely run on different
+// goroutines: http.Transport writes the request body from its writeLoop, while
+// Emit — triggered by the response body closing — renders that same buffer. A
+// server that answers before consuming the upload (an early 4xx, or any large
+// streamed request) overlaps the two.
 type bodyBuffer struct {
+	mu        sync.Mutex
 	max       int
 	buf       bytes.Buffer
 	total     int64
@@ -348,6 +366,9 @@ type bodyBuffer struct {
 }
 
 func (b *bodyBuffer) write(p []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if remaining := b.max - b.buf.Len(); remaining > 0 {
 		n := len(p)
 		if n > remaining {
@@ -391,11 +412,16 @@ func renderBody(b *bodyBuffer, contentType string, cfg config.CompiledBodyCaptur
 	if b == nil {
 		return nil
 	}
-	out := map[string]any{"bytes": b.total}
-	if b.truncated {
+	// Snapshot under the lock; the writer may still be appending.
+	b.mu.Lock()
+	total, truncated := b.total, b.truncated
+	data := bytes.Clone(b.buf.Bytes())
+	b.mu.Unlock()
+
+	out := map[string]any{"bytes": total}
+	if truncated {
 		out["truncated"] = true
 	}
-	data := b.buf.Bytes()
 	if len(data) == 0 {
 		return out
 	}
