@@ -229,8 +229,16 @@ func (r *Record) applyResponse(resp *http.Response) {
 	// resp.Body as http.NoBody, the wrapper hid that, and the response went out
 	// chunked in violation of RFC 9110.
 	//
-	// With capture off there is nothing to tee, so emit now: status and headers
-	// are already recorded and the request body has been read.
+	// With capture off there is nothing to tee, so emit at header time.
+	//
+	// Nothing is lost by that in MITM mode: no Record field is populated after
+	// the response headers. SetTCP and SetRequestIn/Out have already run,
+	// addUp/addDown are passthrough-only, and no caller records an error once the
+	// response has arrived. The record would be byte-identical either way -- the
+	// wrapper existed only to delay the write. What it does mean is that these
+	// records are emitted before the response body finishes streaming, so a
+	// failure that occurs mid-body is not reflected; enable body capture for the
+	// rule if that matters.
 	if resp.Body == nil || resp.Body == http.NoBody || !r.CaptureResponseBody() {
 		r.Emit()
 		return
@@ -350,7 +358,6 @@ func toAttrs(args []any) []slog.Attr {
 }
 
 // bodyBuffer captures up to max bytes of a body while counting the total seen.
-// bodyBuffer accumulates a capped copy of a request or response body.
 //
 // Access is mutex-guarded because the two ends genuinely run on different
 // goroutines: http.Transport writes the request body from its writeLoop, while

@@ -31,9 +31,11 @@ func PassthroughDialer(rec *Record, base DialFunc) DialFunc {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := base(context.WithValue(ctx, CtxKey, rec), network, addr)
 		if err != nil {
-			// base has already called SetError via the context. Emit here because a
-			// failed dial produces no conn, so Close never runs.
-			rec.SetError(err.Error())
+			// Error recording belongs to base, which sees the record on the context
+			// and has the specific failure in hand (MakeDialer also classifies it for
+			// the upstream error metrics). Setting it again here would overwrite that
+			// with a less specific message. Emitting is this wrapper's job, because a
+			// failed dial produces no conn and therefore no Close.
 			rec.Emit()
 			return nil, err
 		}

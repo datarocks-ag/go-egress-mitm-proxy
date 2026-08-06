@@ -14,6 +14,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"go-egress-proxy/internal/config"
 )
@@ -117,8 +118,14 @@ func TestPassthroughDialerEmitsOnDialFailure(t *testing.T) {
 	var buf bytes.Buffer
 	rec := testRecord(t, &buf)
 
-	base := func(_ context.Context, _, _ string) (net.Conn, error) {
-		return nil, errors.New("connection refused")
+	// Mirror what MakeDialer does: record the error on the context record, which
+	// is where PassthroughDialer expects error reporting to happen.
+	base := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		err := errors.New("connection refused")
+		if r := FromContext(ctx); r != nil {
+			r.SetError(err.Error())
+		}
+		return nil, err
 	}
 
 	if _, err := PassthroughDialer(rec, base)(context.Background(), "tcp", "x:443"); err == nil {
@@ -189,13 +196,24 @@ func TestCountingConnConcurrentCopyIsRaceFree(t *testing.T) {
 
 	conn := wrapConn(dialLocal(t, ln.Addr().String()), rec)
 
-	payload := bytes.Repeat([]byte("x"), 4096)
+	const (
+		chunk  = 4096
+		rounds = 20
+		total  = chunk * rounds
+	)
+	payload := bytes.Repeat([]byte("x"), chunk)
+
+	// Bound the test: if the accounting below is ever wrong, fail rather than hang.
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		for range 20 {
+		for range rounds {
 			if _, wErr := conn.Write(payload); wErr != nil {
 				return
 			}
@@ -203,9 +221,13 @@ func TestCountingConnConcurrentCopyIsRaceFree(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		sink := make([]byte, 4096)
-		for range 20 {
-			if _, rErr := conn.Read(sink); rErr != nil {
+		// Track bytes, not iterations: Read may return short, and reading fewer
+		// bytes than were written applies backpressure that blocks the writer.
+		sink := make([]byte, chunk)
+		for read := 0; read < total; {
+			n, rErr := conn.Read(sink)
+			read += n
+			if rErr != nil {
 				return
 			}
 		}
