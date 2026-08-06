@@ -6,9 +6,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -85,8 +87,13 @@ func newLoadedRuntime(t *testing.T, dir string) (*config.RuntimeConfig, string, 
 	return rc, certPath, keyPath
 }
 
-// captureSlog swaps the default logger for the duration of fn.
-func captureSlog(t *testing.T, fn func()) string {
+// captureRecords swaps the default logger for the duration of fn and returns
+// the emitted records decoded from JSON.
+//
+// Decoding rather than substring-matching keeps these assertions tied to the
+// structure slog actually emits -- level, message, attributes -- instead of to
+// incidental formatting or exact wording.
+func captureRecords(t *testing.T, fn func()) []map[string]any {
 	t.Helper()
 
 	var buf bytes.Buffer
@@ -95,7 +102,41 @@ func captureSlog(t *testing.T, fn func()) string {
 	defer slog.SetDefault(old)
 
 	fn()
-	return buf.String()
+
+	var records []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not JSON: %v\n%s", err, line)
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
+// findRestartWarning returns the fields named by the WARN record listing
+// settings a reload cannot apply, and whether such a record was emitted.
+func findRestartWarning(records []map[string]any) ([]string, bool) {
+	for _, rec := range records {
+		if rec["level"] != "WARN" {
+			continue
+		}
+		raw, ok := rec["fields"].([]any)
+		if !ok {
+			continue
+		}
+		fields := make([]string, 0, len(raw))
+		for _, f := range raw {
+			if s, ok := f.(string); ok {
+				fields = append(fields, s)
+			}
+		}
+		return fields, true
+	}
+	return nil, false
 }
 
 // TestReloadAppliesNewConfiguration is the happy path: new policy in effect,
@@ -233,17 +274,18 @@ func TestReloadWarnsAboutSettingsItCannotApply(t *testing.T) {
 		Replace(baseConfig("BLOCK", "first.example.com"))
 	path := writeConfig(t, dir, "rotated.yaml", body)
 
-	out := captureSlog(t, func() {
+	records := captureRecords(t, func() {
 		if err := reload(reloadDeps{configPath: path, runtimeCfg: rc, pool: &countingPool{}}); err != nil {
 			t.Fatalf("reload: %v", err)
 		}
 	})
 
-	if !strings.Contains(out, "require a restart") {
-		t.Errorf("no warning about unapplied settings; operator would believe the CA rotated.\nlogs: %s", out)
+	fields, ok := findRestartWarning(records)
+	if !ok {
+		t.Fatalf("no WARN record naming unapplied settings; an operator would believe the CA rotated.\nrecords: %v", records)
 	}
-	if !strings.Contains(out, "mitm_cert_path") {
-		t.Errorf("warning does not name the ignored field.\nlogs: %s", out)
+	if !slices.Contains(fields, "proxy.mitm_cert_path") {
+		t.Errorf("warning fields = %v, want it to name proxy.mitm_cert_path", fields)
 	}
 }
 
@@ -257,19 +299,25 @@ func TestReloadDoesNotWarnForReloadableSettings(t *testing.T) {
 		Replace(baseConfig("ALLOW", "changed.example.com"))
 	path := writeConfig(t, dir, "policy-only.yaml", body)
 
-	out := captureSlog(t, func() {
+	records := captureRecords(t, func() {
 		if err := reload(reloadDeps{configPath: path, runtimeCfg: rc, pool: &countingPool{}}); err != nil {
 			t.Fatalf("reload: %v", err)
 		}
 	})
 
-	if strings.Contains(out, "require a restart") {
-		t.Errorf("warned about a policy-only change.\nlogs: %s", out)
+	if fields, ok := findRestartWarning(records); ok {
+		t.Errorf("warned about a policy-only change, naming %v", fields)
 	}
 }
 
-// TestReloadRotatesLogFiles covers the blocked-log rotation path: SIGHUP is the
-// documented way to rotate, so the new file must be in use afterwards.
+// TestReloadRotatesLogFiles verifies rotation the way logrotate performs it:
+// move the file aside, then signal the process to reopen it.
+//
+// The previous version of this test only asserted the logger was non-nil after a
+// second reload, which is true whether or not anything was reopened -- it would
+// have passed against a reload that reused the old descriptor and kept writing
+// into the moved-away file, which is precisely the bug rotation support exists
+// to prevent.
 func TestReloadRotatesLogFiles(t *testing.T) {
 	dir := t.TempDir()
 	rc, certPath, keyPath := newLoadedRuntime(t, dir)
@@ -282,17 +330,54 @@ func TestReloadRotatesLogFiles(t *testing.T) {
 	if err := reload(reloadDeps{configPath: path, runtimeCfg: rc, pool: &countingPool{}}); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if rc.GetBlockedLogger() == nil {
+	t.Cleanup(rc.CloseBlockedLog)
+
+	logger := rc.GetBlockedLogger()
+	if logger == nil {
 		t.Fatal("blocked logger was not installed")
 	}
+	logger.Info("before-rotation")
 
-	// Reloading again must swap in a fresh handle without error, which is what
-	// rotation depends on.
+	// logrotate moves the file aside; the descriptor the proxy holds still points
+	// at the moved inode.
+	rotated := logPath + ".1"
+	if err := os.Rename(logPath, rotated); err != nil {
+		t.Fatalf("simulate logrotate: %v", err)
+	}
+
+	// SIGHUP: the reload must reopen the original path, creating a new file.
 	if err := reload(reloadDeps{configPath: path, runtimeCfg: rc, pool: &countingPool{}}); err != nil {
 		t.Fatalf("second reload (rotation): %v", err)
 	}
-	if rc.GetBlockedLogger() == nil {
+	logger = rc.GetBlockedLogger()
+	if logger == nil {
 		t.Fatal("blocked logger was lost across rotation")
 	}
-	rc.CloseBlockedLog()
+	logger.Info("after-rotation")
+
+	oldContents := readFile(t, rotated)
+	newContents := readFile(t, logPath)
+
+	if !strings.Contains(oldContents, "before-rotation") {
+		t.Errorf("rotated file lost the pre-rotation entry:\n%s", oldContents)
+	}
+	if strings.Contains(oldContents, "after-rotation") {
+		t.Error("post-rotation entry landed in the moved-aside file; the descriptor was not reopened")
+	}
+	if !strings.Contains(newContents, "after-rotation") {
+		t.Errorf("post-rotation entry did not reach the new file:\n%s", newContents)
+	}
+	if strings.Contains(newContents, "before-rotation") {
+		t.Errorf("new file unexpectedly contains the pre-rotation entry:\n%s", newContents)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+
+	b, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
 }
