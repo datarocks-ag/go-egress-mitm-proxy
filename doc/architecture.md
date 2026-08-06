@@ -245,7 +245,21 @@ Opt-in, full-detail tracing of a subset of requests (configured via the `trace:`
 
 - A `*trace.Record` is created in `HandleRequest` when a request matches a trace rule, before any header mutation (so the inbound snapshot is what the client sent)
 - The record is threaded to the dialers via the request context (`trace.CtxKey`) — which populate the connected IP, dial timing, and TLS version/cipher — and to the response handler via goproxy `ctx.UserData`
-- The response body is wrapped so the record is emitted exactly once (`sync.Once`) when the body finishes streaming; blocked (403) and upstream-error (502/504) paths emit via their synthetic responses
+- The record is emitted exactly once (`sync.Once`). **When** depends on body capture:
+  - **Capture off (the default):** emitted at header time. The record is
+    byte-identical either way — no field is populated after the response headers
+    — but a failure occurring *mid-body* is therefore not reflected in it. Enable
+    body capture for the rule if that matters.
+  - **Capture on:** the response body is wrapped, and the record is emitted when
+    that body finishes streaming.
+
+  The body is deliberately left untouched with capture off. goproxy treats a
+  changed `resp.Body` as a modified response and re-frames it as chunked, so
+  wrapping unconditionally would make an observability switch alter the bytes the
+  client receives. `http.NoBody` (204/304) and `101 Switching Protocols` are
+  never wrapped for the same reason — a wrapped 101 also fails goproxy's
+  `io.ReadWriter` assertion and drops the WebSocket tunnel.
+- Blocked (403) and upstream-error (502/504) paths emit via their synthetic responses
 - Passthrough (non-MITM) hosts are traced TCP-only via goproxy's per-request `ctx.Dialer` (connected IP, dial timing, bytes up/down)
 - Redaction is secure-by-default (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` always masked; `redact_headers`/`redact_query` extend; `log_secrets` disables)
 - Independent of the `-v/-vv/-vvv` level; trace log file reopened on SIGHUP for rotation
