@@ -283,7 +283,10 @@ func main() {
 						rec := trace.NewRecord(proxy.GenerateRequestID(), "passthrough", rule, trace.NewRedactor(ct), traceLogger)
 						rec.SetConnect(host, hostname)
 						ctx.UserData = rec
-						ctx.Dialer = trace.PassthroughDialer(rec)
+						// Decorate the production dialer rather than replacing it, so a
+						// traced passthrough host keeps its rewrite target and its dial
+						// error metrics.
+						ctx.Dialer = trace.PassthroughDialer(rec, proxy.MakeDialer(runtimeCfg))
 					}
 				}
 				return passthroughAction, host
