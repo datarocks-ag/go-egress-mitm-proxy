@@ -543,10 +543,24 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// Start metrics server in background
+	// Bind the metrics port before backgrounding the server, and treat a bind
+	// failure as fatal like every other startup dependency.
+	//
+	// ListenAndServe inside a bare goroutine meant a port collision only logged:
+	// the proxy still bound, still called SetReady, and served with /healthz,
+	// /readyz and /metrics all unreachable — so the readiness mechanism was inert
+	// and the pod sat NotReady with nothing obviously wrong in the logs. That
+	// "running, healthy-looking, receiving no traffic" state is exactly what the
+	// readiness work exists to prevent.
+	metricsLn, metricsErr := (&net.ListenConfig{}).Listen(context.Background(), "tcp", metricsServer.Addr)
+	if metricsErr != nil {
+		slog.Error("Failed to bind metrics port", "addr", metricsServer.Addr, "err", metricsErr)
+		os.Exit(1)
+	}
+
 	go func() {
 		slog.Info("Metrics server starting", "port", cfg.Proxy.MetricsPort)
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := metricsServer.Serve(metricsLn); err != nil && err != http.ErrServerClosed {
 			slog.Error("Metrics server error", "err", err)
 		}
 	}()
