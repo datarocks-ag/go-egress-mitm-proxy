@@ -229,8 +229,8 @@ internal/health/
 e2e_test.go                    # End-to-end tests (build tag: e2e, Docker-based)
 Makefile                       # Build and dev commands
 .golangci.yml                  # Linter configuration
-.github/workflows/ci.yaml     # CI pipeline (feature branches)
-.github/workflows/release.yaml # Release pipeline (develop/tags)
+.github/workflows/ci.yaml     # CI pipeline (branch pushes + PRs to main)
+.github/workflows/release.yaml # Release pipeline (main pushes/tags; publishes on v* tags)
 .github/dependabot.yml         # Dependency updates
 docker-compose.yaml            # Local dev environment
 ```
@@ -245,6 +245,6 @@ docker-compose.yaml            # Local dev environment
 ## Conventions
 
 - Git branching: `feature/`, `bugfix/`, `hotfix/`, `release/` prefixes
-- **Never push directly to `develop` or `main`** — always create a feature branch and open a pull request
+- **Never push directly to `main`** — always create a feature branch and open a pull request
 - Do not add `Co-Authored-By` lines in commit messages
 - Do not add `Generated with Claude Code` lines in pull request descriptions
