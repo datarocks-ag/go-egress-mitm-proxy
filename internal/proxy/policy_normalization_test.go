@@ -294,3 +294,50 @@ func TestBlacklistOutranksRewrite(t *testing.T) {
 		}
 	})
 }
+
+// TestBlacklistWinsOverWhitelistOnRequestPath pins the precedence governing all
+// plain HTTP and every intercepted HTTPS request.
+//
+// The CONNECT-stage ordering has a test; this one did not, and every ACL fixture
+// in the suite used disjoint lists, so no test configured a host matched by
+// both. Swapping the two branches in HandleRequest left every package green.
+// The configuration that breaks is the one the README recommends: a broad
+// whitelist with a narrower blacklist carved out of it.
+func TestBlacklistWinsOverWhitelistOnRequestPath(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.ACL.Whitelist = []string{"*.corp.internal", "shared.example.com"}
+	cfg.ACL.Blacklist = []string{"secrets.corp.internal", "shared.example.com"}
+
+	rc := runtimeFor(t, cfg)
+
+	tests := []struct {
+		name        string
+		url         string
+		wantBlocked bool
+	}{
+		{
+			name:        "narrow blacklist carved out of a broad whitelist",
+			url:         "https://secrets.corp.internal/x",
+			wantBlocked: true,
+		},
+		{
+			name:        "same host in both lists",
+			url:         "https://shared.example.com/x",
+			wantBlocked: true,
+		},
+		{
+			name:        "whitelisted host not in the blacklist still passes",
+			url:         "https://build.corp.internal/x",
+			wantBlocked: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := actionFor(t, rc, tt.url); got != tt.wantBlocked {
+				t.Errorf("blocked = %v, want %v — blacklist must be evaluated before whitelist", got, tt.wantBlocked)
+			}
+		})
+	}
+}
