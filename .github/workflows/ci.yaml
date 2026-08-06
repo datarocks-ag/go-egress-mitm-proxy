@@ -8,6 +8,17 @@ on:
       - 'hotfix/**'
       - 'release/**'
       - 'dependabot/**'
+  # Without this, a branch outside the prefixes above gets no checks at all and
+  # its PR reports success by silence.
+  pull_request:
+    branches: [main]
+
+# A branch matching a prefix above that also has an open PR would otherwise run
+# twice per push. Keying on head_ref for PRs and ref_name for pushes yields the
+# same group for both, so the newer run cancels the older instead of duplicating.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   lint:
