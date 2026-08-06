@@ -725,6 +725,24 @@ func WildcardToRegex(pattern string) (*regexp.Regexp, error) {
 		return regexp.Compile(".*")
 	}
 
+	// Reject a "*" anywhere other than the leading label.
+	//
+	// Only a leading "*." is expanded; every other "*" survives QuoteMeta and is
+	// then anchored, so "api.*.evil.com" compiles to ^api\.\*\.evil\.com$ and
+	// matches nothing. That is silent and, in a blacklist, fails open: the entry
+	// blocks nothing and every host it was meant to deny is ALLOWED-BY-DEFAULT.
+	// Compilation succeeds today and `validate` reports the config as valid, so
+	// nothing surfaces the mistake. For a policy list, refusing to load beats
+	// pretending to enforce.
+	rest := pattern
+	if after, ok := strings.CutPrefix(pattern, "*."); ok {
+		rest = after
+	}
+	if strings.Contains(rest, "*") {
+		return nil, fmt.Errorf("invalid wildcard %q: \"*\" is only supported as a leading \"*.\" label "+
+			"(or alone); use a \"~\" prefix for a raw regex", pattern)
+	}
+
 	// Escape regex special characters except *. Lowercase first: hosts are
 	// normalized before matching, so an uppercase pattern would never match.
 	escaped := regexp.QuoteMeta(strings.ToLower(pattern))

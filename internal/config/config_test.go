@@ -1468,3 +1468,55 @@ func TestReloadIgnoredFields(t *testing.T) {
 		})
 	}
 }
+
+// TestWildcardRejectsMidPatternStar pins a fail-open trap.
+//
+// Only a leading "*." is expanded. Every other "*" survived QuoteMeta and was
+// then anchored, so "api.*.evil.com" compiled to a pattern matching nothing —
+// and in a blacklist that means the entry blocks nothing while `validate`
+// reports the configuration as valid.
+func TestWildcardRejectsMidPatternStar(t *testing.T) {
+	rejected := []string{
+		"api.*.evil.com", // mid-pattern
+		"*evil.com",      // leading star without the dot
+		"evil.*",         // trailing
+		"*.*.evil.com",   // redundant second star
+	}
+	for _, p := range rejected {
+		t.Run(p, func(t *testing.T) {
+			if _, err := WildcardToRegex(p); err == nil {
+				t.Errorf("WildcardToRegex(%q) accepted a wildcard that matches nothing", p)
+			}
+		})
+	}
+
+	accepted := []string{"*", "*.evil.com", "evil.com", `~^api[0-9]*\.evil\.com$`}
+	for _, p := range accepted {
+		t.Run(p, func(t *testing.T) {
+			if _, err := WildcardToRegex(p); err != nil {
+				t.Errorf("WildcardToRegex(%q) rejected a valid pattern: %v", p, err)
+			}
+		})
+	}
+}
+
+// TestCompileACLRejectsUnmatchablePattern ensures the rejection reaches config
+// load, so a bad denylist entry fails at startup and under `validate` rather
+// than silently allowing the traffic it names.
+func TestCompileACLRejectsUnmatchablePattern(t *testing.T) {
+	cfg := Config{}
+	cfg.ACL.Blacklist = []string{"api.*.evil.com"}
+
+	if _, err := CompileACL(cfg); err == nil {
+		t.Error("CompileACL accepted a blacklist entry that can never match")
+	}
+}
+
+// TestCompileRewritesRejectsUnmatchablePattern is the same guard for rewrites,
+// where the failure is a rule that silently never applies.
+func TestCompileRewritesRejectsUnmatchablePattern(t *testing.T) {
+	_, err := CompileRewrites([]RewriteRule{{Domain: "api.*.internal", TargetIP: "10.0.0.1"}})
+	if err == nil {
+		t.Error("CompileRewrites accepted a domain pattern that can never match")
+	}
+}
