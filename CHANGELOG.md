@@ -10,6 +10,8 @@ git history for the full detail.
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-08-07
+
 ### Fixed
 - **Connection pool no longer ignores the rewrite target.** Go keys idle
   connections on the request URL's `host:port`, which is fixed before the
@@ -349,6 +351,7 @@ dial interception (not DNS-level). Includes ACL enforcement
 automatic `X-Request-ID`, Prometheus metrics, health endpoints, hot reload
 (SIGHUP), graceful shutdown, and a CI pipeline.
 
+[4.0.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v2.3.0...v3.0.0
 [2.3.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v2.2.0...v2.2.1
