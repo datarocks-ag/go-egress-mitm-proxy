@@ -69,3 +69,50 @@ func TestEveryEnvVarIsDocumented(t *testing.T) {
 		}
 	}
 }
+
+// TestEveryConfigFieldAppearsInTheExample keeps the shipped example the complete
+// discovery surface for configuration.
+//
+// The example is what the Quick Start tells users to copy, and for most operators
+// it is the only place they will learn an option exists. Three separate options
+// have now been added with the example left untouched — PROXY_MAX_CONNECTIONS,
+// its max_connections YAML field, and mitm_org — each discoverable only by
+// reading the source. Reviews keep missing it because the field and the example
+// live in different files, so the check belongs here.
+//
+// Fields may be commented out in the example; this asserts they are mentioned,
+// not enabled.
+func TestEveryConfigFieldAppearsInTheExample(t *testing.T) {
+	source, err := os.ReadFile(filepath.Clean("config.go"))
+	if err != nil {
+		t.Fatalf("read config.go: %v", err)
+	}
+	fields := regexp.MustCompile(`yaml:"([a-z_0-9]+)"`).FindAllStringSubmatch(string(source), -1)
+	if len(fields) == 0 {
+		t.Fatal("found no yaml tags; the scan is broken, not the example")
+	}
+
+	example, err := os.ReadFile(filepath.Clean(exampleConfigPath))
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	text := string(example)
+
+	var missing []string
+	seen := map[string]bool{}
+	for _, f := range fields {
+		name := f[1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if !strings.Contains(text, name) {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("%s does not mention: %s\n(an option absent from the example is discoverable "+
+			"only by reading the source)", exampleConfigPath, strings.Join(missing, ", "))
+	}
+}

@@ -35,6 +35,11 @@ proxy:
   # mitm_keystore_path: "certs/ca.p12"
   # mitm_keystore_password: "changeit"
 
+  # Optional: Organization on the MITM leaf certificates the proxy mints.
+  # Default is goproxy's built-in "GoProxy untrusted MITM proxy Inc". Captured at
+  # startup -- SIGHUP does not reload it.
+  # mitm_org: "ACME Corp"
+
 # Domain rewrite rules
 # Supports exact match, wildcards (*.example.com), and regex (~<pattern>)
 # Rewrite rules bypass the whitelist and default policy -- a rewritten host is

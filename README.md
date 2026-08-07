@@ -97,6 +97,13 @@ proxy:
     - "certs/partner-ca.crt"
   blocked_log_path: ""      # Optional: JSON log file for blocked requests
 
+  # Optional: ceiling on concurrent client connections (0/unset = unlimited).
+  # A hijacked CONNECT tunnel has no deadline at any layer, so this is what
+  # bounds a client that connects and then goes silent. At the cap the proxy
+  # pauses accepting until one closes and increments
+  # proxy_listener_saturated_total. Overridable with PROXY_MAX_CONNECTIONS.
+  # max_connections: 2048
+
   # Optional: PKCS#12 truststore for upstream TLS (additive with outgoing_ca_bundle)
   # outgoing_truststore_path: "certs/upstream-cas.p12"
   # outgoing_truststore_password: "changeit"
@@ -347,7 +354,7 @@ they are structured and must come from the config file.
 | `PROXY_METRICS_PORT` | Metrics endpoint port |
 | `PROXY_DEFAULT_POLICY` | `ALLOW` or `BLOCK` |
 | `PROXY_MITM_ORG` | Organization on generated MITM leaf certificates (see `mitm_org`) |
-| `PROXY_MAX_CONNECTIONS` | Ceiling on concurrent client connections (default `0` = unlimited). At the cap the listener pauses accepting until one closes, warns, and increments `proxy_listener_saturated_total`. A hijacked CONNECT tunnel has no deadline, so this is what bounds fd usage against a client that connects and goes silent. |
+| `PROXY_MAX_CONNECTIONS` | Overrides `proxy.max_connections`: ceiling on concurrent client connections (default `0` = unlimited). At the cap the listener pauses accepting until one closes, warns, and increments `proxy_listener_saturated_total`. A hijacked CONNECT tunnel has no deadline, so this is what bounds fd usage against a client that connects and goes silent. |
 | `PROXY_PRESTOP_GRACE` | How long to keep serving after failing `/readyz` on SIGTERM, before closing the listener (default `10s`; set `0` when a `preStop` hook already sleeps) |
 | `PROXY_MITM_CERT_PATH` | Path to MITM CA certificate (PEM) |
 | `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |
@@ -471,7 +478,7 @@ Available at `http://localhost:9090/metrics`:
 | `proxy_response_status_total` | Counter | class | Response status codes (2xx, 4xx, 5xx) |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred (request/response) |
 | `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough) |
-| `proxy_listener_saturated_total` | Counter | - | Times the client connection limit was reached and accepting paused |
+| `proxy_listener_saturated_total` | Counter | - | Times the client connection ceiling (`proxy.max_connections`, or its `PROXY_MAX_CONNECTIONS` override) was reached and accepting paused |
 
 Three of these measure something different than a first reading suggests, which matters if you are building alerts on them:
 

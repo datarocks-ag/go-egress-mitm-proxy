@@ -308,7 +308,7 @@ Prometheus metrics with bounded cardinality:
 | `proxy_response_status_total` | Counter | class | Response codes |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred |
 | `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough). Only advances when a record is actually written |
-| `proxy_listener_saturated_total` | Counter | - | Times the client connection ceiling (`PROXY_MAX_CONNECTIONS`) was reached and accepting paused |
+| `proxy_listener_saturated_total` | Counter | - | Times the client connection ceiling (`proxy.max_connections`, or its `PROXY_MAX_CONNECTIONS` override) was reached and accepting paused |
 
 Domain normalization prevents cardinality explosion:
 - Known rewrite domains: tracked individually

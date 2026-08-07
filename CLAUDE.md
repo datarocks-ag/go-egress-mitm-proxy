@@ -151,7 +151,6 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
 - `max_connections` / `PROXY_MAX_CONNECTIONS`: ceiling on concurrent client connections (0 = unlimited). A hijacked CONNECT tunnel has no deadline at any layer, so this is the only bound on a client that connects and goes silent. At the cap the listener pauses accepting, warns, and increments `proxy_listener_saturated_total`. `TrackingListener.Close()` releases a parked accept, without which `http.Server.Shutdown` deadlocks waiting on its listener group
 - Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
-- Per-rewrite `target_port`: TCP port to connect to, overriding the client's port and the scheme default (for backends not on 80/443)
 - Per-rewrite `target_scheme`: optional `"http"` or `"https"` to change the request scheme before forwarding (e.g., HTTPS client → HTTP backend). The port moves with the scheme when the client's port was that scheme's default — an intercepted HTTPS request carries `:443` from the CONNECT authority, so without this a downgrade sent cleartext HTTP to the TLS port. An explicitly chosen port is preserved
 - Per-rewrite `target_port`: optional TCP port overriding both the client's port and the scheme default, for backends that do not listen on 80/443
 - Per-rewrite `drop_headers`: list of header names to strip from the request before forwarding (case-insensitive via `r.Header.Del()`)
