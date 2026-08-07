@@ -7,6 +7,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -174,7 +175,35 @@ func TestKubernetesExampleGatesBothSchemes(t *testing.T) {
 			t.Errorf("app container does not set %s; egress for that scheme bypasses the proxy entirely", key)
 		}
 	}
-	if env["HTTP_PROXY"] != env["HTTPS_PROXY"] {
-		t.Errorf("HTTP_PROXY (%q) and HTTPS_PROXY (%q) disagree", env["HTTP_PROXY"], env["HTTPS_PROXY"])
+
+	// All four must point at the same place. A lowercase variant pointing
+	// elsewhere is worse than one being absent: the client silently picks a
+	// different proxy for the same traffic depending on which spelling it reads.
+	want := env["HTTP_PROXY"]
+	for _, key := range []string{"HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if env[key] != want {
+			t.Errorf("%s = %q but HTTP_PROXY = %q; the spellings disagree about where traffic goes",
+				key, env[key], want)
+		}
+	}
+
+	// NO_PROXY keeps in-cluster and link-local traffic off the proxy. Without it
+	// pod-to-pod and metadata-endpoint calls are tunneled through the sidecar,
+	// where the ACL has no rules for them -- with default_policy BLOCK that breaks
+	// service discovery, and it puts the proxy on the path of traffic it was
+	// never meant to see.
+	for _, key := range []string{"NO_PROXY", "no_proxy"} {
+		if env[key] == "" {
+			t.Errorf("app container does not set %s; in-cluster traffic is routed through the proxy", key)
+			continue
+		}
+		for _, must := range []string{"localhost", ".svc"} {
+			if !strings.Contains(env[key], must) {
+				t.Errorf("%s = %q does not exempt %q", key, env[key], must)
+			}
+		}
+	}
+	if env["NO_PROXY"] != env["no_proxy"] {
+		t.Errorf("NO_PROXY (%q) and no_proxy (%q) disagree", env["NO_PROXY"], env["no_proxy"])
 	}
 }
