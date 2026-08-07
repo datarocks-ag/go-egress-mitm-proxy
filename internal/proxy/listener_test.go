@@ -6,7 +6,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -250,5 +252,155 @@ func TestUnlimitedListenerIsTheDefault(t *testing.T) {
 
 	if tl.slots != nil {
 		t.Error("NewTrackingListener installed a connection ceiling; it must default to unlimited")
+	}
+}
+
+// TestLimitedListenerAcceptUnblocksOnClose pins the shutdown path of the
+// connection ceiling.
+//
+// Accept waits for a free slot BEFORE calling the underlying Accept, and closing
+// a net.Listener does not unblock a channel send. So with the ceiling full,
+// Serve's accept loop sat in that send: Shutdown closed the listener and nothing
+// woke it. main blocks on Serve (cmd/mitm-proxy/main.go), so the process would
+// never reach the drain join and never exit -- it would hang until the kubelet
+// escalated to SIGKILL at terminationGracePeriodSeconds.
+//
+// The saturating connections are hijacked CONNECT tunnels that may never close,
+// which is precisely the situation the ceiling was added to survive, so the
+// bound would have introduced a shutdown hang in its own motivating case.
+func TestLimitedListenerAcceptUnblocksOnClose(t *testing.T) {
+	base, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl := NewLimitedTrackingListener(base, 1)
+
+	// Fill the single slot and keep it filled.
+	client, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close() //nolint:errcheck // test cleanup
+
+	held, err := tl.Accept()
+	if err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+	defer held.Close() //nolint:errcheck // test cleanup
+
+	// This Accept blocks waiting for the slot, as Serve's loop would.
+	accepted := make(chan error, 1)
+	go func() {
+		c, acceptErr := tl.Accept()
+		if c != nil {
+			c.Close() //nolint:errcheck // test cleanup
+		}
+		accepted <- acceptErr
+	}()
+
+	// Let it reach the blocking send before closing.
+	time.Sleep(50 * time.Millisecond)
+
+	if err := tl.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case <-accepted:
+		// Any error is fine; returning at all is the property under test.
+	case <-time.After(3 * time.Second):
+		t.Fatal("Accept did not return after Close while the ceiling was full; " +
+			"Serve's accept loop is wedged and the process cannot shut down")
+	}
+}
+
+// TestServeReturnsAfterShutdownWithSaturatedListener is the end-to-end form of
+// the property above: what main actually depends on is not that Accept returns,
+// but that http.Server.Serve does.
+//
+// main blocks on Serve and only then joins the drain goroutine, so a wedged
+// accept loop means the process never exits -- the drain finishes, and the
+// binary sits there until the kubelet SIGKILLs it at the end of
+// terminationGracePeriodSeconds.
+//
+// The saturating connection is HIJACKED, which matters: an ordinary idle
+// connection is closed by Shutdown, which frees the slot and hides the defect.
+// http.Server stops tracking a connection once it is hijacked and never closes
+// it, so the slot stays held -- and a hijacked connection is what every CONNECT
+// tunnel through this proxy is.
+func TestServeReturnsAfterShutdownWithSaturatedListener(t *testing.T) {
+	base, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl := NewLimitedTrackingListener(base, 1)
+
+	hijacked := make(chan net.Conn, 1)
+	srv := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, _, hijackErr := w.(http.Hijacker).Hijack()
+			if hijackErr != nil {
+				t.Errorf("hijack: %v", hijackErr)
+				return
+			}
+			hijacked <- conn // held open, exactly like a CONNECT tunnel
+		}),
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(tl) }()
+
+	client, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close() //nolint:errcheck // test cleanup
+	if _, err = client.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	var tunnel net.Conn
+	select {
+	case tunnel = <-hijacked:
+		defer tunnel.Close() //nolint:errcheck // test cleanup
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never hijacked the connection")
+	}
+
+	// A second connection so the accept loop is parked waiting for the slot the
+	// hijacked tunnel holds and will not give back.
+	queued, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queued.Close() //nolint:errcheck // test cleanup
+	time.Sleep(100 * time.Millisecond)
+
+	// Shutdown runs on its own goroutine so this test reports a clean failure
+	// instead of deadlocking. http.Server.Shutdown waits on its listener group
+	// for Serve to return, and that wait is NOT context-aware -- so a wedged
+	// accept loop hangs Shutdown itself, past its own timeout. In drain() that is
+	// the first call, so nothing after it runs either.
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown(shutdownCtx) }()
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(8 * time.Second):
+		t.Fatal("Shutdown did not return with the ceiling saturated by a hijacked connection; " +
+			"it waits on its listener group for Serve, and that wait ignores the context, " +
+			"so drain() blocks on its very first call and the process never exits")
+	}
+
+	select {
+	case err := <-served:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("Serve returned %v, want ErrServerClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after Shutdown; main blocks here and never reaches the drain join")
 	}
 }

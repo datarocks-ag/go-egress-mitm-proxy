@@ -43,6 +43,17 @@ type TrackingListener struct {
 	// that applies. Those connections also make WaitForDrain burn the full budget
 	// on every rollout, since they never close.
 	slots chan struct{}
+
+	// done is closed by Close so a saturated Accept stops waiting. Closing a
+	// net.Listener does not interrupt a channel send, so without this the accept
+	// loop stays parked in the slot wait forever: Shutdown closes the listener,
+	// nothing wakes the send, Serve never returns, and main -- which blocks on
+	// Serve -- never reaches the drain join. The connections holding the slots
+	// are hijacked CONNECT tunnels that may never close, which is exactly the
+	// case the ceiling exists for, so the bound would otherwise introduce a
+	// shutdown hang in its own motivating scenario.
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewTrackingListener wraps ln so open connections can be counted and waited on,
@@ -58,7 +69,7 @@ func NewTrackingListener(ln net.Listener) *TrackingListener {
 // the kernel backlog absorbs the wait, and a client that times out retries,
 // whereas a rejected connection looks to the caller like the proxy is down.
 func NewLimitedTrackingListener(ln net.Listener, maxConns int) *TrackingListener {
-	l := &TrackingListener{Listener: ln}
+	l := &TrackingListener{Listener: ln, done: make(chan struct{})}
 	if maxConns > 0 {
 		l.slots = make(chan struct{}, maxConns)
 	}
@@ -77,7 +88,13 @@ func (l *TrackingListener) Accept() (net.Conn, error) {
 			metrics.ListenerSaturated.Inc()
 			slog.Warn("Client connection limit reached; accepting is paused until one closes",
 				"limit", cap(l.slots), "open", l.Open())
-			l.slots <- struct{}{}
+			select {
+			case l.slots <- struct{}{}:
+			case <-l.done:
+				// Shutting down. Serve turns this into ErrServerClosed because it
+				// checks shuttingDown() before inspecting the error.
+				return nil, net.ErrClosed
+			}
 		}
 	}
 
@@ -109,6 +126,18 @@ func (l *TrackingListener) releaseSlot() {
 	case <-l.slots:
 	default:
 	}
+}
+
+// Close stops the listener and releases any Accept parked on the connection
+// ceiling. Safe to call more than once: http.Server closes the listener during
+// Shutdown, and callers commonly defer a Close of their own.
+func (l *TrackingListener) Close() error {
+	l.closeOnce.Do(func() {
+		if l.done != nil {
+			close(l.done)
+		}
+	})
+	return l.Listener.Close()
 }
 
 // Open reports how many accepted connections are still open.
