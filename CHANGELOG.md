@@ -28,6 +28,41 @@ git history for the full detail.
 
 Findings from a full multi-lens code review of `main`, grouped by area:
 
+- **A rewrite rule no longer overrides the blacklist.** The rewrite table was
+  consulted before the denylist, so a host that matched both was `REWRITTEN` and
+  forwarded — to the rule's `target_ip`, carrying that rule's injected headers.
+  A denied host was not merely allowed, it was allowed with credentials attached.
+  The blacklist is now evaluated first on the request path.
+- **Blacklisted HTTPS hosts get a 403 and an audit-log entry.** Narrowing the
+  CONNECT-stage check to passthrough hosts removed the backstop for everything
+  else; blacklisted hosts are now intercepted and refused by the handler, which
+  is also what puts them in the blocked-request log.
+- **A blacklisted HTTPS attempt is recorded even when interception fails.** A
+  blacklisted host is intercepted rather than refused so the handler can answer
+  with a readable 403, but that leaves the denial recorded only if the client
+  completes the handshake with the proxy's certificate — a pinning SDK or a JVM
+  truststore never will, and goproxy routes that failure to debug level. The
+  attempt now warns and counts under a distinct `BLACK-LISTED-CONNECT` action at
+  the CONNECT stage, so a denial is observable regardless of whether the client
+  cooperates. The separate label keeps it from inflating the `BLACK-LISTED`
+  count that `HandleRequest` records when the handshake does succeed.
+- **The truststore password is kept out of the log stream.**
+- **The leaf-certificate cache is keyed by signing identity**, not by hostname
+  alone, so two callers configured with different CAs cannot be served each
+  other's leaves.
+- **A metrics-port bind failure is fatal** instead of leaving the proxy running
+  with no observability.
+- **Trace records survive log rotation.** The logger is resolved when the record
+  is emitted rather than captured when the request starts, so a SIGHUP mid-request
+  no longer writes the record to the closed file.
+- **Body capture no longer breaks WebSocket upgrades.** A 101 response hands the
+  body to the caller as an `io.ReadWriter` for the upgraded connection; wrapping
+  it broke the upgrade outright.
+- **A late dial cannot contradict a reused connection.** An abandoned dial could
+  still write `connected_ip` and dial timing onto a record already marked
+  `connection_reused`, producing a trace that answered "where did this request
+  go" with a socket the request never used.
+
 - **Hostnames are normalized before every policy decision.** DNS names are
   case-insensitive and a trailing dot denotes the same FQDN, but patterns were
   compiled case-sensitively and hosts were matched verbatim. In the documented
@@ -75,8 +110,19 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   image.
 - `gencert` creates its output directories, so the documented Quick Start works
   on a fresh clone.
+- **Fail-open denylist entries in the example configuration.** The example is
+  what the Quick Start says to copy, so its denylist reads as an idiom. A raw
+  regex was annotated as a substring match when raw patterns are anchored
+  (`ads.social-media.internal` went straight through), and the wildcard entries
+  left the bare apex domains `ALLOWED-BY-DEFAULT`. The example config, the
+  Kubernetes ConfigMap and the Deployment's config mount path are now covered by
+  tests, which is what had been missing when each of them shipped broken.
 
 ### Breaking
+- **The blocked-request log renames `path` to `target`.** A CONNECT carries
+  `host:port` in its request-target rather than a path, so the old field was
+  empty for exactly the entries an audit log most needs — rejected HTTPS
+  tunnels. Log consumers keying on `path` must be updated.
 - **Configs containing a misplaced `*` no longer load.** Only a leading `*.`
   label is expanded; a `*` anywhere else survived escaping and was then anchored,
   so `api.*.evil.com` compiled to a pattern that matched nothing. On a blacklist
@@ -104,6 +150,16 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   `log_path` parent directory does not exist) and captured full headers and
   bodies by default.
 - `cert.BuildOutboundTLSConfig` and `cert.LoadCertPool` now return errors.
+- `proxy_request_duration_seconds` measures the request, not the policy handler.
+  It was observed around rule evaluation and returned before the upstream
+  round-trip, so it reported proxy overhead while looking like request latency.
+  Forwarded requests are now observed once the round-trip returns, so the span
+  covers DNS, dial, TLS handshake and upstream think-time. **Existing dashboards
+  and alert thresholds on this histogram will shift upward.**
+- `proxy_active_connections` is a `GaugeFunc` backed by the listener's live
+  count. It was incremented around the `OnRequest` filter, which returns before
+  the upstream round-trip and never saw hijacked CONNECT tunnels at all, so it
+  read approximately zero at every scrape.
 - `trace.redact_query` defaults to `true`. Query strings routinely carry tokens
   in `?access_token=`/`?sig=` form, so the safe setting is the one you get by
   omitting the field; set `redact_query: false` to opt out.

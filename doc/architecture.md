@@ -254,7 +254,9 @@ Optional JSON log file for auditing blocked requests:
 
 - Configured via `blocked_log_path` (YAML) or `PROXY_BLOCKED_LOG_PATH` (env)
 - Only logs requests with action `BLACK-LISTED` or `BLOCKED`
-- Each entry: `request_id`, `client`, `host`, `method`, `path`, `action`
+- Each entry: `request_id`, `client`, `host`, `method`, `target`, `action`
+- `target` holds the request path for a forwarded request and `host:port` for a
+  rejected CONNECT, whose request-target carries no path
 - File created with 0600 permissions
 - Reopened on SIGHUP for log rotation support
 - Old file handle closed after successful reload
@@ -291,8 +293,8 @@ Prometheus metrics with bounded cardinality:
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `proxy_traffic_total` | Counter | domain, action | Requests by domain/action |
-| `proxy_request_duration_seconds` | Histogram | action | Request latency |
-| `proxy_active_connections` | Gauge | - | Current connections |
+| `proxy_request_duration_seconds` | Histogram | action | Request latency. Forwarded requests are observed once the upstream round-trip returns, so the span includes DNS, dial, TLS and upstream think-time; blocked requests are recorded in the handler |
+| `proxy_active_connections` | Gauge | - | Client connections open at the listener, including hijacked CONNECT tunnels. A `GaugeFunc` read at scrape time |
 | `proxy_config_load_errors_total` | Counter | - | Config load failures |
 | `proxy_config_reloads_total` | Counter | - | Successful reloads |
 | `proxy_upstream_errors_total` | Counter | type | Upstream errors |

@@ -450,7 +450,9 @@ Debug and trace logging have zero overhead when not enabled — the log construc
 
 ## Blocked Request Log
 
-When `blocked_log_path` is configured, the proxy writes a JSON log entry for every request with action `BLACK-LISTED` or `BLOCKED`. Each entry includes `request_id`, `client`, `host`, `method`, `path`, and `action`. The log file is reopened on SIGHUP for log rotation support.
+When `blocked_log_path` is configured, the proxy writes a JSON log entry for every request with action `BLACK-LISTED` or `BLOCKED`. Each entry includes `request_id`, `client`, `host`, `method`, `target`, and `action`. The log file is reopened on SIGHUP for log rotation support.
+
+`target` is the request path for a forwarded request. A CONNECT carries `host:port` in its request-target rather than a path, so rejected CONNECTs record the authority there — the field was previously named `path` and was empty for exactly those entries, which is the case an audit log most needs to show.
 
 ## Metrics
 
@@ -468,7 +470,17 @@ Available at `http://localhost:9090/metrics`:
 | `proxy_bytes_total` | Counter | direction | Bytes transferred (request/response) |
 | `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough) |
 
-Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `PASSTHROUGH`
+Three of these measure something different than a first reading suggests, which matters if you are building alerts on them:
+
+- `proxy_request_duration_seconds` is observed for a forwarded request once the upstream round-trip returns, so the span covers DNS, dial, TLS handshake and upstream think-time — not just proxy overhead. Blocked requests are recorded in the handler, where the elapsed time *is* the whole request.
+- `proxy_active_connections` counts client connections open at the listener, including hijacked CONNECT tunnels. It is a `GaugeFunc` reading the live count at scrape time.
+- `proxy_trace_records_total` only advances when a record is actually written. If the destination logger would filter the record, the proxy warns and does not count it, so the counter cannot disagree with the log.
+
+Actions: `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `PASSTHROUGH`, `BLACK-LISTED-CONNECT`
+
+`BLACK-LISTED-CONNECT` is recorded at the CONNECT stage when a blacklisted host is intercepted. Interception is preferred over refusing the tunnel because it lets the handler return a readable 403, but the denial is then only recorded if the client completes the TLS handshake with the proxy CA — a certificate-pinning SDK or a JVM with its own truststore never will. Counting the attempt at CONNECT keeps it observable either way, and the separate label stops it inflating the `BLACK-LISTED` count that `HandleRequest` records when the handshake does succeed.
+
+A host that is both passthrough *and* blacklisted is refused outright, since a passthrough tunnel is never inspected; that case counts as `BLACK-LISTED`.
 
 ## Health Endpoints
 
