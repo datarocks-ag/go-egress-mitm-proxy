@@ -289,7 +289,7 @@ Opt-in, full-detail tracing of a subset of requests (configured via the `trace:`
   `io.ReadWriter` assertion and drops the WebSocket tunnel.
 - Blocked (403) and upstream-error (502/504) paths emit via their synthetic responses
 - Passthrough (non-MITM) hosts are traced TCP-only via goproxy's per-request `ctx.Dialer` (connected IP, dial timing, bytes up/down)
-- Redaction is secure-by-default. Always masked: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and the URL-bearing `Location`, `Content-Location`, `Referer` (an OAuth 302 carries the authorization code in `Location`, and `redact_query` only ever saw the request URL). `redactURL` also strips `user:password@`. `redact_headers` extends the set; `log_secrets` disables all of it
+- Redaction is secure-by-default. Always masked: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and the URL-bearing `Location`, `Content-Location`, `Referer` (an OAuth 302 carries the authorization code in `Location`, and `redact_query` only ever saw the request URL). `redactURL` also strips `user:password@`. `redact_headers` extends the set, and a `-` prefix removes one built-in without touching the rest; `log_secrets` disables all of it
 - **Bodies are not redacted.** `renderBody` receives no redactor, so enabling `bodies` writes payloads verbatim within the size caps and content-type gate
 - Independent of the `-v/-vv/-vvv` level; trace log file reopened on SIGHUP for rotation
 

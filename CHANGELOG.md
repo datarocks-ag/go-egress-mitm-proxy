@@ -10,6 +10,23 @@ git history for the full detail.
 
 ## [Unreleased]
 
+### Added
+- **`trace.redact_headers` entries may be prefixed with `-` to remove a built-in
+  default.** `redact_headers: ["-location"]` makes redirect targets visible while
+  `Authorization` and `Cookie` stay masked. Until now the only way to see a
+  masked header was `log_secrets: true`, which disables redaction entirely -- so
+  an operator who needed `Location` to follow a redirect chain had to give up the
+  masking of every credential to get it, and an all-or-nothing escape hatch
+  invites reaching for the widest setting to solve the narrowest problem.
+
+  Entries apply in order, so `["-location", "location"]` re-masks it. Removing a
+  credential-bearing default (`Authorization`, `Proxy-Authorization`, `Cookie`,
+  `Set-Cookie`) is allowed but logs a warning at startup naming the header.
+  Removing a header that is not masked is a load error listing the built-ins,
+  rather than a no-op that reads as having taken effect -- for a redaction
+  setting, silently doing nothing means believing a header is visible when it
+  was never masked.
+
 ## [4.0.0] - 2026-08-07
 
 ### Fixed

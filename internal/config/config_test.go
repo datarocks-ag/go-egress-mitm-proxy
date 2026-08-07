@@ -5,6 +5,7 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -1644,5 +1645,121 @@ func TestValidateAcceptsHostHeaderInjection(t *testing.T) {
 
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() rejected a Host injection, which the handler does apply: %v", err)
+	}
+}
+
+// TestRedactHeadersRemovalValidation covers the "-" prefix's failure modes.
+//
+// A removal that removes nothing reads as taking effect and does not. For a
+// redaction setting that is the wrong way round: the operator believes a header
+// is visible in their traces when it was never masked, and goes looking for the
+// bug elsewhere.
+func TestRedactHeadersRemovalValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		redact  []string
+		wantErr string
+	}{
+		{
+			name:    "removing a header that is not masked",
+			redact:  []string{"-x-not-masked"},
+			wantErr: "cannot remove",
+		},
+		{
+			name:    "removing a header the same list added is allowed",
+			redact:  []string{"x-api-key", "-x-api-key"},
+			wantErr: "",
+		},
+		{
+			name:    "removing before adding is an error, since nothing is masked yet",
+			redact:  []string{"-x-api-key", "x-api-key"},
+			wantErr: "cannot remove",
+		},
+		{
+			name:    "a bare dash names no header",
+			redact:  []string{"-"},
+			wantErr: "names no header",
+		},
+		{
+			name:    "removing a built-in default is allowed",
+			redact:  []string{"-location"},
+			wantErr: "",
+		},
+		{
+			name:    "removing a credential-bearing default is allowed but warned",
+			redact:  []string{"-authorization"},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := CompileTrace(TraceConfig{
+				Enabled:       true,
+				RedactHeaders: tt.redact,
+				Rules:         []TraceRule{{Host: "*"}},
+			})
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("CompileTrace() = %v, want success", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("CompileTrace() accepted %v, want an error mentioning %q", tt.redact, tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Errorf("error %q does not mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRedactHeadersErrorNamesTheDefaults: the error has to be actionable, and
+// the built-in set is the one thing the operator cannot see from their config.
+func TestRedactHeadersErrorNamesTheDefaults(t *testing.T) {
+	_, err := CompileTrace(TraceConfig{
+		Enabled:       true,
+		RedactHeaders: []string{"-nope"},
+		Rules:         []TraceRule{{Host: "*"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"authorization", "location"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not list the default %q, so it cannot be acted on: %v", want, err)
+		}
+	}
+}
+
+// TestRemovingACredentialHeaderWarns pins the warning. Un-masking Location is
+// the intended use; un-masking Authorization writes the credential itself to
+// disk, and that should not happen quietly.
+func TestRemovingACredentialHeaderWarns(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	if _, err := CompileTrace(TraceConfig{
+		Enabled:       true,
+		RedactHeaders: []string{"-authorization"},
+		Rules:         []TraceRule{{Host: "*"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "authorization") {
+		t.Errorf("removing authorization from the redaction set was silent:\n%s", buf.String())
+	}
+
+	// The URL-bearing defaults are the motivating case; warning on them too would
+	// be noise on the intended path.
+	buf.Reset()
+	if _, err := CompileTrace(TraceConfig{
+		Enabled:       true,
+		RedactHeaders: []string{"-location"},
+		Rules:         []TraceRule{{Host: "*"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("removing location warned; that is the intended use:\n%s", buf.String())
 	}
 }
