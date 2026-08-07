@@ -99,13 +99,24 @@ func TestKubernetesManifestsMountConfigWhereTheBinaryReadsIt(t *testing.T) {
 	// Must match CONFIG_PATH in the Dockerfile.
 	const wantMountPath = "/app/config.yaml"
 
-	// The proxy is a native sidecar, so it lives under initContainers; check both
-	// so this keeps working if that changes.
-	all := append(append([]container{}, manifest.Spec.Template.Spec.Containers...),
-		manifest.Spec.Template.Spec.InitContainers...)
+	// Scan initContainers only. The proxy is deliberately a native sidecar, and
+	// restartPolicy is not a valid field on an ordinary container -- scanning both
+	// would report a confusing "restartPolicy is empty" if it were ever moved
+	// back, instead of naming the actual problem.
+	if len(manifest.Spec.Template.Spec.InitContainers) == 0 {
+		t.Fatal("no initContainers: the proxy must be a native sidecar so the kubelet starts it " +
+			"before the app and stops it only after the app exits")
+	}
+	for _, c := range manifest.Spec.Template.Spec.Containers {
+		if c.Name == "mitm-proxy" {
+			t.Error("mitm-proxy is an ordinary container; as a native sidecar it belongs in " +
+				"initContainers with restartPolicy: Always, or the kubelet SIGTERMs it alongside " +
+				"the app and egress dies while the app is still draining")
+		}
+	}
 
 	var found bool
-	for _, c := range all {
+	for _, c := range manifest.Spec.Template.Spec.InitContainers {
 		if c.Name != "mitm-proxy" {
 			continue
 		}
