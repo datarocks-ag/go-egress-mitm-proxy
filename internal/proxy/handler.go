@@ -211,6 +211,21 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 			r.Header.Del(h)
 		}
 		for k, v := range matchedRewrite.Headers {
+			// Host lives in r.Host, not r.Header. net/http excludes it from
+			// Header.WriteSubset and derives the wire value (and HTTP/2
+			// :authority) from r.Host, so Header.Set("Host", ...) is silently
+			// dropped on the way out. Setting a Host that never arrives is the
+			// worst kind of failure for a rewrite: the ACCESS log says REWRITTEN
+			// and the trace diff lists the header as added, while the backend
+			// answers from whichever vhost the original name selected.
+			//
+			// Every request already carries a Host, so this is always a
+			// modification rather than an addition.
+			if strings.EqualFold(k, "Host") {
+				modified = append(modified, k)
+				r.Host = v
+				continue
+			}
 			// Set overwrites; distinguish a brand-new header from one that
 			// replaces an existing client value so the diff stays accurate.
 			if len(r.Header.Values(k)) > 0 {

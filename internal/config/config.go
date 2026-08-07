@@ -480,6 +480,9 @@ func (c *Config) Validate() error {
 		if rw.TargetScheme != "" && rw.TargetScheme != "http" && rw.TargetScheme != "https" {
 			return fmt.Errorf("rewrites[%d]: invalid target_scheme %q: must be \"http\" or \"https\"", i, rw.TargetScheme)
 		}
+		if err := validateRewriteHeaders(i, rw); err != nil {
+			return err
+		}
 	}
 
 	// Detect duplicate exact domains without path_pattern (second rule would be unreachable).
@@ -881,4 +884,46 @@ func ReloadIgnoredFields(oldCfg, newCfg Config) []string {
 // "independent of the -v/-vv/-vvv log level" true rather than aspirational.
 func MainStreamTraceLogger(w io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
+
+// framingHeaders are set by net/http from the request itself and cannot be
+// overridden through a header map. Request.write derives Content-Length and
+// Transfer-Encoding from the body, and Header.WriteSubset excludes all three
+// from the serialized headers, so a value configured here is discarded on the
+// way to the upstream.
+//
+// Accepting them would mean the proxy reports a header as injected (in the
+// ACCESS log and in the trace diff) that the backend never receives. For a
+// rewrite rule whose purpose is to reshape a request, silently doing nothing is
+// worse than refusing to start.
+//
+// Host is deliberately absent: it is applied via Request.Host instead, so
+// configuring it does work.
+var framingHeaders = []string{"Content-Length", "Transfer-Encoding", "Trailer"}
+
+// validateRewriteHeaders rejects header mutations that cannot take effect.
+func validateRewriteHeaders(i int, rw RewriteRule) error {
+	for k := range rw.Headers {
+		for _, bad := range framingHeaders {
+			if strings.EqualFold(k, bad) {
+				return fmt.Errorf("rewrites[%d]: headers cannot set %q: net/http derives it from the "+
+					"request body and discards a configured value", i, k)
+			}
+		}
+	}
+	for _, h := range rw.DropHeaders {
+		// Header.Del cannot remove Host (it lives in Request.Host), and a request
+		// without one is not a valid HTTP/1.1 request in any case.
+		if strings.EqualFold(h, "Host") {
+			return fmt.Errorf("rewrites[%d]: drop_headers cannot remove %q: every request must carry a "+
+				"Host, and it is not stored in the header map; use headers to set a different value", i, h)
+		}
+		for _, bad := range framingHeaders {
+			if strings.EqualFold(h, bad) {
+				return fmt.Errorf("rewrites[%d]: drop_headers cannot remove %q: net/http derives it from "+
+					"the request body", i, h)
+			}
+		}
+	}
+	return nil
 }

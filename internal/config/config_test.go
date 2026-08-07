@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -1558,5 +1559,88 @@ func TestRedactQueryDefaultsToMasked(t *testing.T) {
 				t.Errorf("RedactQuery = %v, want %v", ct.RedactQuery, tt.want)
 			}
 		})
+	}
+}
+
+// TestValidateRejectsUnsettableRewriteHeaders pins that a header mutation which
+// cannot take effect is a load error rather than a silent no-op.
+//
+// net/http derives Content-Length and Transfer-Encoding from the request body
+// and excludes them (and Trailer) from the serialized headers, so a configured
+// value never reaches the upstream. Accepting the config would have the proxy
+// report the header as injected in both the ACCESS log and the trace diff while
+// the backend never sees it.
+func TestValidateRejectsUnsettableRewriteHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		rule    RewriteRule
+		wantErr string
+	}{
+		{
+			name: "headers cannot set Content-Length",
+			rule: RewriteRule{
+				Domain: "api.internal", TargetIP: "10.0.0.1",
+				Headers: map[string]string{"Content-Length": "42"},
+			},
+			wantErr: "Content-Length",
+		},
+		{
+			name: "headers cannot set Transfer-Encoding, case-insensitively",
+			rule: RewriteRule{
+				Domain: "api.internal", TargetIP: "10.0.0.1",
+				Headers: map[string]string{"transfer-encoding": "chunked"},
+			},
+			wantErr: "transfer-encoding",
+		},
+		{
+			name: "drop_headers cannot remove Host",
+			rule: RewriteRule{
+				Domain: "api.internal", TargetIP: "10.0.0.1",
+				DropHeaders: []string{"Host"},
+			},
+			wantErr: "Host",
+		},
+		{
+			name: "drop_headers cannot remove Content-Length",
+			rule: RewriteRule{
+				Domain: "api.internal", TargetIP: "10.0.0.1",
+				DropHeaders: []string{"Content-Length"},
+			},
+			wantErr: "Content-Length",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Rewrites: []RewriteRule{tt.rule}}
+			cfg.Proxy.DefaultPolicy = "BLOCK"
+			cfg.Proxy.MitmCertPath = "ca.crt"
+			cfg.Proxy.MitmKeyPath = "ca.key"
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate() accepted a header mutation that cannot take effect")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not name the offending header %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsHostHeaderInjection is the companion: Host IS applicable,
+// because the handler routes it to Request.Host instead of the header map.
+// Rejecting it would break the documented name-based-vhost rewrite.
+func TestValidateAcceptsHostHeaderInjection(t *testing.T) {
+	cfg := Config{Rewrites: []RewriteRule{{
+		Domain: "api.internal", TargetIP: "10.0.0.1",
+		Headers: map[string]string{"Host": "vhost.corp"},
+	}}}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	cfg.Proxy.MitmCertPath = "ca.crt"
+	cfg.Proxy.MitmKeyPath = "ca.key"
+
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() rejected a Host injection, which the handler does apply: %v", err)
 	}
 }
