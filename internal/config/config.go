@@ -1000,7 +1000,12 @@ var credentialRedactHeaders = map[string]bool{
 func applyRedactHeaders(set map[string]bool, entries []string) error {
 	for i, raw := range entries {
 		entry := strings.ToLower(strings.TrimSpace(raw))
+		// Trim again after the prefix: "- location" is an easy slip to make by
+		// hand, and leaving the space in would reject it as "not masked" -- an
+		// error that describes the wrong problem and sends the reader looking at
+		// their header name rather than their spacing.
 		name, remove := strings.CutPrefix(entry, "-")
+		name = strings.TrimSpace(name)
 		if name == "" {
 			return fmt.Errorf("trace.redact_headers[%d]: %q names no header", i, raw)
 		}

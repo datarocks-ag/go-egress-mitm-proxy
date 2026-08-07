@@ -82,13 +82,20 @@ func TestRedactHeadersAddAndRemoveCompose(t *testing.T) {
 // TestRedactHeadersRemovalIsCaseAndSpaceInsensitive matches how the plain form
 // already behaves, so the two do not diverge.
 func TestRedactHeadersRemovalIsCaseAndSpaceInsensitive(t *testing.T) {
-	rd := redactorFor(t, []string{"  -LOCATION  "})
+	// Including a space between the prefix and the name: an easy slip to make by
+	// hand, and one that used to be rejected as "not masked" -- an error naming
+	// the wrong problem.
+	for _, entry := range []string{"  -LOCATION  ", "- location", "-  Location", "  - LOCATION  "} {
+		t.Run(entry, func(t *testing.T) {
+			rd := redactorFor(t, []string{entry})
 
-	hdr := http.Header{}
-	hdr.Set("Location", "https://app/cb?code=visible")
-	if !strings.Contains(rd.headerMap(hdr)["Location"], "code=visible") {
-		t.Error("\"  -LOCATION  \" did not unmask Location; the removal form must normalize " +
-			"like the add form")
+			hdr := http.Header{}
+			hdr.Set("Location", "https://app/cb?code=visible")
+			if !strings.Contains(rd.headerMap(hdr)["Location"], "code=visible") {
+				t.Errorf("%q did not unmask Location; the removal form must normalize "+
+					"like the add form", entry)
+			}
+		})
 	}
 }
 
