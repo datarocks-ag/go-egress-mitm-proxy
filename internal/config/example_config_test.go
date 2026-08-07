@@ -5,7 +5,9 @@
 package config_test
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go-egress-proxy/internal/config"
@@ -15,10 +17,35 @@ import (
 // documentation that executes, so it gets tested like code.
 const exampleConfigPath = "../../doc/examples/configuration.yaml"
 
+// withoutProxyEnv clears every PROXY_* override for the duration of the test.
+//
+// LoadConfig applies environment overrides, so these tests otherwise depend on
+// the developer's shell: exporting PROXY_MITM_KEYSTORE_PATH (a normal thing to
+// do when running the proxy with a PKCS#12 keystore) makes the example config
+// fail the mutually-exclusive check, and PROXY_DEFAULT_POLICY with an
+// unexpected value fails validation. Neither has anything to do with what is
+// being asserted, so the environment is removed rather than reasoned about.
+//
+// The list is derived from os.Environ() instead of being written out, so a
+// PROXY_* variable added later is covered without anyone remembering to update
+// this. Every override is read with os.Getenv(...) != "", so setting a variable
+// to the empty string is equivalent to unsetting it; t.Setenv restores the
+// original value when the test ends.
+func withoutProxyEnv(t *testing.T) {
+	t.Helper()
+	for _, entry := range os.Environ() {
+		if key, _, found := strings.Cut(entry, "="); found && strings.HasPrefix(key, "PROXY_") {
+			t.Setenv(key, "")
+		}
+	}
+}
+
 // TestExampleConfigLoads guards against the example drifting out of sync with
 // the loader — a shipped config that fails Validate() breaks the first thing a
 // new user does.
 func TestExampleConfigLoads(t *testing.T) {
+	withoutProxyEnv(t)
+
 	if _, err := config.LoadConfig(filepath.Clean(exampleConfigPath)); err != nil {
 		t.Fatalf("shipped example config does not load: %v", err)
 	}
@@ -33,6 +60,8 @@ func TestExampleConfigLoads(t *testing.T) {
 // denylists — where subdomains would sail straight through. A denylist example
 // that fails open is worse than no example.
 func TestExampleBlacklistDoesNotFailOpen(t *testing.T) {
+	withoutProxyEnv(t)
+
 	cfg, err := config.LoadConfig(filepath.Clean(exampleConfigPath))
 	if err != nil {
 		t.Fatalf("load example config: %v", err)
