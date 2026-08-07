@@ -90,10 +90,26 @@ func (rd Redactor) redactURL(raw string) string {
 	return u.String()
 }
 
+// LoggerFunc resolves the destination logger at emit time.
+//
+// A Record can outlive the configuration it was created under: a passthrough
+// record emits from countingConn.Close, which may be hours after the tunnel
+// opened. SIGHUP rotates the trace log and closes the previous file handle, so a
+// Record holding a captured *slog.Logger would write to a closed descriptor.
+// slog discards handler errors, so the record would vanish with no diagnostic —
+// on precisely the code path rotation exists for. Resolving late means a record
+// emitted after a rotation lands in the current file.
+type LoggerFunc func() *slog.Logger
+
+// StaticLogger adapts a fixed logger for callers with no rotation concern.
+func StaticLogger(l *slog.Logger) LoggerFunc {
+	return func() *slog.Logger { return l }
+}
+
 // Record accumulates the full trace of a single request or passthrough tunnel
 // and emits it exactly once as an aggregated JSON log entry.
 type Record struct {
-	logger   *slog.Logger
+	logger   LoggerFunc
 	bodies   config.CompiledBodyCapture
 	redactor Redactor
 	once     sync.Once
@@ -104,6 +120,13 @@ type Record struct {
 	connectHost string
 	sni         string
 
+	// mu guards the fields the dialer writes. http.Transport dials on its own
+	// goroutine (go t.dialConnFor(w)); when the request goroutine is instead
+	// satisfied by a freed idle connection, the abandoned dial keeps running and
+	// still calls SetTCP/SetError — potentially while the request goroutine is
+	// already emitting. Request cancellation produces the same overlap.
+	// bytesUp/bytesDown are atomics for the equivalent reason on the tunnel path.
+	mu          sync.Mutex
 	connectedIP string
 	dialMillis  int64
 	connReused  bool
@@ -135,7 +158,7 @@ type Record struct {
 
 // NewRecord creates a trace Record. logger may be nil, in which case the
 // aggregated entry is emitted via the default slog logger.
-func NewRecord(traceID, mode string, rule *config.CompiledTraceRule, redactor Redactor, logger *slog.Logger) *Record {
+func NewRecord(traceID, mode string, rule *config.CompiledTraceRule, redactor Redactor, logger LoggerFunc) *Record {
 	rec := &Record{
 		logger:   logger,
 		redactor: redactor,
@@ -156,6 +179,18 @@ func (r *Record) SetConnect(host, sni string) {
 
 // SetTCP records the established connection's resolved IP, dial duration, and TLS details.
 func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, tlsCipher string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// An abandoned dial can still be running after the request goroutine was
+	// satisfied by a pooled connection and applyResponse concluded the connection
+	// was reused. Accepting its values here would emit a record claiming both
+	// connection_reused and a connected_ip, describing a connection this request
+	// never used.
+	if r.connReused {
+		return
+	}
+
 	r.connectedIP = connectedIP
 	r.dialMillis = dialDur.Milliseconds()
 	r.tlsVersion = tlsVersion
@@ -164,6 +199,15 @@ func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, t
 
 // SetError records an upstream/dial error for the trace.
 func (r *Record) SetError(msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Same reasoning as SetTCP: a dial abandoned after the request completed on a
+	// pooled connection must not attach its failure to a request that succeeded.
+	if r.connReused {
+		return
+	}
+
 	r.errMsg = msg
 }
 
@@ -214,9 +258,11 @@ func (r *Record) applyResponse(resp *http.Response) {
 
 	// A MITM response with no recorded dial means the upstream connection was
 	// reused from the pool; its remote IP is not observable for this request.
+	r.mu.Lock()
 	if r.mode == "mitm" && r.connectedIP == "" && r.errMsg == "" {
 		r.connReused = true
 	}
+	r.mu.Unlock()
 
 	// Wrap the body only when bytes actually need teeing.
 	//
@@ -239,7 +285,14 @@ func (r *Record) applyResponse(resp *http.Response) {
 	// records are emitted before the response body finishes streaming, so a
 	// failure that occurs mid-body is not reflected; enable body capture for the
 	// rule if that matters.
-	if resp.Body == nil || resp.Body == http.NoBody || !r.CaptureResponseBody() {
+	// A 101 is not a body at all: goproxy hands the upgraded connection to the
+	// client by asserting resp.Body.(io.ReadWriter) (https.go:550). Wrapping it
+	// leaves only Read and Close, the assertion fails, and goproxy drops the
+	// tunnel with a debug-level warning — so enabling body capture on a rule
+	// silently broke every MITM WebSocket upgrade to that host. It also tripped
+	// the same chunked re-framing this guard exists to prevent.
+	if resp.Body == nil || resp.Body == http.NoBody ||
+		resp.StatusCode == http.StatusSwitchingProtocols || !r.CaptureResponseBody() {
 		r.Emit()
 		return
 	}
@@ -264,11 +317,13 @@ func (r *Record) Emit() {
 }
 
 func (r *Record) emit() {
-	logger := r.logger
+	var logger *slog.Logger
+	if r.logger != nil {
+		logger = r.logger()
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	metrics.TraceRecords.WithLabelValues(r.mode).Inc()
 
 	attrs := []any{
 		slog.String("trace_id", r.traceID),
@@ -281,16 +336,23 @@ func (r *Record) emit() {
 	}
 	attrs = append(attrs, slog.Group("connect", connect...))
 
+	// Snapshot under the lock: an abandoned dial may still be writing these.
+	r.mu.Lock()
+	connectedIP, dialMillis := r.connectedIP, r.dialMillis
+	connReused, tlsVersion, tlsCipher := r.connReused, r.tlsVersion, r.tlsCipher
+	errMsg := r.errMsg
+	r.mu.Unlock()
+
 	tcp := []any{}
-	if r.connectedIP != "" {
-		tcp = append(tcp, slog.String("connected_ip", r.connectedIP))
-		tcp = append(tcp, slog.Int64("dial_ms", r.dialMillis))
+	if connectedIP != "" {
+		tcp = append(tcp, slog.String("connected_ip", connectedIP))
+		tcp = append(tcp, slog.Int64("dial_ms", dialMillis))
 	}
-	if r.connReused {
+	if connReused {
 		tcp = append(tcp, slog.Bool("connection_reused", true))
 	}
-	if r.tlsVersion != "" {
-		tcp = append(tcp, slog.String("tls_version", r.tlsVersion), slog.String("tls_cipher", r.tlsCipher))
+	if tlsVersion != "" {
+		tcp = append(tcp, slog.String("tls_version", tlsVersion), slog.String("tls_cipher", tlsCipher))
 	}
 	if up, down := r.bytesUp.Load(), r.bytesDown.Load(); up != 0 || down != 0 {
 		tcp = append(tcp, slog.Int64("bytes_up", up), slog.Int64("bytes_down", down))
@@ -339,11 +401,16 @@ func (r *Record) emit() {
 		attrs = append(attrs, slog.Group("response", resp...))
 	}
 
-	if r.errMsg != "" {
-		attrs = append(attrs, slog.String("error", r.errMsg))
+	if errMsg != "" {
+		attrs = append(attrs, slog.String("error", errMsg))
 	}
 
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "trace", toAttrs(attrs)...)
+
+	// Counted after the write, not before. slog discards handler errors so this
+	// cannot detect a failed write, but incrementing first guaranteed the counter
+	// and the file diverged whenever a write did not land.
+	metrics.TraceRecords.WithLabelValues(r.mode).Inc()
 }
 
 // toAttrs converts a slice that already holds slog.Attr values into []slog.Attr.
