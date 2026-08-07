@@ -51,6 +51,7 @@ Multi-package application using goproxy library with thread-safe hot-reloadable 
 **Package Layout:**
 ```
 cmd/mitm-proxy/main.go        # CLI entrypoint: arg parsing, signal handling, wiring
+cmd/mitm-proxy/reload.go       # SIGHUP reload: config swap, log reopen, transport pool reset
 internal/config/config.go      # Types, YAML loading, validation, env overrides, ACL/rewrite compilation
 internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
 internal/cert/gencert.go       # gencert subcommand + key pair generation
@@ -59,9 +60,6 @@ internal/proxy/handler.go      # Request handling, dialers, rewrite lookup, doma
 internal/proxy/connect.go      # CONNECT decision handling, reject responses, passthrough trace wiring
 internal/proxy/listener.go     # Connection-tracking listener for CONNECT-tunnel drain
 internal/proxy/transport.go    # Per-rewrite-target upstream transport pool
-internal/proxy/connect.go      # CONNECT-stage handler: policy dispatch, reject, passthrough trace wiring
-internal/proxy/transport.go    # Per-rewrite-target transport pool (correct connection-pool keying)
-internal/proxy/listener.go     # Connection-tracking listener (drains hijacked CONNECT tunnels)
 internal/cert/store.go         # Bounded, TTL'd MITM leaf certificate cache
 internal/trace/trace.go        # Selective trace Record, redaction, body capture, aggregated emit
 internal/trace/conn.go         # Passthrough tunnel tracing dialer + byte-counting conn
@@ -87,7 +85,7 @@ cmd/main    → cert, config, health, metrics, proxy, trace
 2. Otherwise, proxy presents cert signed by internal CA (MITM)
 3. Request ID generated and injected (`X-Request-ID`)
 4. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
-5. Actions: `PASSTHROUGH`, `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`
+5. Actions: `PASSTHROUGH`, `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `BLACK-LISTED-CONNECT` (CONNECT refused at the CONNECT stage for a passthrough+blacklisted host, which never reaches `HandleRequest`)
 5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
 6. Headers dropped (`drop_headers`) and injected (`headers`) on rewritten requests
 7. Request scheme optionally changed (`target_scheme`) before forwarding
@@ -229,7 +227,11 @@ Typical production workflow: generate root CA (store offline) → generate inter
 ```
 cmd/mitm-proxy/
   main.go                      # CLI entrypoint, signal handling, wiring
+  reload.go                    # SIGHUP reload (extracted from main for testability)
   main_test.go                 # Version and usage tests
+  prestop_test.go              # PROXY_PRESTOP_GRACE parsing tests
+  reload_test.go               # Reload, fd cleanup, log rotation tests
+  reload_signal_test.go        # SIGHUP-driven reload (build tag: unix)
 internal/config/
   config.go                    # Config types, loading, validation, ACL/rewrite compilation
   config_test.go               # Config, ACL, rewrite, runtime, validate tests

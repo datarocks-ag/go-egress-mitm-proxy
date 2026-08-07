@@ -13,8 +13,10 @@ spec:
       labels:
         app: my-app
     spec:
-      # Must exceed the proxy's 30s drain budget, or the kubelet SIGKILLs it
-      # mid-drain and the graceful shutdown is wasted.
+      # Must exceed PROXY_PRESTOP_GRACE plus the 30s drain budget, or the kubelet
+      # SIGKILLs the proxy mid-drain and the graceful shutdown is wasted. Sized
+      # for the 10s default (10 + 30 = 40, with headroom); raise this by the same
+      # amount if you raise PROXY_PRESTOP_GRACE.
       terminationGracePeriodSeconds: 45
       containers:
         # 1. Your Application

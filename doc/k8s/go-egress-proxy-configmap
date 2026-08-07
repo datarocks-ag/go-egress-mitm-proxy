@@ -18,4 +18,8 @@ data:
         # Wildcard form. A bare regex like "^.*\\.google\\.com$" is escaped
         # literally by WildcardToRegex and never matches; prefix with "~" to opt
         # into raw regex, or use the wildcard form as here.
+        #
+        # "*.google.com" covers subdomains at any depth but NOT the apex
+        # "google.com". With default_policy BLOCK that fails closed, so add the
+        # apex explicitly if you need it. On a blacklist the same gap fails open.
         - "*.google.com"
