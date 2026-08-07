@@ -165,6 +165,9 @@ trace:
     # Trace every request to a host, including request & response bodies.
     - host: "*.internal.com"
       bodies:
+        # NOTE: body content is NOT redacted. redact_headers and redact_query
+        # cover headers and the query string only, so enabling this writes
+        # payloads verbatim -- treat the trace log as containing secrets.
         enabled: true
         capture: both                 # request | response | both (default: both)
         max_request_bytes: 65536       # per-direction cap (default: 8192)
