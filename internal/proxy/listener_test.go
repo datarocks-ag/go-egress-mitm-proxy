@@ -183,11 +183,15 @@ func TestLimitedListenerBoundsConcurrentConnections(t *testing.T) {
 		}
 	}()
 
+	// Fatal, not Errorf-and-return-nil: callers defer Close on the result, so a
+	// nil would turn a transient dial failure into a panic in the deferred call
+	// and bury the real cause. A failed dial makes the rest of this test
+	// meaningless anyway.
 	dial := func() net.Conn {
+		t.Helper()
 		c, dialErr := (&net.Dialer{}).DialContext(t.Context(), "tcp", base.Addr().String())
 		if dialErr != nil {
-			t.Errorf("dial: %v", dialErr)
-			return nil
+			t.Fatalf("dial: %v", dialErr)
 		}
 		return c
 	}
