@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go-egress-proxy/internal/netx"
 )
 
 // TrackingListener counts the client connections it has handed out that are
@@ -39,7 +41,14 @@ func (l *TrackingListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	l.open.Add(1)
-	return &trackedConn{Conn: conn, release: func() { l.open.Add(-1) }}, nil
+	tracked := &trackedConn{Conn: conn, release: func() { l.open.Add(-1) }}
+
+	// Every CONNECT tunnel is hijacked from a connection this listener returned,
+	// and goproxy takes its half-closable copy loop only when BOTH ends support
+	// half-close. Wrapping without preserving it here silently downgraded every
+	// tunnel — including the ones internal/trace already takes care to preserve
+	// on the target side, which made that work dead code in production.
+	return netx.PreserveHalfClose(conn, tracked), nil
 }
 
 // Open reports how many accepted connections are still open.
