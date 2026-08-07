@@ -394,6 +394,18 @@ make fmt
 
 ## Docker
 
+Images are published to `ghcr.io/datarocks-ag/go-egress-mitm-proxy` on `v*` tags and carry OCI metadata, so a running container can be traced back to its source:
+
+```bash
+docker inspect --format '{{json .Config.Labels}}' ghcr.io/datarocks-ag/go-egress-mitm-proxy:4.1.0 | jq
+# org.opencontainers.image.version   v4.1.0
+# org.opencontainers.image.revision  075e8d2af6cf9f96d3e6da2f36336f25cbbf32da
+# org.opencontainers.image.created   2026-08-07T13:00:53Z
+```
+
+`make docker-build` stamps the same labels from your working tree. An image reading `revision=unknown` was built by neither path.
+
+
 ```bash
 # Build
 make docker-build

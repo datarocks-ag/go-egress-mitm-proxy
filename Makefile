@@ -65,7 +65,11 @@ certs:
 
 ## docker-build: Build Docker image
 docker-build:
-	docker build -t go-egress-proxy:latest .
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg REVISION=$(shell git rev-parse HEAD 2>/dev/null || echo unknown) \
+		--build-arg CREATED=$(shell date -u +%Y-%m-%dT%H:%M:%SZ) \
+		-t go-egress-proxy:latest .
 
 ## docker-run: Run Docker container (requires config.yaml and certs/)
 docker-run:
