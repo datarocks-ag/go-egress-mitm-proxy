@@ -42,7 +42,9 @@ type RewriteResult struct {
 }
 
 // HandleRequest processes each incoming request through the policy engine.
-// It evaluates rules in order: rewrites -> blacklist -> whitelist -> default policy.
+// It evaluates rules in order: blacklist -> rewrites -> whitelist -> default policy.
+// The blacklist is first and short-circuits the rewrite table; see the comment at
+// the blacklist check for why that ordering is load-bearing rather than cosmetic.
 func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig) (*http.Request, *http.Response) {
 	start := time.Now()
 

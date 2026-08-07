@@ -84,7 +84,7 @@ cmd/main    → cert, config, health, metrics, proxy, trace
 1. Client connects → CONNECT handler checks passthrough ACL; if matched, tunnel is established without MITM (`PASSTHROUGH`)
 2. Otherwise, proxy presents cert signed by internal CA (MITM)
 3. Request ID generated and injected (`X-Request-ID`)
-4. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
+4. Rule matching: **blacklist first** (a match blocks with 403 and short-circuits the rewrite table), then rewrites (exact then wildcard, with optional `path_pattern` regex filtering), then whitelist, then default policy. Rewrites otherwise bypass the ACL — a rewritten host is implicitly allowed — but a denylist is not a preference, so it outranks them
 5. Actions: `PASSTHROUGH`, `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, plus `BLACK-LISTED-CONNECT` — recorded at the CONNECT stage when a blacklisted host is intercepted, so the attempt stays visible even if the client refuses the proxy certificate and never reaches `HandleRequest`. A host that is both passthrough and blacklisted is refused outright and counts as `BLACK-LISTED`
 6. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
 7. Headers dropped (`drop_headers`) and injected (`headers`) on rewritten requests

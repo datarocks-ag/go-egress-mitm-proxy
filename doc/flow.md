@@ -74,8 +74,9 @@ When the proxy intercepts a CONNECT tunnel, `goproxy` dynamically generates a TL
 
 6. **Proxy evaluates policy** -- The `handleRequest` function processes the request:
    - Generates and injects `X-Request-ID` header
-   - Checks **rewrite rules** (exact match, then wildcard patterns)
-   - If no rewrite matched: checks **blacklist** -> **whitelist** -> **default policy**
+   - Checks the **blacklist** first; a match blocks with 403 and the rewrite table is never consulted
+   - Otherwise checks **rewrite rules** (exact match, then wildcard patterns)
+   - If no rewrite matched: checks **whitelist** -> **default policy**
    - If blocked (`BLACK-LISTED` or `BLOCKED`): returns `403 Forbidden` immediately; no upstream connection is made.
 
 7. **Proxy dials upstream** -- For allowed/rewritten requests, the custom `DialContext` resolves the destination:
@@ -146,7 +147,7 @@ sequenceDiagram
     note over C,P: Encrypted tunnel established
 
     C->>P: GET /api/data HTTP/1.1<br/>Host: api.example.com
-    note right of P: handleRequest() evaluates policy:<br/>1. Inject X-Request-ID<br/>2. Check rewrites (exact → wildcard)<br/>3. Check blacklist → whitelist<br/>4. Apply default policy
+    note right of P: handleRequest() evaluates policy:<br/>1. Inject X-Request-ID<br/>2. Check blacklist (short-circuits rewrites)<br/>3. Check rewrites (exact → wildcard)<br/>4. Check whitelist<br/>5. Apply default policy
 
     alt BLOCKED or BLACK-LISTED
         P->>C: HTTP/1.1 403 Forbidden<br/>"Policy Blocked"

@@ -26,7 +26,7 @@ sequenceDiagram
         Note right of Proxy: Proxy presents cert signed<br/>by internal CA
 
         Client->>Proxy: GET /api
-        Note right of Proxy: 1. Generate X-Request-ID<br/>2. Check rewrite rules<br/>   (exact → wildcard → path)<br/>3. Check ACL blacklist<br/>4. Check ACL whitelist<br/>5. Apply default policy
+        Note right of Proxy: 1. Generate X-Request-ID<br/>2. Check ACL blacklist<br/>   (short-circuits rewrites)<br/>3. Check rewrite rules<br/>   (exact → wildcard → path)<br/>4. Check ACL whitelist<br/>5. Apply default policy
 
     alt BLOCKED / BLACK-LISTED
         Proxy-->>Client: 403 Forbidden
@@ -137,10 +137,15 @@ tunnel is handled:
 
 **Per request** (plain HTTP, and every intercepted HTTPS request):
 
-1. **Rewrite rules** - Exact match first (O(1) map lookup), then wildcard/regex patterns with optional `path_pattern` filtering
-2. **Blacklist** - Blocks request if matched
+1. **Blacklist** - Blocks the request with 403 and short-circuits the rewrite table
+2. **Rewrite rules** - Exact match first (O(1) map lookup), then wildcard/regex patterns with optional `path_pattern` filtering
 3. **Whitelist** - Allows request if matched
 4. **Default policy** - `ALLOW` or `BLOCK` for unmatched domains
+
+A rewrite otherwise bypasses the ACL: a rewritten host is implicitly allowed and
+needs no whitelist entry. The blacklist is the exception, and deliberately so — a
+host in both tables was previously forwarded to its `target_ip` carrying the
+rule's injected headers.
 
 Hostnames are normalized with `config.NormalizeHost` (lowercased, trailing dot
 stripped) before every one of these comparisons.
@@ -179,7 +184,7 @@ there so a future call site that forgets to normalize fails closed.
 The `HandleRequest()` function processes every HTTP request:
 
 1. Generate unique `X-Request-ID` for tracing
-2. Evaluate against rules (rewrite → blacklist → whitelist → default)
+2. Evaluate against rules (blacklist → rewrite → whitelist → default)
    - Rewrite matching: exact map lookup, then sequential pattern + path matching
    - Path-based rules use `path_pattern` regex against `r.URL.Path` (first match wins)
 3. Store matched rewrite in request context (for dialer access)
