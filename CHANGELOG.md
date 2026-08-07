@@ -10,12 +10,17 @@ git history for the full detail.
 
 ## [Unreleased]
 
-### Added
-- **The container image carries OCI metadata.** `title`, `description`, `source`,
-  `url`, `documentation`, `licenses`, `vendor`, `base.name`, plus a per-build
-  `version`, `revision` (the commit SHA) and `created` timestamp. `revision` is
-  what links a running container back to the commit that produced it, which
-  previously required matching the image digest by hand.
+## [4.1.1] - 2026-08-07
+
+### Fixed
+- **The published container image was missing its OCI metadata.** The package
+  page read "No description provided", and nothing on the image linked it back to
+  the commit that produced it -- correlating a running container with a revision
+  meant matching the image digest by hand.
+
+  It now carries `title`, `description`, `source`, `url`, `documentation`,
+  `licenses`, `vendor` and `base.name`, plus a per-build `version`, `revision`
+  (the commit SHA) and `created` timestamp.
 
   The published package read "No description provided" because the CI metadata
   action derives that label from the GitHub repository description, which is
@@ -394,6 +399,7 @@ dial interception (not DNS-level). Includes ACL enforcement
 automatic `X-Request-ID`, Prometheus metrics, health endpoints, hot reload
 (SIGHUP), graceful shutdown, and a CI pipeline.
 
+[4.1.1]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v2.3.0...v3.0.0
