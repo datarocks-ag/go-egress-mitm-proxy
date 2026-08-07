@@ -151,7 +151,10 @@ func TestLateDialUpdateDoesNotContradictConnectionReuse(t *testing.T) {
 	var buf bytes.Buffer
 	rec := recordFor(t, &buf, config.BodyCaptureConfig{Enabled: false})
 
-	// A pooled connection: no dial happened, so applyResponse marks it reused.
+	// A pooled connection: the request went upstream (which is what the
+	// round-trip wrapper records) but no dial happened, so applyResponse marks it
+	// reused.
+	rec.MarkForwarded()
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}
 	PrepareResponse(rec, resp)
 
@@ -233,5 +236,32 @@ func TestEmitCountsWhenRecordIsWritten(t *testing.T) {
 	}
 	if delta := testutil.ToFloat64(metrics.TraceRecords.WithLabelValues("mitm")) - before; delta != 1 {
 		t.Errorf("counter moved by %v, want 1", delta)
+	}
+}
+
+// TestBlockedRequestIsNotReportedAsConnectionReused pins the gate that
+// MarkForwarded exists for.
+//
+// The reuse inference is "mitm mode, no dial, no error", which was also true of
+// a request that never reached the network -- most importantly the 403 the
+// handler synthesizes for a blocked host. The record then asserted the proxy had
+// reused an upstream connection to a host it deliberately refused to contact.
+func TestBlockedRequestIsNotReportedAsConnectionReused(t *testing.T) {
+	var buf bytes.Buffer
+	rec := recordFor(t, &buf, config.BodyCaptureConfig{Enabled: false})
+
+	// No MarkForwarded: the handler returned 403 without dialing.
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{}, Body: http.NoBody}
+	PrepareResponse(rec, resp)
+
+	var out map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &out); err != nil {
+		t.Fatalf("trace record is not JSON: %v\n%s", err, buf.String())
+	}
+	if tcp, ok := out["tcp"].(map[string]any); ok {
+		if tcp["connection_reused"] == true {
+			t.Error("a request that was never forwarded is reported as connection_reused; " +
+				"the record claims an upstream connection to a host the proxy refused to contact")
+		}
 	}
 }

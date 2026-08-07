@@ -367,6 +367,12 @@ func main() {
 		// The pool dispatches on the rewrite result that HandleRequest stores on the
 		// request context, so req here is the post-handler request, not r.
 		ctx.RoundTripper = goproxy.RoundTripperFunc(func(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
+			// Reaching here means the request is going upstream, which is what
+			// makes "no dial recorded" mean "reused from the pool" rather than
+			// "never left the proxy".
+			rec := trace.FromContext(req.Context())
+			rec.MarkForwarded()
+
 			resp, err := transportPool.RoundTrip(req)
 
 			// Timed here, not in HandleRequest: this span covers DNS, dial, TLS
@@ -376,6 +382,13 @@ func main() {
 
 			if err != nil {
 				status, reason := proxy.UpstreamErrorResponse(err)
+				// The error is converted to a synthetic response below, so
+				// goproxy never sees it and ctx.Error stays nil. Without this the
+				// trace record for a non-dial failure -- a ResponseHeaderTimeout
+				// on a pooled connection, say -- carried status 502 and no cause
+				// at all. Dial failures are already recorded by the dialers, which
+				// have the more specific error, and SetError keeps the first.
+				rec.SetError(err.Error())
 				slog.Warn("Upstream connection error",
 					"host", req.URL.Host,
 					"status", status,
