@@ -11,9 +11,15 @@ name: CI go-egress-proxy
 # Triggering on pull_request alone gives every PR a full set of checks regardless
 # of how its branch is named — the gap that motivated adding the trigger — with
 # no second event to race. Pushes to main are covered by release.yaml.
+#
+# No `branches:` filter, so this covers stacked PRs. With `branches: [main]` a PR
+# based on another feature branch matched nothing and ran no checks at all: an
+# eight-PR stack merged with only the bottom one ever tested, and a PR with no
+# checks looks the same in the UI as a PR that passed. Listing the branch
+# prefixes instead would leave the same trap for any base that does not match the
+# convention, and the failure mode is silence, so there is nothing to alert on.
 on:
   pull_request:
-    branches: [main]
 
 # Supersede in-flight runs when a PR is pushed to again. Only one event type
 # reaches this workflow now, so this cannot cancel a run for a different event.
