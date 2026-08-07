@@ -83,8 +83,17 @@ func (rd Redactor) redactURL(raw string) string {
 		return raw
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.RawQuery == "" {
+	if err != nil {
 		return raw
+	}
+	// Strip userinfo before anything else. An absolute-form plain-HTTP target can
+	// carry user:password@, and url.URL.String() re-emits it, so the credential
+	// would reach the log even with query redaction on.
+	if u.User != nil {
+		u.User = url.User("<redacted>")
+	}
+	if u.RawQuery == "" {
+		return u.String()
 	}
 	q := u.Query()
 	for k := range q {

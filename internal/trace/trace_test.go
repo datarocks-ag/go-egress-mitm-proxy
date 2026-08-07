@@ -232,3 +232,86 @@ func TestContentTypeAllowed(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultRedactionCoversURLBearingHeaders pins the OAuth-code leak.
+//
+// redact_query only ever saw the request URL. Header values are masked by header
+// NAME against DefaultRedactHeaders, which listed only the four
+// credential-bearing headers — so a 302 carrying an authorization code in
+// Location wrote it to the trace log verbatim, on the shipped example rule, with
+// redaction nominally enabled and log_secrets false.
+func TestDefaultRedactionCoversURLBearingHeaders(t *testing.T) {
+	ct, err := config.CompileTrace(config.TraceConfig{
+		Enabled: true,
+		Rules:   []config.TraceRule{{Host: "*"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := NewRedactor(ct)
+
+	const authCode = "4/0AY0e-g7SECRETCODE"
+	hdr := http.Header{}
+	hdr.Set("Location", "https://app.internal.com/callback?code="+authCode+"&state=xyz")
+	hdr.Set("Referer", "https://app.internal.com/login?session=abc123")
+	hdr.Set("Content-Location", "/v1/resource?token=zzz")
+	hdr.Set("X-Trace-Id", "keep-me")
+
+	got := rd.headerMap(hdr)
+
+	for _, name := range []string{"Location", "Referer", "Content-Location"} {
+		joined := got[name]
+		if strings.Contains(joined, "code=4/") || strings.Contains(joined, "session=abc123") ||
+			strings.Contains(joined, "token=zzz") {
+			t.Errorf("%s leaked a secret into the trace record: %q", name, joined)
+		}
+	}
+	// Non-sensitive headers must still be readable, or the trace stops being useful.
+	if got["X-Trace-Id"] != "keep-me" {
+		t.Errorf("X-Trace-Id was masked; only the listed headers should be")
+	}
+}
+
+// TestRedactURLStripsUserinfo covers the other half: url.URL.String() re-emits
+// user:password@ for an absolute-form plain-HTTP target, so the credential
+// reached the log even with query redaction on.
+func TestRedactURLStripsUserinfo(t *testing.T) {
+	ct, err := config.CompileTrace(config.TraceConfig{
+		Enabled: true,
+		Rules:   []config.TraceRule{{Host: "*"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := NewRedactor(ct)
+
+	got := rd.redactURL("http://alice:hunter2@api.internal/v1/things?token=abc")
+	if strings.Contains(got, "hunter2") {
+		t.Errorf("userinfo password survived redaction: %q", got)
+	}
+	if strings.Contains(got, "abc") {
+		t.Errorf("query value survived redaction: %q", got)
+	}
+	if !strings.Contains(got, "api.internal") {
+		t.Errorf("host was lost, making the record useless: %q", got)
+	}
+}
+
+// TestLogSecretsStillDisablesTheNewRedaction keeps the escape hatch honest.
+func TestLogSecretsStillDisablesTheNewRedaction(t *testing.T) {
+	ct, err := config.CompileTrace(config.TraceConfig{
+		Enabled:    true,
+		LogSecrets: true,
+		Rules:      []config.TraceRule{{Host: "*"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := NewRedactor(ct)
+
+	hdr := http.Header{}
+	hdr.Set("Location", "https://app/cb?code=verbatim")
+	if got := rd.headerMap(hdr)["Location"]; !strings.Contains(got, "verbatim") {
+		t.Errorf("log_secrets did not disable Location redaction: %q", got)
+	}
+}

@@ -143,7 +143,18 @@ type CompiledBodyCapture struct {
 }
 
 // DefaultRedactHeaders are always masked unless log_secrets is set.
-var DefaultRedactHeaders = []string{"authorization", "proxy-authorization", "cookie", "set-cookie"}
+//
+// The credential-bearing four are obvious. The URL-bearing three are here
+// because redact_query only ever saw the request URL: a 302 carrying
+// "Location: .../callback?code=4/0AY0e-g7...&state=xyz" wrote an OAuth
+// authorization code to the trace log verbatim, on the shipped example rule,
+// with redaction nominally enabled. Masking the whole value rather than just its
+// query is deliberate -- these headers are not needed in cleartext to correlate
+// a trace, and a partial mask invites the assumption that what is left is safe.
+var DefaultRedactHeaders = []string{
+	"authorization", "proxy-authorization", "cookie", "set-cookie",
+	"location", "content-location", "referer",
+}
 
 // DefaultBodyContentTypes are logged as text when no content_types are configured.
 var DefaultBodyContentTypes = []string{"application/json", "text/*", "application/xml", "application/x-www-form-urlencoded"}
