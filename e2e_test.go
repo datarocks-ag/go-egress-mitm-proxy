@@ -500,9 +500,13 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("https_blacklisted_returns_403", func(t *testing.T) {
-		// HTTPS to blacklisted.example.com through the MITM proxy.
-		// The proxy does AlwaysMitm (CONNECT accepted, TLS established),
-		// then handleRequest sees the blacklisted domain and returns 403.
+		// HTTPS to blacklisted.example.com through the proxy. This host is not in
+		// acl.passthrough, so the tunnel is intercepted and HandleRequest answers
+		// 403 — nothing is forwarded upstream before policy runs. CONNECT-time
+		// rejection is reserved for a host that is both passthrough and
+		// blacklisted, where no interception would happen and the tunnel would
+		// otherwise escape inspection; that path is covered by
+		// TestConnectHandlerRejectWritesResponse.
 		resp, err := doGet(ctx, tlsClient, "https://blacklisted.example.com/")
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
