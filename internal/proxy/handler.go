@@ -172,6 +172,14 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 
 	// Record metrics with bounded cardinality
 	metricDomain := NormalizeDomainForMetrics(host, rewriteExact, acl)
+	if matchedRewrite != nil {
+		// Label from the rule, not the host. Only exact-match rules live in
+		// rewriteExact, so a wildcard or ~regex rewrite fell through to "_other"
+		// and every such target shared one series -- despite rewrites being the
+		// thing most worth attributing per-target. The rule's Original is bounded
+		// by the size of the config, so this cannot inflate cardinality.
+		metricDomain = matchedRewrite.Original
+	}
 	metrics.TrafficTotal.WithLabelValues(metricDomain, action).Inc()
 
 	// Block denied requests
