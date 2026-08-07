@@ -6,11 +6,14 @@ package cert
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/elazarl/goproxy"
 )
 
 // stubGen returns a generator producing a distinguishable certificate and
@@ -281,4 +284,77 @@ func TestCertStoreConcurrentSameHostSignsOnceWithoutHoldingLock(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("generator called %d times for one host under concurrency, want 1", calls)
 	}
+}
+
+// TestMitmTLSConfigKeysCacheByCA pins that cached leaves belong to a signing
+// identity, not just a hostname.
+//
+// Each sub-test holds one dimension fixed. The combined version of this test
+// varied CA and Organization together, so either component alone separated the
+// entries — deleting the CA hash from the key left it green, and that is the
+// half with security consequence: it is what stops two callers sharing a
+// mitm_org but using different CAs from being served a leaf signed by the wrong
+// issuer.
+func TestMitmTLSConfigKeysCacheByCA(t *testing.T) {
+	caA := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	caB := generateTestCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+
+	leafFor := func(t *testing.T, fn func(string, *goproxy.ProxyCtx) (*tls.Config, error)) *x509.Certificate {
+		t.Helper()
+		cfg, err := fn("shared.example.com", nil)
+		if err != nil {
+			t.Fatalf("build TLS config: %v", err)
+		}
+		leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return leaf
+	}
+
+	t.Run("different CA, same org", func(t *testing.T) {
+		shared := NewCertStore(10, time.Hour)
+		a := leafFor(t, MitmTLSConfigFromCA(&caA, "Same Org", shared))
+		b := leafFor(t, MitmTLSConfigFromCA(&caB, "Same Org", shared))
+
+		if a.SerialNumber.Cmp(b.SerialNumber) == 0 {
+			t.Error("two CAs sharing an Organization were served one cached leaf; " +
+				"the second caller gets a certificate signed by the wrong issuer")
+		}
+
+		// Issuer DN is not a discriminator here: the test CAs share a subject.
+		// Check who actually signed each leaf.
+		caBCert, err := x509.ParseCertificate(caB.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.CheckSignatureFrom(caBCert); err != nil {
+			t.Errorf("the second caller's leaf was not signed by its own CA: %v", err)
+		}
+	})
+
+	t.Run("same CA, different org", func(t *testing.T) {
+		shared := NewCertStore(10, time.Hour)
+		a := leafFor(t, MitmTLSConfigFromCA(&caA, "Org A", shared))
+		b := leafFor(t, MitmTLSConfigFromCA(&caA, "Org B", shared))
+
+		if len(b.Subject.Organization) == 0 || b.Subject.Organization[0] != "Org B" {
+			t.Errorf("second caller got Organization %v, want [Org B]; the org is not part of the cache key",
+				b.Subject.Organization)
+		}
+		if a.SerialNumber.Cmp(b.SerialNumber) == 0 {
+			t.Error("both orgs share one cached certificate")
+		}
+	})
+
+	t.Run("same CA and org still caches", func(t *testing.T) {
+		shared := NewCertStore(10, time.Hour)
+		fn := MitmTLSConfigFromCA(&caA, "Org A", shared)
+		first := leafFor(t, fn)
+		again := leafFor(t, fn)
+
+		if first.SerialNumber.Cmp(again.SerialNumber) != 0 {
+			t.Error("same CA and host re-signed; qualifying the key must not defeat caching")
+		}
+	})
 }
