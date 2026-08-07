@@ -52,6 +52,7 @@ Multi-package application using goproxy library with thread-safe hot-reloadable 
 ```
 cmd/mitm-proxy/main.go        # CLI entrypoint: arg parsing, signal handling, wiring
 cmd/mitm-proxy/reload.go       # SIGHUP reload: config swap, log reopen, transport pool reset
+cmd/mitm-proxy/drain.go        # Graceful-shutdown sequence (extracted from main for testability)
 internal/config/config.go      # Types, YAML loading, validation, env overrides, ACL/rewrite compilation
 internal/cert/cert.go          # MITM cert loading (PEM/PKCS#12), signing, TLS pool building
 internal/cert/gencert.go       # gencert subcommand + key pair generation
@@ -148,6 +149,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - `mitm_org`: optional custom Organization for MITM leaf certificates (default: goproxy's built-in `"GoProxy untrusted MITM proxy Inc"`)
 - Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
 - Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
+- `max_connections` / `PROXY_MAX_CONNECTIONS`: ceiling on concurrent client connections (0 = unlimited). A hijacked CONNECT tunnel has no deadline at any layer, so this is the only bound on a client that connects and goes silent. At the cap the listener pauses accepting, warns, and increments `proxy_listener_saturated_total`. `TrackingListener.Close()` releases a parked accept, without which `http.Server.Shutdown` deadlocks waiting on its listener group
 - Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
 - Per-rewrite `target_scheme`: optional `"http"` or `"https"` to change the request scheme before forwarding (e.g., HTTPS client → HTTP backend). The port moves with the scheme when the client's port was that scheme's default — an intercepted HTTPS request carries `:443` from the CONNECT authority, so without this a downgrade sent cleartext HTTP to the TLS port. An explicitly chosen port is preserved
 - Per-rewrite `target_port`: optional TCP port overriding both the client's port and the scheme default, for backends that do not listen on 80/443
@@ -164,7 +166,7 @@ Opt-in, full-detail tracing of a *subset* of requests selected by host and/or UR
 - `enabled`: master switch; when false, tracing is fully short-circuited (no per-request overhead)
 - `log_path`: optional dedicated JSON-lines file (reopened on SIGHUP for rotation, like `blocked_log_path`); empty = main log stream
 - `rules`: OR across rules; within a rule `host` AND `url` must both match. `host`/`url` use the `WildcardToRegex` convention (wildcard, or `~` prefix for raw regex); `url` is matched against the full `scheme://host/path?query`. Rules carrying a `url` are skipped at CONNECT time (URL not yet known), so passthrough hosts are matched by `host` only.
-- Redaction is secure-by-default: built-in masked headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`) always apply; `redact_headers` extends the set; `redact_query` masks query-string values and **defaults to true** (set `false` to opt out); `log_secrets: true` is the escape hatch that disables all redaction.
+- Redaction is secure-by-default: built-in masked headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, plus the URL-bearing `Location`, `Content-Location`, `Referer`) always apply, and `redactURL` strips `user:password@`. **Bodies are never redacted** — `renderBody` takes no redactor; `redact_headers` extends the set; `redact_query` masks query-string values and **defaults to true** (set `false` to opt out); `log_secrets: true` is the escape hatch that disables all redaction.
 - Per-rule `bodies`: `enabled`, `capture` (request/response/both), `max_request_bytes`/`max_response_bytes` (default 8192), `content_types` allowlist (logged as text; supports `type/*`), `on_binary` (base64/skip). Bodies are teed (streaming preserved). With response-body capture enabled the record is emitted when that body finishes streaming; otherwise — capture off (the default), a 101 upgrade, or an empty body — it is emitted at response-header time. Emission is once-only (`sync.Once`).
 - Passthrough (non-MITM) hosts are traced TCP-only via goproxy's per-request `ctx.Dialer` (connected IP, dial timing, bytes up/down); headers/bodies are inherently invisible.
 - The record is threaded from `HandleRequest` to the dialers via the request context (`trace.CtxKey`) and to the response handler via goproxy `ctx.UserData`.
@@ -183,7 +185,7 @@ Opt-in, full-detail tracing of a *subset* of requests selected by host and/or UR
 
 `/readyz` is backed by an atomic flag: 503 until the proxy listener is bound, 200 while serving, 503 again as the first step of shutdown so load balancers stop sending traffic before draining begins. `/healthz` stays independent — failing it during a drain would have Kubernetes kill the pod mid-drain.
 
-**Graceful Shutdown:** SIGINT/SIGTERM. Readiness fails first, then the proxy keeps serving for `PROXY_PRESTOP_GRACE` (default 10s) — failing readiness and closing the listener in the same instant just produces ECONNREFUSED until the next probe, so only already-accepted connections would benefit from the drain. Then `http.Server.Shutdown` drains non-hijacked connections, and `TrackingListener.WaitForDrain` waits out the CONNECT tunnels `http.Server` cannot see, within a 30s budget. `main` joins the drain goroutine rather than returning underneath it. Deployment grace periods must exceed grace + drain: the k8s manifest and docker-compose both use 45s.
+**Graceful Shutdown:** SIGINT/SIGTERM. Readiness fails first, then the proxy keeps serving for `PROXY_PRESTOP_GRACE` (default 10s) — failing readiness and closing the listener in the same instant just produces ECONNREFUSED until the next probe, so only already-accepted connections would benefit from the drain. Then `http.Server.Shutdown` drains non-hijacked connections, and `TrackingListener.WaitForDrain` waits out the CONNECT tunnels `http.Server` cannot see, within a 30s budget. The sequence lives in `drain()` (cmd/mitm-proxy/drain.go), extracted from `main` so its ordering is testable. `main` joins the drain goroutine rather than returning underneath it, and `stop()` runs as soon as the context cancels so a second SIGINT/SIGTERM terminates rather than being swallowed for the whole window. Deployment grace periods must exceed grace + drain: the k8s manifest and docker-compose both use 45s.
 
 **Hot Reload:** SIGHUP reloads ACL, rewrites, trace config, both log files and outbound TLS, and calls `transportPool.Reset()`. It does **not** reload the MITM CA, `mitm_org` or the listen ports — those are captured at startup — and logs a warning naming any that changed.
 
@@ -229,6 +231,8 @@ Typical production workflow: generate root CA (store offline) → generate inter
 cmd/mitm-proxy/
   main.go                      # CLI entrypoint, signal handling, wiring
   reload.go                    # SIGHUP reload (extracted from main for testability)
+  drain.go                     # Graceful-shutdown sequence (readiness, grace, drain, release)
+  drain_test.go                # Shutdown ordering tests
   main_test.go                 # Version and usage tests
   prestop_test.go              # PROXY_PRESTOP_GRACE parsing tests
   reload_test.go               # Reload, fd cleanup, log rotation tests

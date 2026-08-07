@@ -289,7 +289,8 @@ Opt-in, full-detail tracing of a subset of requests (configured via the `trace:`
   `io.ReadWriter` assertion and drops the WebSocket tunnel.
 - Blocked (403) and upstream-error (502/504) paths emit via their synthetic responses
 - Passthrough (non-MITM) hosts are traced TCP-only via goproxy's per-request `ctx.Dialer` (connected IP, dial timing, bytes up/down)
-- Redaction is secure-by-default (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` always masked; `redact_headers`/`redact_query` extend; `log_secrets` disables)
+- Redaction is secure-by-default. Always masked: `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and the URL-bearing `Location`, `Content-Location`, `Referer` (an OAuth 302 carries the authorization code in `Location`, and `redact_query` only ever saw the request URL). `redactURL` also strips `user:password@`. `redact_headers` extends the set; `log_secrets` disables all of it
+- **Bodies are not redacted.** `renderBody` receives no redactor, so enabling `bodies` writes payloads verbatim within the size caps and content-type gate
 - Independent of the `-v/-vv/-vvv` level; trace log file reopened on SIGHUP for rotation
 
 ### Metrics System
@@ -298,7 +299,7 @@ Prometheus metrics with bounded cardinality:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `proxy_traffic_total` | Counter | domain, action | Requests by domain/action |
+| `proxy_traffic_total` | Counter | domain, action | Requests by domain/action. A rewritten request is labelled with the matching rule's configured pattern rather than the host, so wildcard and regex rewrites are attributable per rule instead of collapsing into `_other` |
 | `proxy_request_duration_seconds` | Histogram | action | Request latency. Forwarded requests are observed once the upstream round-trip returns, so the span includes DNS, dial, TLS and upstream think-time; blocked requests are recorded in the handler |
 | `proxy_active_connections` | Gauge | - | Client connections open at the listener, including hijacked CONNECT tunnels. A `GaugeFunc` read at scrape time |
 | `proxy_config_load_errors_total` | Counter | - | Config load failures |
@@ -306,7 +307,8 @@ Prometheus metrics with bounded cardinality:
 | `proxy_upstream_errors_total` | Counter | type | Upstream errors |
 | `proxy_response_status_total` | Counter | class | Response codes |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred |
-| `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough) |
+| `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough). Only advances when a record is actually written |
+| `proxy_listener_saturated_total` | Counter | - | Times the client connection ceiling (`proxy.max_connections`, or its `PROXY_MAX_CONNECTIONS` override) was reached and accepting paused |
 
 Domain normalization prevents cardinality explosion:
 - Known rewrite domains: tracked individually
@@ -324,7 +326,7 @@ Separate HTTP server on metrics port exposing:
 
 | Signal | Action |
 |--------|--------|
-| `SIGINT` / `SIGTERM` | Graceful shutdown: fail `/readyz`, keep serving for `PROXY_PRESTOP_GRACE` (default 10s), then drain in-flight requests and CONNECT tunnels within a 30s budget |
+| `SIGINT` / `SIGTERM` | Graceful shutdown (`drain()` in cmd/mitm-proxy/drain.go): fail `/readyz`, keep serving for `PROXY_PRESTOP_GRACE` (default 10s), then drain in-flight requests and CONNECT tunnels within a 30s budget. Default signal handling is restored as soon as the first signal arrives, so a second one terminates immediately instead of being swallowed for the whole window |
 | `SIGHUP` | Hot reload configuration, reopen blocked and trace log files, rebuild outbound TLS, and `TransportPool.Reset()`. Warns about changed `mitm_*` and port settings, which need a restart. |
 
 ## Data Flow
