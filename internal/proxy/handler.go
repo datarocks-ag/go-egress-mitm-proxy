@@ -204,6 +204,10 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 	var dropped, modified []string
 	schemeChanged := ""
 	if matchedRewrite != nil {
+		// Scheme and port are applied before the header map so an explicit
+		// headers: {Host: ...} still wins over the authority derived here.
+		schemeChanged = applyTargetSchemeAndPort(r, matchedRewrite)
+
 		for _, h := range matchedRewrite.DropHeaders {
 			if len(r.Header.Values(h)) > 0 {
 				dropped = append(dropped, h)
@@ -234,10 +238,6 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 				added = append(added, k)
 			}
 			r.Header.Set(k, v)
-		}
-		if matchedRewrite.TargetScheme != "" {
-			r.URL.Scheme = matchedRewrite.TargetScheme
-			schemeChanged = matchedRewrite.TargetScheme
 		}
 	}
 
@@ -673,4 +673,58 @@ func LogBlocked(ctx context.Context, runtimeCfg *config.RuntimeConfig, req Block
 		slog.String("target", req.Target),
 		slog.String("action", req.Action),
 	)
+}
+
+// defaultPortForScheme returns the port an HTTP URL scheme implies when the
+// authority carries none.
+func defaultPortForScheme(scheme string) string {
+	if scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+// applyTargetSchemeAndPort applies a rewrite rule's target_scheme and
+// target_port to the request, returning the new scheme if it changed.
+//
+// The port has to move with the scheme. goproxy builds the MITM request URL
+// from the CONNECT authority, so an intercepted HTTPS request carries :443.
+// Rewriting only the scheme therefore sent a cleartext HTTP request to port 443
+// of the target -- refused by a backend that serves HTTP on 80 or 8080, and
+// read as a malformed TLS record by anything that does speak TLS there. The
+// documented "HTTPS client -> HTTP backend" rewrite could not work at all.
+//
+// A port that is the default for the *original* scheme was implicit (the client
+// wrote https://host, or CONNECT host:443), so it moves to the new scheme's
+// default. A port the operator chose explicitly is left alone: it is a
+// deliberate destination, not an artifact of the scheme. target_port overrides
+// both, for the common case of a legacy backend on 8080.
+func applyTargetSchemeAndPort(r *http.Request, rw *config.CompiledRewriteRule) string {
+	schemeChanged := ""
+	port := r.URL.Port()
+
+	if rw.TargetScheme != "" && rw.TargetScheme != r.URL.Scheme {
+		wasImplicitPort := port == "" || port == defaultPortForScheme(r.URL.Scheme)
+		r.URL.Scheme = rw.TargetScheme
+		schemeChanged = rw.TargetScheme
+		if wasImplicitPort {
+			port = defaultPortForScheme(rw.TargetScheme)
+		}
+	}
+	if rw.TargetPort != "" {
+		port = rw.TargetPort
+	}
+
+	if port != "" && port != r.URL.Port() {
+		r.URL.Host = net.JoinHostPort(r.URL.Hostname(), port)
+		// Keep the Host header consistent with the authority actually dialed.
+		// RFC 9110 omits the port when it is the scheme default. An explicit
+		// headers: {Host: ...} is applied after this and overrides it.
+		if port == defaultPortForScheme(r.URL.Scheme) {
+			r.Host = r.URL.Hostname()
+		} else {
+			r.Host = net.JoinHostPort(r.URL.Hostname(), port)
+		}
+	}
+	return schemeChanged
 }

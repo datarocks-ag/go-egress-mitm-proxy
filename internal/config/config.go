@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,6 +28,7 @@ type RewriteRule struct {
 	TargetIP     string            `yaml:"target_ip"`     // IP address to route to (e.g., "10.0.0.1")
 	TargetHost   string            `yaml:"target_host"`   // Hostname to route to (resolved via DNS at dial time)
 	TargetScheme string            `yaml:"target_scheme"` // Optional: "http" or "https" to change request scheme
+	TargetPort   string            `yaml:"target_port"`   // Optional: TCP port to connect to (overrides the scheme default)
 	Headers      map[string]string `yaml:"headers"`       // Headers to inject into the request
 	DropHeaders  []string          `yaml:"drop_headers"`  // Headers to remove before forwarding
 	Insecure     bool              `yaml:"insecure"`      // Skip TLS verification for this rewrite only
@@ -39,6 +41,7 @@ type CompiledRewriteRule struct {
 	TargetIP     string
 	TargetHost   string
 	TargetScheme string // "http" or "https" to change request scheme (empty = keep original)
+	TargetPort   string // TCP port to connect to (empty = the scheme's default or the client's port)
 	Headers      map[string]string
 	DropHeaders  []string // Headers to remove before forwarding
 	Original     string   // Original domain string for exact match optimization
@@ -480,6 +483,12 @@ func (c *Config) Validate() error {
 		if rw.TargetScheme != "" && rw.TargetScheme != "http" && rw.TargetScheme != "https" {
 			return fmt.Errorf("rewrites[%d]: invalid target_scheme %q: must be \"http\" or \"https\"", i, rw.TargetScheme)
 		}
+		if rw.TargetPort != "" {
+			n, convErr := strconv.Atoi(rw.TargetPort)
+			if convErr != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("rewrites[%d]: invalid target_port %q: must be a number between 1 and 65535", i, rw.TargetPort)
+			}
+		}
 		if err := validateRewriteHeaders(i, rw); err != nil {
 			return err
 		}
@@ -692,6 +701,7 @@ func CompileRewrites(rules []RewriteRule) ([]CompiledRewriteRule, error) {
 			TargetIP:     rule.TargetIP,
 			TargetHost:   rule.TargetHost,
 			TargetScheme: rule.TargetScheme,
+			TargetPort:   rule.TargetPort,
 			Headers:      rule.Headers,
 			DropHeaders:  rule.DropHeaders,
 			Original:     rule.Domain,

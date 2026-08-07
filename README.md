@@ -185,7 +185,8 @@ Each rewrite rule supports these fields:
 | `target_ip` | one of | IP address to route to (mutually exclusive with `target_host`) |
 | `target_host` | one of | Hostname to route to, resolved via DNS at dial time |
 | `path_pattern` | no | Regex matched against `r.URL.Path` for path-based routing |
-| `target_scheme` | no | `"http"` or `"https"` to change the request scheme before forwarding |
+| `target_scheme` | no | `"http"` or `"https"` to change the request scheme before forwarding. The port moves with the scheme when the client used the old scheme's default (an intercepted HTTPS request carries `:443`, so a downgrade to `http` dials `:80`). A port the client chose explicitly is kept. |
+| `target_port` | no | TCP port to connect to, overriding both the client's port and the scheme default. Needed when the backend listens somewhere other than 80/443 (e.g. a legacy service on `8080`). |
 | `headers` | no | Map of headers to inject into the request |
 | `drop_headers` | no | List of header names to remove before forwarding |
 | `insecure` | no | Skip upstream TLS verification for this target only |
