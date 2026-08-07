@@ -188,6 +188,7 @@ jobs:
             VERSION=${{ steps.version.outputs.VERSION }}
             REVISION=${{ github.sha }}
             CREATED=${{ steps.version.outputs.CREATED }}
+            DOCS_REF=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

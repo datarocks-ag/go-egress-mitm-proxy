@@ -69,6 +69,7 @@ func TestPerBuildLabelsComeFromBuildArgs(t *testing.T) {
 		"REVISION": "org.opencontainers.image.revision",
 		"CREATED":  "org.opencontainers.image.created",
 	} {
+
 		if !strings.Contains(text, "ARG "+arg) {
 			t.Errorf("Dockerfile has no ARG %s", arg)
 		}
@@ -101,5 +102,37 @@ func TestReleaseWorkflowPassesBuildMetadata(t *testing.T) {
 		t.Error("release workflow does not set the image description explicitly; " +
 			"metadata-action will emit an empty one and the registry shows " +
 			"\"No description provided\"")
+	}
+}
+
+// TestDocumentationLinkIsPinnedToTheCommit stops the docs link floating.
+//
+// An image is immutable; the README on main is not. A documentation label
+// pointing at main sends someone running a year-old tag to documentation
+// describing a config format that image never supported -- confidently wrong,
+// which is worse than no link. The label is therefore built from DOCS_REF, which
+// both the workflow and `make docker-build` set to the commit.
+func TestDocumentationLinkIsPinnedToTheCommit(t *testing.T) {
+	dockerfile, err := os.ReadFile(filepath.Clean("../../Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	text := string(dockerfile)
+
+	if !strings.Contains(text, "ARG DOCS_REF") {
+		t.Error("Dockerfile has no ARG DOCS_REF")
+	}
+	if !strings.Contains(text, "blob/${DOCS_REF}/README.md") {
+		t.Error("the documentation label is not built from ${DOCS_REF}; a link to a branch " +
+			"drifts away from the image that carries it")
+	}
+
+	workflow, err := os.ReadFile(filepath.Clean("../../.github/workflows/release.yaml"))
+	if err != nil {
+		t.Fatalf("read release.yaml: %v", err)
+	}
+	if !strings.Contains(string(workflow), "DOCS_REF=") {
+		t.Error("the release workflow does not pass DOCS_REF, so published images would link " +
+			"to the default branch instead of their own commit")
 	}
 }

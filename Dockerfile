@@ -25,15 +25,25 @@ FROM alpine:3.24
 # VERSION, REVISION and CREATED are per-build and default to placeholders; the
 # release workflow and the Makefile pass real values. A published image with
 # revision=unknown means it was built outside those paths.
+#
+# The documentation link is pinned to the commit rather than to main. An image is
+# immutable and its README is not: a link to main would send someone running a
+# year-old tag to documentation describing a config format that image never
+# supported, which is worse than no link at all.
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=1970-01-01T00:00:00Z
+# The git ref the documentation link points at. Pinned to the commit by the
+# release workflow and by `make docker-build`, so the README an image links to is
+# the one that described it. Defaults to main only so an un-stamped build still
+# produces a URL that resolves.
+ARG DOCS_REF=main
 
 LABEL org.opencontainers.image.title="go-egress-proxy" \
       org.opencontainers.image.description="MITM HTTP/HTTPS egress proxy with split-brain DNS: ACL policy (whitelist/blacklist/passthrough), domain rewrites to internal targets, header injection and selective request tracing." \
       org.opencontainers.image.source="https://github.com/datarocks-ag/go-egress-mitm-proxy" \
       org.opencontainers.image.url="https://github.com/datarocks-ag/go-egress-mitm-proxy" \
-      org.opencontainers.image.documentation="https://github.com/datarocks-ag/go-egress-mitm-proxy/blob/main/README.md" \
+      org.opencontainers.image.documentation="https://github.com/datarocks-ag/go-egress-mitm-proxy/blob/${DOCS_REF}/README.md" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="Data Rocks AG" \
       org.opencontainers.image.base.name="docker.io/library/alpine:3.24" \

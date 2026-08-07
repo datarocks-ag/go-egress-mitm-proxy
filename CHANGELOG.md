@@ -23,6 +23,11 @@ git history for the full detail.
   description now lives in the Dockerfile and in the workflow, where it is
   reviewable in a diff rather than in a repository setting.
 
+  The documentation link is pinned to the commit rather than to `main`. An image
+  is immutable and the README on a branch is not: a link to `main` would send
+  someone running a year-old tag to documentation describing a config format that
+  image never supported.
+
   The labels are declared in the Dockerfile as well as the workflow so an image
   built with `make docker-build`, or by anyone with a clone, describes itself the
   same way the published one does. `make docker-build` passes the real version,
