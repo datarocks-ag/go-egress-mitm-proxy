@@ -964,11 +964,22 @@ func TestNewOutboundTransport(t *testing.T) {
 		t.Error("DialTLSContext must be set, or per-rewrite insecure does not apply")
 	}
 
-	// MaxConnsPerHost must stay unset: Go keys it on the request URL host rather
-	// than the substituted dial target, and reaching the cap parks the request on
-	// a queue with no deadline.
+	// MaxConnsPerHost must stay unset, and OutboundTransportOptions no longer has
+	// the field, so it cannot be set by configuration at all.
+	//
+	// Go keys connsPerHost on the request URL host, computed before the dialer
+	// substitutes target_ip, and TransportPool clones per target -- so N rewritten
+	// hostnames still permit N x limit sockets to one upstream IP, the exact case
+	// a cap looks like it covers. At the cap queueForConn parks the request on a
+	// channel whose only escape is req.Context().Done(), and goproxy builds MITM
+	// requests over context.Background(), so the bound is bought with unbounded
+	// latency.
+	//
+	// The previous assertion read tr.MaxConnsPerHost != 0 against an options
+	// literal that simply omitted the field: it asserted a zero it had passed in
+	// itself, and would not have failed if main's literal set a value.
 	if tr.MaxConnsPerHost != 0 {
-		t.Errorf("MaxConnsPerHost = %d, want 0 (see the comment at its call site)", tr.MaxConnsPerHost)
+		t.Errorf("MaxConnsPerHost = %d, want 0", tr.MaxConnsPerHost)
 	}
 	if tr.MaxIdleConns != opts.MaxIdleConns {
 		t.Errorf("MaxIdleConns = %d, want %d", tr.MaxIdleConns, opts.MaxIdleConns)

@@ -8,7 +8,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"regexp"
 	"testing"
+
+	"github.com/elazarl/goproxy"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -167,5 +171,56 @@ func TestObserveRequestDurationIgnoresUntimedRequests(t *testing.T) {
 	ObserveRequestDuration(req) // must not panic or record
 	if after := testutil.CollectAndCount(metrics.RequestDuration); after != before {
 		t.Errorf("label sets went from %d to %d; an untimed request created a series", before, after)
+	}
+}
+
+// TestRewriteMetricsAreLabelledPerRule pins per-target attribution for rewrites.
+//
+// NormalizeDomainForMetrics gives a dedicated label only to hosts in
+// rewriteExact, and RuntimeConfig.Update excludes any rule whose domain contains
+// "*" or that carries a path_pattern, and files a "~" regex rule under its
+// literal pattern string — a key no hostname can equal. So the shipped example's
+// "*.internal.example.com" and "~^api[0-9]+\.example\.com$" rewrites all emitted
+// as domain="_other", indistinguishable from each other and from unmatched
+// traffic, despite a rewrite being the thing most worth attributing per target.
+func TestRewriteMetricsAreLabelledPerRule(t *testing.T) {
+	rewrites := []config.CompiledRewriteRule{
+		{
+			Pattern:  regexp.MustCompile(`^.+\.internal\.example\.com$`),
+			TargetIP: "10.20.30.50",
+			Original: "*.internal.example.com",
+		},
+		{
+			Pattern:  regexp.MustCompile(`(?i)^(?:^api[0-9]+\.example\.com$)$`),
+			TargetIP: "10.20.30.60",
+			Original: `~^api[0-9]+\.example\.com$`,
+		},
+	}
+
+	rc := &config.RuntimeConfig{}
+	cfg := config.Config{}
+	cfg.Proxy.DefaultPolicy = "BLOCK"
+	_ = rc.Update(cfg, config.CompiledACL{}, rewrites, nil, nil, nil)
+
+	for _, tc := range []struct{ host, wantLabel string }{
+		{"a.internal.example.com", "*.internal.example.com"},
+		{"deep.b.internal.example.com", "*.internal.example.com"},
+		{"api7.example.com", `~^api[0-9]+\.example\.com$`},
+	} {
+		before := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues(tc.wantLabel, "REWRITTEN"))
+		other := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues("_other", "REWRITTEN"))
+
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+tc.host+"/x", nil)
+		_, resp := HandleRequest(req, &goproxy.ProxyCtx{Req: req}, rc) //nolint:bodyclose // nil on the forwarded path
+		if resp != nil {
+			t.Fatalf("%s was not forwarded: %s", tc.host, resp.Status)
+		}
+
+		if delta := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues(tc.wantLabel, "REWRITTEN")) - before; delta != 1 {
+			t.Errorf("%s: series domain=%q moved by %v, want 1", tc.host, tc.wantLabel, delta)
+		}
+		if delta := testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues("_other", "REWRITTEN")) - other; delta != 0 {
+			t.Errorf("%s: collapsed into domain=\"_other\" instead of its own rule label", tc.host)
+		}
 	}
 }

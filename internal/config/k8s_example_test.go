@@ -74,17 +74,20 @@ func TestKubernetesManifestsMountConfigWhereTheBinaryReadsIt(t *testing.T) {
 		t.Fatalf("read Deployment: %v", err)
 	}
 
+	type container struct {
+		Name          string `yaml:"name"`
+		RestartPolicy string `yaml:"restartPolicy"`
+		VolumeMounts  []struct {
+			Name      string `yaml:"name"`
+			MountPath string `yaml:"mountPath"`
+		} `yaml:"volumeMounts"`
+	}
 	var manifest struct {
 		Spec struct {
 			Template struct {
 				Spec struct {
-					Containers []struct {
-						Name         string `yaml:"name"`
-						VolumeMounts []struct {
-							Name      string `yaml:"name"`
-							MountPath string `yaml:"mountPath"`
-						} `yaml:"volumeMounts"`
-					} `yaml:"containers"`
+					Containers     []container `yaml:"containers"`
+					InitContainers []container `yaml:"initContainers"`
 				} `yaml:"spec"`
 			} `yaml:"template"`
 		} `yaml:"spec"`
@@ -96,10 +99,33 @@ func TestKubernetesManifestsMountConfigWhereTheBinaryReadsIt(t *testing.T) {
 	// Must match CONFIG_PATH in the Dockerfile.
 	const wantMountPath = "/app/config.yaml"
 
-	var found bool
+	// Scan initContainers only. The proxy is deliberately a native sidecar, and
+	// restartPolicy is not a valid field on an ordinary container -- scanning both
+	// would report a confusing "restartPolicy is empty" if it were ever moved
+	// back, instead of naming the actual problem.
+	if len(manifest.Spec.Template.Spec.InitContainers) == 0 {
+		t.Fatal("no initContainers: the proxy must be a native sidecar so the kubelet starts it " +
+			"before the app and stops it only after the app exits")
+	}
 	for _, c := range manifest.Spec.Template.Spec.Containers {
+		if c.Name == "mitm-proxy" {
+			t.Error("mitm-proxy is an ordinary container; as a native sidecar it belongs in " +
+				"initContainers with restartPolicy: Always, or the kubelet SIGTERMs it alongside " +
+				"the app and egress dies while the app is still draining")
+		}
+	}
+
+	var found bool
+	for _, c := range manifest.Spec.Template.Spec.InitContainers {
 		if c.Name != "mitm-proxy" {
 			continue
+		}
+		// A native sidecar is an initContainer with restartPolicy: Always. Without
+		// it the kubelet runs the proxy to completion before starting the app,
+		// which never happens, and the pod hangs in Init.
+		if c.RestartPolicy != "Always" {
+			t.Errorf("mitm-proxy restartPolicy = %q, want \"Always\"; an initContainer without it "+
+				"blocks the pod from ever starting the app", c.RestartPolicy)
 		}
 		for _, m := range c.VolumeMounts {
 			if m.Name == "config" {

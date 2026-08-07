@@ -172,6 +172,14 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 
 	// Record metrics with bounded cardinality
 	metricDomain := NormalizeDomainForMetrics(host, rewriteExact, acl)
+	if matchedRewrite != nil {
+		// Label from the rule, not the host. Only exact-match rules live in
+		// rewriteExact, so a wildcard or ~regex rewrite fell through to "_other"
+		// and every such target shared one series -- despite rewrites being the
+		// thing most worth attributing per-target. The rule's Original is bounded
+		// by the size of the config, so this cannot inflate cardinality.
+		metricDomain = matchedRewrite.Original
+	}
 	metrics.TrafficTotal.WithLabelValues(metricDomain, action).Inc()
 
 	// Block denied requests
@@ -627,7 +635,6 @@ func NewOutboundTransport(baseTLS *tls.Config, runtimeCfg *config.RuntimeConfig,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          opts.MaxIdleConns,
 		MaxIdleConnsPerHost:   opts.MaxIdleConnsPerHost,
-		MaxConnsPerHost:       opts.MaxConnsPerHost,
 		IdleConnTimeout:       opts.IdleConnTimeout,
 		ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
 		DialContext:           MakeDialer(runtimeCfg),
@@ -641,7 +648,6 @@ func NewOutboundTransport(baseTLS *tls.Config, runtimeCfg *config.RuntimeConfig,
 type OutboundTransportOptions struct {
 	MaxIdleConns          int
 	MaxIdleConnsPerHost   int
-	MaxConnsPerHost       int
 	IdleConnTimeout       time.Duration
 	ResponseHeaderTimeout time.Duration
 }
@@ -667,18 +673,16 @@ type BlockedRequest struct {
 // through here is the only way the log can hold what the documentation promises:
 // every BLACK-LISTED and BLOCKED request, including HTTPS.
 func LogBlocked(ctx context.Context, runtimeCfg *config.RuntimeConfig, req BlockedRequest) {
-	bl := runtimeCfg.GetBlockedLogger()
-	if bl == nil {
-		return
-	}
-	bl.LogAttrs(ctx, slog.LevelInfo, "blocked",
-		slog.String("request_id", req.RequestID),
-		slog.String("client", req.Client),
-		slog.String("host", req.Host),
-		slog.String("method", req.Method),
-		slog.String("target", req.Target),
-		slog.String("action", req.Action),
-	)
+	runtimeCfg.WithBlockedLogger(func(bl *slog.Logger) {
+		bl.LogAttrs(ctx, slog.LevelInfo, "blocked",
+			slog.String("request_id", req.RequestID),
+			slog.String("client", req.Client),
+			slog.String("host", req.Host),
+			slog.String("method", req.Method),
+			slog.String("target", req.Target),
+			slog.String("action", req.Action),
+		)
+	})
 }
 
 // defaultPortForScheme returns the port an HTTP URL scheme implies when the

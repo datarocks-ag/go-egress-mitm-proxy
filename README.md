@@ -532,6 +532,8 @@ Each record captures:
 
 **Matching:** rules are OR'd; within a single rule, `host` and `url` must both match (use separate rules for OR). `host`/`url` use the same convention as ACL/rewrites (wildcard, or `~` for raw regex).
 
+**Bodies are not redacted.** `redact_headers` and `redact_query` apply to headers and the query string only; `renderBody` receives no redactor. Enabling `bodies` writes request and response payloads verbatim (subject to the size caps and content-type gate), so treat a trace log with bodies enabled as containing secrets.
+
 **Redaction is secure-by-default.** `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always masked, as are the URL-bearing `Location`, `Content-Location` and `Referer` — a 302 in an OAuth flow routinely carries the authorization code in `Location`, and header values are masked by name, so `redact_query` (which only sees the request URL) never covered it; `redact_headers` extends the set, and `redact_query` masks query-string values and **defaults to `true`** — set it to `false` to opt out. Set `log_secrets: true` to disable all redaction (use with care — these logs may be shipped/retained).
 
 **Passthrough hosts** (non-MITM tunnels) are traced TCP-only: connected IP, dial timing, and bytes transferred. Headers and bodies are inherently invisible because the traffic is not intercepted.
