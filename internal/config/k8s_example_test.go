@@ -7,6 +7,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -111,5 +112,98 @@ func TestKubernetesManifestsMountConfigWhereTheBinaryReadsIt(t *testing.T) {
 	}
 	if !found {
 		t.Error("no config volumeMount on the mitm-proxy container")
+	}
+}
+
+// TestKubernetesExampleGatesBothSchemes pins that the app container is pointed
+// at the proxy for cleartext HTTP as well as HTTPS.
+//
+// The manifest previously set only HTTPS_PROXY. Every proxy-aware client selects
+// by request scheme, so all plain-HTTP egress went direct: no ACL evaluation, no
+// 403, no blocked-log entry, no metric. The manifest read as "all egress is
+// gated" while the entire cleartext surface was not — and the proxy explicitly
+// supports that path.
+func TestKubernetesExampleGatesBothSchemes(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Clean("../../doc/k8s/go-egress-proxy-deployment"))
+	if err != nil {
+		t.Fatalf("read Deployment: %v", err)
+	}
+
+	var manifest struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Name string `yaml:"name"`
+						Env  []struct {
+							Name  string `yaml:"name"`
+							Value string `yaml:"value"`
+						} `yaml:"env"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err = yaml.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("Deployment is not valid YAML: %v", err)
+	}
+
+	var app *struct {
+		Name string `yaml:"name"`
+		Env  []struct {
+			Name  string `yaml:"name"`
+			Value string `yaml:"value"`
+		} `yaml:"env"`
+	}
+	for i, c := range manifest.Spec.Template.Spec.Containers {
+		if c.Name == "app" {
+			app = &manifest.Spec.Template.Spec.Containers[i]
+		}
+	}
+	if app == nil {
+		t.Fatal("no container named \"app\" in the example Deployment")
+	}
+
+	env := map[string]string{}
+	for _, e := range app.Env {
+		env[e.Name] = e.Value
+	}
+
+	// Lowercase matters: curl and several libraries read only those spellings.
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if env[key] == "" {
+			t.Errorf("app container does not set %s; egress for that scheme bypasses the proxy entirely", key)
+		}
+	}
+
+	// All four must point at the same place. A lowercase variant pointing
+	// elsewhere is worse than one being absent: the client silently picks a
+	// different proxy for the same traffic depending on which spelling it reads.
+	want := env["HTTP_PROXY"]
+	for _, key := range []string{"HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if env[key] != want {
+			t.Errorf("%s = %q but HTTP_PROXY = %q; the spellings disagree about where traffic goes",
+				key, env[key], want)
+		}
+	}
+
+	// NO_PROXY keeps in-cluster and link-local traffic off the proxy. Without it
+	// pod-to-pod and metadata-endpoint calls are tunneled through the sidecar,
+	// where the ACL has no rules for them -- with default_policy BLOCK that breaks
+	// service discovery, and it puts the proxy on the path of traffic it was
+	// never meant to see.
+	for _, key := range []string{"NO_PROXY", "no_proxy"} {
+		if env[key] == "" {
+			t.Errorf("app container does not set %s; in-cluster traffic is routed through the proxy", key)
+			continue
+		}
+		for _, must := range []string{"localhost", ".svc"} {
+			if !strings.Contains(env[key], must) {
+				t.Errorf("%s = %q does not exempt %q", key, env[key], must)
+			}
+		}
+	}
+	if env["NO_PROXY"] != env["no_proxy"] {
+		t.Errorf("NO_PROXY (%q) and no_proxy (%q) disagree", env["NO_PROXY"], env["no_proxy"])
 	}
 }

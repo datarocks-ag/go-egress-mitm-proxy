@@ -42,7 +42,9 @@ type RewriteResult struct {
 }
 
 // HandleRequest processes each incoming request through the policy engine.
-// It evaluates rules in order: rewrites -> blacklist -> whitelist -> default policy.
+// It evaluates rules in order: blacklist -> rewrites -> whitelist -> default policy.
+// The blacklist is first and short-circuits the rewrite table; see the comment at
+// the blacklist check for why that ordering is load-bearing rather than cosmetic.
 func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.RuntimeConfig) (*http.Request, *http.Response) {
 	start := time.Now()
 
@@ -172,11 +174,6 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 	metricDomain := NormalizeDomainForMetrics(host, rewriteExact, acl)
 	metrics.TrafficTotal.WithLabelValues(metricDomain, action).Inc()
 
-	// Track request size
-	if r.ContentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("request").Add(float64(r.ContentLength))
-	}
-
 	// Block denied requests
 	if action == "BLACK-LISTED" || action == "BLOCKED" {
 		LogBlocked(r.Context(), runtimeCfg, BlockedRequest{
@@ -195,6 +192,15 @@ func HandleRequest(r *http.Request, pctx *goproxy.ProxyCtx, runtimeCfg *config.R
 		// request.
 		metrics.RequestDuration.WithLabelValues(action).Observe(time.Since(start).Seconds())
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusForbidden, "Policy Blocked")
+	}
+
+	// Track request size. Counted only once the request is actually going
+	// upstream: a 10 MB POST to a blacklisted host is refused with 403 without a
+	// byte leaving the proxy, and counting it above the block check inflated
+	// proxy_bytes_total with traffic that never happened -- in the direction an
+	// egress dashboard reads as data leaving the network.
+	if r.ContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("request").Add(float64(r.ContentLength))
 	}
 
 	// Apply rewrite transformations: drop headers, inject headers, change scheme.

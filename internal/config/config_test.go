@@ -776,47 +776,49 @@ func TestOpenBlockedLog(t *testing.T) {
 	})
 }
 
-func TestBlockedLoggerWritesJSON(t *testing.T) {
+// TestOpenBlockedLogProducesAppendableJSONLines covers what this package owns:
+// OpenBlockedLog returns a logger that writes one JSON object per line to the
+// named file, and appends rather than truncating on reopen.
+//
+// It deliberately does NOT assert the field names of a blocked-request entry.
+// The previous version wrote its own attributes and read the same keys back, so
+// it asserted nothing about production and went on passing after the record's
+// "path" field was renamed to "target". The schema is pinned where it is
+// produced, in proxy.TestHandleRequestWritesBlockedAuditEntry.
+func TestOpenBlockedLogProducesAppendableJSONLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "blocked.log")
+
 	logger, f, err := OpenBlockedLog(path)
 	if err != nil {
 		t.Fatalf("OpenBlockedLog() error = %v", err)
 	}
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "blocked")
+	f.Close() //nolint:errcheck // flush before reopen
 
-	logger.LogAttrs(context.Background(), slog.LevelInfo, "blocked",
-		slog.String("request_id", "abc123"),
-		slog.String("client", "127.0.0.1:9999"),
-		slog.String("host", "evil.com"),
-		slog.String("method", "GET"),
-		slog.String("path", "/malware"),
-		slog.String("action", "BLACK-LISTED"),
-	)
-	f.Close() //nolint:errcheck // flush before read
+	// Reopening must append: SIGHUP rotation relies on it.
+	logger2, f2, err := OpenBlockedLog(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	logger2.LogAttrs(context.Background(), slog.LevelInfo, "blocked")
+	f2.Close() //nolint:errcheck // flush before read
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read blocked log: %v", err)
 	}
-
-	var entry map[string]interface{}
-	if err := json.Unmarshal(data, &entry); err != nil {
-		t.Fatalf("unmarshal JSON log entry: %v (raw: %s)", err, data)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2 (reopen truncated instead of appending):\n%s", len(lines), data)
 	}
-
-	wantKeys := []string{"request_id", "client", "host", "method", "path", "action", "msg", "level", "time"}
-	for _, key := range wantKeys {
-		if _, ok := entry[key]; !ok {
-			t.Errorf("missing key %q in JSON log entry", key)
+	for i, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("line %d is not JSON: %v (raw: %s)", i, err, line)
 		}
-	}
-	if entry["request_id"] != "abc123" {
-		t.Errorf("request_id = %v, want %q", entry["request_id"], "abc123")
-	}
-	if entry["action"] != "BLACK-LISTED" {
-		t.Errorf("action = %v, want %q", entry["action"], "BLACK-LISTED")
-	}
-	if entry["msg"] != "blocked" {
-		t.Errorf("msg = %v, want %q", entry["msg"], "blocked")
+		if entry["msg"] != "blocked" {
+			t.Errorf("line %d msg = %v, want %q", i, entry["msg"], "blocked")
+		}
 	}
 }
 

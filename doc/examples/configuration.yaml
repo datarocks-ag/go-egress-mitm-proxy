@@ -29,7 +29,9 @@ proxy:
 
 # Domain rewrite rules
 # Supports exact match, wildcards (*.example.com), and regex (~<pattern>)
-# Rewrite rules bypass ACL checks
+# Rewrite rules bypass the whitelist and default policy -- a rewritten host is
+# implicitly allowed. They do NOT bypass the blacklist: a denied host is blocked
+# with 403 and its rewrite rule is never applied.
 # Each rule must specify either target_ip or target_host (not both)
 rewrites:
   # Exact domain match with target IP
