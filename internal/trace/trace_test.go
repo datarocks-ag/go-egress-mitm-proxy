@@ -41,7 +41,7 @@ func TestRecordEmitAggregatedRedacts(t *testing.T) {
 	var buf bytes.Buffer
 	// Compile through the real path so built-in redaction defaults
 	// (authorization, cookie, set-cookie, ...) are applied.
-	ct, err := config.CompileTrace(config.TraceConfig{Enabled: true, RedactQuery: true})
+	ct, err := config.CompileTrace(config.TraceConfig{Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}

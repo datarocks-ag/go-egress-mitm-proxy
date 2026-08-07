@@ -14,8 +14,6 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
-
-	"go-egress-proxy/internal/metrics"
 )
 
 // RewriteRule defines a domain rewrite configuration.
@@ -83,12 +81,16 @@ type Config struct {
 // When enabled, requests matching any rule are logged as a single aggregated
 // JSON record covering the TCP/TLS, request, and response layers.
 type TraceConfig struct {
-	Enabled       bool        `yaml:"enabled"`        // Master switch; when false tracing is fully short-circuited
-	LogPath       string      `yaml:"log_path"`       // Optional dedicated JSON-lines file; empty = main log stream
-	RedactHeaders []string    `yaml:"redact_headers"` // Header names to mask, in addition to the built-in defaults
-	RedactQuery   bool        `yaml:"redact_query"`   // Mask URL query-string values
-	LogSecrets    bool        `yaml:"log_secrets"`    // Escape hatch: disable all redaction and log verbatim
-	Rules         []TraceRule `yaml:"rules"`          // OR across rules; within a rule host AND url must both match
+	Enabled       bool     `yaml:"enabled"`        // Master switch; when false tracing is fully short-circuited
+	LogPath       string   `yaml:"log_path"`       // Optional dedicated JSON-lines file; empty = main log stream
+	RedactHeaders []string `yaml:"redact_headers"` // Header names to mask, in addition to the built-in defaults
+	// RedactQuery masks URL query-string values. Defaults to true when omitted:
+	// query strings routinely carry tokens, api keys and presigned signatures,
+	// and trace records are written to disk. A pointer so an explicit
+	// "redact_query: false" is distinguishable from an absent key.
+	RedactQuery *bool       `yaml:"redact_query"`
+	LogSecrets  bool        `yaml:"log_secrets"` // Escape hatch: disable all redaction and log verbatim
+	Rules       []TraceRule `yaml:"rules"`       // OR across rules; within a rule host AND url must both match
 }
 
 // TraceRule selects requests to trace by host and/or URL, with per-rule body capture.
@@ -168,7 +170,7 @@ func (ct CompiledTrace) Match(host, fullURL string, hasURL bool) *CompiledTraceR
 func CompileTrace(tc TraceConfig) (CompiledTrace, error) {
 	ct := CompiledTrace{
 		Enabled:       tc.Enabled,
-		RedactQuery:   tc.RedactQuery,
+		RedactQuery:   tc.RedactQuery == nil || *tc.RedactQuery,
 		LogSecrets:    tc.LogSecrets,
 		RedactHeaders: make(map[string]bool),
 	}
@@ -725,6 +727,31 @@ func WildcardToRegex(pattern string) (*regexp.Regexp, error) {
 		return regexp.Compile(".*")
 	}
 
+	// Reject a "*" anywhere other than the leading label.
+	//
+	// Only a leading "*." is expanded; every other "*" survives QuoteMeta and is
+	// then anchored, so "api.*.evil.com" compiles to ^api\.\*\.evil\.com$ and
+	// matches nothing. That is silent and, in a blacklist, fails open: the entry
+	// blocks nothing and every host it was meant to deny is ALLOWED-BY-DEFAULT.
+	// Compilation succeeds today and `validate` reports the config as valid, so
+	// nothing surfaces the mistake. For a policy list, refusing to load beats
+	// pretending to enforce.
+	rest := pattern
+	if after, ok := strings.CutPrefix(pattern, "*."); ok {
+		if after == "" {
+			// "*." alone anchors to ^.+\.$ — it can only match a host ending in a
+			// dot, and NormalizeHost strips exactly that before matching, so it can
+			// never match anything. Same silent fail-open this check exists to
+			// prevent.
+			return nil, fmt.Errorf("invalid wildcard %q: %q matches nothing; use %q to match every host", pattern, "*.", "*")
+		}
+		rest = after
+	}
+	if strings.Contains(rest, "*") {
+		return nil, fmt.Errorf("invalid wildcard %q: \"*\" is only supported as a leading \"*.\" label "+
+			"(or alone); use a \"~\" prefix for a raw regex", pattern)
+	}
+
 	// Escape regex special characters except *. Lowercase first: hosts are
 	// normalized before matching, so an uppercase pattern would never match.
 	escaped := regexp.QuoteMeta(strings.ToLower(pattern))
@@ -788,12 +815,10 @@ func WildcardToURLRegex(pattern string) (*regexp.Regexp, error) {
 func LoadConfig(path string) (Config, error) {
 	f, err := os.ReadFile(path)
 	if err != nil {
-		metrics.ConfigLoadErrors.Inc()
 		return Config{}, fmt.Errorf("read config file: %w", err)
 	}
 	var c Config
 	if err := yaml.Unmarshal(f, &c); err != nil {
-		metrics.ConfigLoadErrors.Inc()
 		return Config{}, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -801,7 +826,6 @@ func LoadConfig(path string) (Config, error) {
 	c.ApplyEnvOverrides()
 
 	if err := c.Validate(); err != nil {
-		metrics.ConfigLoadErrors.Inc()
 		return Config{}, fmt.Errorf("validate config: %w", err)
 	}
 	return c, nil

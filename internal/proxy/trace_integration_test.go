@@ -45,8 +45,7 @@ func TestTraceEndToEndThroughProxy(t *testing.T) {
 	_ = rc.Update(cfg, config.CompiledACL{}, nil, nil, nil, nil)
 
 	ct, err := config.CompileTrace(config.TraceConfig{
-		Enabled:     true,
-		RedactQuery: true,
+		Enabled: true,
 		Rules: []config.TraceRule{
 			{
 				Host:   "~^127\\.0\\.0\\.1$",
