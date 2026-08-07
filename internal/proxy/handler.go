@@ -627,7 +627,6 @@ func NewOutboundTransport(baseTLS *tls.Config, runtimeCfg *config.RuntimeConfig,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          opts.MaxIdleConns,
 		MaxIdleConnsPerHost:   opts.MaxIdleConnsPerHost,
-		MaxConnsPerHost:       opts.MaxConnsPerHost,
 		IdleConnTimeout:       opts.IdleConnTimeout,
 		ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
 		DialContext:           MakeDialer(runtimeCfg),
@@ -641,7 +640,6 @@ func NewOutboundTransport(baseTLS *tls.Config, runtimeCfg *config.RuntimeConfig,
 type OutboundTransportOptions struct {
 	MaxIdleConns          int
 	MaxIdleConnsPerHost   int
-	MaxConnsPerHost       int
 	IdleConnTimeout       time.Duration
 	ResponseHeaderTimeout time.Duration
 }
