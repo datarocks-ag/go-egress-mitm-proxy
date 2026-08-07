@@ -348,6 +348,27 @@ func (rc *RuntimeConfig) GetBlockedLogger() *slog.Logger {
 	return rc.blockedLogger
 }
 
+// WithBlockedLogger runs fn against the blocked-request logger while holding the
+// read lock, or does nothing when the log is disabled.
+//
+// Fetching the logger and writing to it as two steps leaves a window: a SIGHUP
+// between them swaps the logger and closes the previous file, so the write lands
+// on a closed descriptor, returns ErrFileClosing, and slog discards handler
+// errors -- the audit entry exists in neither the rotated file nor the new one.
+// The exposure is small (one record, at the instant of a rotation, and the fd
+// number cannot be recycled under an in-flight writer because internal/poll
+// defers the real close until references drain) but a blocked-request entry is
+// the one record that must not go missing quietly. A blocked-log write is a
+// single small append, so holding the read lock across it is cheap.
+func (rc *RuntimeConfig) WithBlockedLogger(fn func(*slog.Logger)) {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	if rc.blockedLogger == nil {
+		return
+	}
+	fn(rc.blockedLogger)
+}
+
 // CloseBlockedLog closes the blocked log file handle, if open.
 func (rc *RuntimeConfig) CloseBlockedLog() {
 	rc.mu.Lock()

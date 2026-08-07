@@ -667,18 +667,16 @@ type BlockedRequest struct {
 // through here is the only way the log can hold what the documentation promises:
 // every BLACK-LISTED and BLOCKED request, including HTTPS.
 func LogBlocked(ctx context.Context, runtimeCfg *config.RuntimeConfig, req BlockedRequest) {
-	bl := runtimeCfg.GetBlockedLogger()
-	if bl == nil {
-		return
-	}
-	bl.LogAttrs(ctx, slog.LevelInfo, "blocked",
-		slog.String("request_id", req.RequestID),
-		slog.String("client", req.Client),
-		slog.String("host", req.Host),
-		slog.String("method", req.Method),
-		slog.String("target", req.Target),
-		slog.String("action", req.Action),
-	)
+	runtimeCfg.WithBlockedLogger(func(bl *slog.Logger) {
+		bl.LogAttrs(ctx, slog.LevelInfo, "blocked",
+			slog.String("request_id", req.RequestID),
+			slog.String("client", req.Client),
+			slog.String("host", req.Host),
+			slog.String("method", req.Method),
+			slog.String("target", req.Target),
+			slog.String("action", req.Action),
+		)
+	})
 }
 
 // defaultPortForScheme returns the port an HTTP URL scheme implies when the
