@@ -257,6 +257,12 @@ func main() {
 		slog.Error("Failed to open trace log", "path", cfg.Trace.LogPath, "err", err)
 		os.Exit(1)
 	}
+	if traceLogger == nil && cfg.Trace.Enabled {
+		// No dedicated file: records go to the main stream, but they are written
+		// at Info and the proxy defaults to Warn. Use a handler that always admits
+		// Info so tracing really is independent of the verbosity flags.
+		traceLogger = config.MainStreamTraceLogger(os.Stdout)
+	}
 	_ = runtimeCfg.SetTrace(compiledTrace, traceLogger, traceFile)
 
 	// Load MITM CA certificate and key for TLS interception

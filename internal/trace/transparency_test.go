@@ -14,7 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"go-egress-proxy/internal/config"
+	"go-egress-proxy/internal/metrics"
 )
 
 // TestPrepareResponseLeavesBodyAloneWhenNotCapturing is the guard that keeps
@@ -173,5 +176,62 @@ func TestLateDialUpdateDoesNotContradictConnectionReuse(t *testing.T) {
 	}
 	if errMsg, ok := out["error"]; ok {
 		t.Errorf("error = %v attached to a request that succeeded on a pooled connection", errMsg)
+	}
+}
+
+// TestEmitSkipsCounterWhenRecordIsFiltered pins the backstop.
+//
+// Records are written at Info while the proxy defaults to Warn, so a
+// main-stream record used to be silently discarded — and
+// proxy_trace_records_total incremented anyway, so the counter and the log
+// diverged permanently. Startup now supplies an Info-admitting handler for that
+// case; this guard makes the remaining paths fail loudly instead of quietly.
+func TestEmitSkipsCounterWhenRecordIsFiltered(t *testing.T) {
+	ct, err := config.CompileTrace(config.TraceConfig{
+		Enabled: true,
+		Rules:   []config.TraceRule{{Host: "*"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	filtering := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+	rec := NewRecord("tid", "mitm", &ct.Rules[0], NewRedactor(ct), StaticLogger(filtering))
+
+	before := testutil.ToFloat64(metrics.TraceRecords.WithLabelValues("mitm"))
+	rec.Emit()
+	after := testutil.ToFloat64(metrics.TraceRecords.WithLabelValues("mitm"))
+
+	if buf.Len() != 0 {
+		t.Errorf("record unexpectedly written through a filtering handler:\n%s", buf.String())
+	}
+	if after != before {
+		t.Errorf("proxy_trace_records_total moved by %v for a record that was never written", after-before)
+	}
+}
+
+// TestEmitCountsWhenRecordIsWritten is the positive control.
+func TestEmitCountsWhenRecordIsWritten(t *testing.T) {
+	ct, err := config.CompileTrace(config.TraceConfig{
+		Enabled: true,
+		Rules:   []config.TraceRule{{Host: "*"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	rec := NewRecord("tid", "mitm", &ct.Rules[0], NewRedactor(ct),
+		StaticLogger(config.MainStreamTraceLogger(&buf)))
+
+	before := testutil.ToFloat64(metrics.TraceRecords.WithLabelValues("mitm"))
+	rec.Emit()
+
+	if buf.Len() == 0 {
+		t.Error("record was not written through the main-stream trace logger")
+	}
+	if delta := testutil.ToFloat64(metrics.TraceRecords.WithLabelValues("mitm")) - before; delta != 1 {
+		t.Errorf("counter moved by %v, want 1", delta)
 	}
 }

@@ -109,10 +109,18 @@ acl:
     - "*.github.com"
     - "*.githubusercontent.com"
   blacklist:
+    # "*.example.com" matches subdomains at any depth but NOT the apex, so a
+    # denylist needs both forms or the bare domain is ALLOWED-BY-DEFAULT.
+    - "tiktok.com"
     - "*.tiktok.com"
+    - "facebook.com"
     - "*.facebook.com"
+    - "twitter.com"
     - "*.twitter.com"
-    - "~social-media\\.internal"   # regex: matches as substring
+    # Raw regex (~) is anchored and case-insensitive, so it matches the WHOLE
+    # host — not a substring. Spell out the subdomains you mean to cover;
+    # "~social-media\\.internal" alone would let ads.social-media.internal through.
+    - "~^(.+\\.)?social-media\\.internal$"
   passthrough:
     # Tunnel these hosts without MITM interception.
     # Use for services with their own PKI where clients don't trust the proxy CA.

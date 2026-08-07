@@ -83,6 +83,11 @@ func reload(deps reloadDeps) error {
 	}
 
 	newTraceLogger, newTraceFile, err := deps.traceOpener()(newCfg.Trace.LogPath)
+	if err == nil && newTraceLogger == nil && newCfg.Trace.Enabled {
+		// Same as startup: an empty log_path means the main stream, which needs a
+		// handler that admits Info or every record is filtered out.
+		newTraceLogger = config.MainStreamTraceLogger(os.Stdout)
+	}
 	if err != nil {
 		closeFile(newBlockedFile, "blocked log")
 		return fmt.Errorf("open trace log %q: %w", newCfg.Trace.LogPath, err)

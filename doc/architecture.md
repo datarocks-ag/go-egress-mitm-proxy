@@ -113,6 +113,9 @@ Environment variable overrides follow 12-factor app principles:
 - `PROXY_MITM_KEYSTORE_PATH`, `PROXY_MITM_KEYSTORE_PASSWORD` (PKCS#12 alternative)
 - `PROXY_OUTGOING_CA_BUNDLE`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`
 - `PROXY_INSECURE_SKIP_VERIFY`, `PROXY_BLOCKED_LOG_PATH`
+- `PROXY_MITM_ORG` (Organization on MITM leaf certificates)
+- `PROXY_PRESTOP_GRACE` (read by `main`, not the config loader: how long to keep
+  serving after `/readyz` starts failing on SIGTERM)
 
 ### ACL Engine
 
@@ -148,11 +151,28 @@ Rewrite rules support wildcards and raw regex for domain matching:
 
 ```go
 // WildcardToRegex converts patterns:
-// "example.com"     -> "^example\.com$"           (exact)
-// "*.example.com"   -> "^.+\.example\.com$"       (any subdomain depth)
+// "example.com"     -> "(?i)^example\.com$"        (exact)
+// "*.example.com"   -> "(?i)^.+\.example\.com$"    (any subdomain depth, NOT the apex)
 // "*"               -> ".*"                        (match all)
-// "~<regex>"        -> compiled as-is             (raw regex, no escaping/anchoring)
+// "~<regex>"        -> "(?i)^(?:<regex>)$"         (raw regex: not escaped, but anchored)
 ```
+
+Two properties are easy to get wrong:
+
+**Raw `~` patterns are anchored, not substring matches.** Matching uses
+`MatchString`, which succeeds on any substring, so an unanchored
+`~api\.corp\.com` would also match `api.corp.com.attacker.net` — a whitelist
+entry that fails open. The non-capturing group keeps alternations intact and is
+a no-op for patterns that already carry their own anchors.
+
+**A `*.` wildcard does not cover the apex.** `*.example.com` matches
+`a.example.com` and `a.b.example.com` but not `example.com`. Denylists need
+both forms; a lone wildcard entry leaves the bare domain
+`ALLOWED-BY-DEFAULT`.
+
+All patterns compile case-insensitively. Hosts are lowercased by
+`NormalizeHost` before matching, so `(?i)` is redundant on that path — it is
+there so a future call site that forgets to normalize fails closed.
 
 ### Request Handler
 
@@ -296,7 +316,7 @@ Separate HTTP server on metrics port exposing:
 
 | Signal | Action |
 |--------|--------|
-| `SIGINT` / `SIGTERM` | Graceful shutdown with 30s drain |
+| `SIGINT` / `SIGTERM` | Graceful shutdown: fail `/readyz`, keep serving for `PROXY_PRESTOP_GRACE` (default 10s), then drain in-flight requests and CONNECT tunnels within a 30s budget |
 | `SIGHUP` | Hot reload configuration, reopen blocked and trace log files, rebuild outbound TLS, and `TransportPool.Reset()`. Warns about changed `mitm_*` and port settings, which need a restart. |
 
 ## Data Flow

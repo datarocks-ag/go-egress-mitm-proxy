@@ -33,6 +33,10 @@ type ctxKeyType struct{}
 // which only receive a context.Context (not the goproxy ProxyCtx).
 var CtxKey = ctxKeyType{}
 
+// traceDropWarning ensures the "records are being filtered" warning is emitted
+// once rather than per record.
+var traceDropWarning sync.Once
+
 // FromContext returns the trace Record stored in ctx, or nil.
 func FromContext(ctx context.Context) *Record {
 	rec, ok := ctx.Value(CtxKey).(*Record)
@@ -323,6 +327,20 @@ func (r *Record) emit() {
 	}
 	if logger == nil {
 		logger = slog.Default()
+	}
+
+	// Records are written at Info. The documented contract is that tracing is
+	// independent of the -v/-vv/-vvv level, and main builds a dedicated Info-level
+	// handler for the main-stream case to honor that. This guard is the backstop:
+	// if a record would be filtered out, say so once rather than incrementing a
+	// counter for a record nobody can read. A silent divergence between
+	// proxy_trace_records_total and the log is worse than either failure alone.
+	if !logger.Enabled(context.Background(), slog.LevelInfo) {
+		traceDropWarning.Do(func() {
+			slog.Warn("Trace records are being discarded: the destination logger filters Info. " +
+				"Set trace.log_path, or raise the log level with -v.")
+		})
+		return
 	}
 
 	attrs := []any{
