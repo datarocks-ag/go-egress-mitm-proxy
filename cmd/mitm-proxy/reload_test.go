@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -380,4 +381,111 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestFailingReloadClosesAlreadyOpenedLogs pins the promise in reload()'s doc
+// comment: a reload that fails after opening one log file closes it on the way
+// out, so a repeatedly failing reload cannot leak a descriptor per attempt.
+//
+// Every existing failure case left blocked_log_path unset, so newBlockedFile was
+// always nil and the cleanup branches always early-returned — deleting all three
+// left the suite green.
+//
+// The assertion is direct rather than inferred from descriptor pressure. An
+// rlimit-based version of this test passes even with the cleanup removed,
+// because os.File finalizers close leaked descriptors during GC and exhaustion
+// never arrives; that makes the leak a latency problem rather than an unbounded
+// one, but it also makes it invisible to any exhaustion check.
+func TestFailingReloadClosesAlreadyOpenedLogs(t *testing.T) {
+	dir := t.TempDir()
+	rc, certPath, keyPath := newLoadedRuntime(t, dir)
+
+	body := strings.NewReplacer("CERT", certPath, "KEY", keyPath).
+		Replace(baseConfig("ALLOW", "x.example.com",
+			`blocked_log_path: "`+filepath.Join(dir, "blocked.log")+`"`))
+	path := writeConfig(t, dir, "aborting.yaml", body)
+
+	// A real file, so Close() is observable through its own error behavior.
+	opened, err := os.CreateTemp(dir, "blocked-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deps := reloadDeps{
+		configPath: path,
+		runtimeCfg: rc,
+		pool:       &countingPool{},
+		openBlockedLog: func(string) (*slog.Logger, *os.File, error) {
+			return slog.New(slog.NewJSONHandler(opened, nil)), opened, nil
+		},
+		openTraceLog: func(string) (*slog.Logger, *os.File, error) {
+			return nil, nil, errors.New("simulated trace log failure")
+		},
+	}
+
+	if err := reload(deps); err == nil {
+		t.Fatal("expected the reload to fail on the trace log")
+	}
+
+	// Closing twice returns an error only if the first close already happened.
+	if err := opened.Close(); err == nil {
+		t.Error("the blocked log was still open after the reload aborted; a failing reload leaks a descriptor per attempt")
+	}
+}
+
+// TestReloadRotatesTraceLog extends rotation coverage to the trace log, which
+// the blocked-log test did not reach.
+func TestReloadRotatesTraceLog(t *testing.T) {
+	dir := t.TempDir()
+	rc, certPath, keyPath := newLoadedRuntime(t, dir)
+
+	logPath := filepath.Join(dir, "trace.jsonl")
+	body := strings.NewReplacer("CERT", certPath, "KEY", keyPath).
+		Replace(baseConfig("ALLOW", "x.example.com")) + `trace:
+  enabled: true
+  log_path: "` + logPath + `"
+  rules:
+    - host: "*"
+`
+	path := writeConfig(t, dir, "traced.yaml", body)
+
+	deps := reloadDeps{configPath: path, runtimeCfg: rc, pool: &countingPool{}}
+	if err := reload(deps); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	t.Cleanup(rc.CloseTraceLog)
+
+	writeTrace := func(msg string) {
+		t.Helper()
+		_, logger := rc.GetTrace()
+		if logger == nil {
+			t.Fatal("trace logger was not installed")
+		}
+		logger.Info(msg)
+	}
+
+	writeTrace("before-rotation")
+
+	rotated := logPath + ".1"
+	if err := os.Rename(logPath, rotated); err != nil {
+		t.Fatalf("simulate logrotate: %v", err)
+	}
+
+	if err := reload(deps); err != nil {
+		t.Fatalf("second reload (rotation): %v", err)
+	}
+	writeTrace("after-rotation")
+
+	oldContents := readFile(t, rotated)
+	newContents := readFile(t, logPath)
+
+	if !strings.Contains(oldContents, "before-rotation") {
+		t.Errorf("rotated trace file lost the pre-rotation entry:\n%s", oldContents)
+	}
+	if strings.Contains(oldContents, "after-rotation") {
+		t.Error("post-rotation entry landed in the moved-aside trace file; the handle was not reopened")
+	}
+	if !strings.Contains(newContents, "after-rotation") {
+		t.Errorf("post-rotation entry did not reach the new trace file:\n%s", newContents)
+	}
 }

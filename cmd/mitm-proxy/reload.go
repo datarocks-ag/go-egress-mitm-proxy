@@ -21,11 +21,37 @@ type connectionPool interface {
 	Reset()
 }
 
+// logOpener opens a log file, returning its logger and handle. Matches
+// config.OpenBlockedLog and config.OpenTraceLog.
+type logOpener func(path string) (*slog.Logger, *os.File, error)
+
 // reloadDeps is what a config reload operates on.
 type reloadDeps struct {
 	configPath string
 	runtimeCfg *config.RuntimeConfig
 	pool       connectionPool
+
+	// openBlockedLog and openTraceLog default to the config package functions.
+	// They exist so a test can observe that a reload aborting between the two
+	// closes the first handle. Asserting that indirectly does not work: os.File
+	// finalizers close leaked descriptors during GC, so a leak never manifests
+	// as exhaustion and an rlimit-based test passes with the cleanup removed.
+	openBlockedLog logOpener
+	openTraceLog   logOpener
+}
+
+func (d reloadDeps) blockedOpener() logOpener {
+	if d.openBlockedLog != nil {
+		return d.openBlockedLog
+	}
+	return config.OpenBlockedLog
+}
+
+func (d reloadDeps) traceOpener() logOpener {
+	if d.openTraceLog != nil {
+		return d.openTraceLog
+	}
+	return config.OpenTraceLog
 }
 
 // reload re-reads the config file and swaps in the new configuration.
@@ -51,12 +77,12 @@ func reload(deps reloadDeps) error {
 		return fmt.Errorf("compile trace configuration: %w", err)
 	}
 
-	newBlockedLogger, newBlockedFile, err := config.OpenBlockedLog(newCfg.Proxy.BlockedLogPath)
+	newBlockedLogger, newBlockedFile, err := deps.blockedOpener()(newCfg.Proxy.BlockedLogPath)
 	if err != nil {
 		return fmt.Errorf("open blocked log %q: %w", newCfg.Proxy.BlockedLogPath, err)
 	}
 
-	newTraceLogger, newTraceFile, err := config.OpenTraceLog(newCfg.Trace.LogPath)
+	newTraceLogger, newTraceFile, err := deps.traceOpener()(newCfg.Trace.LogPath)
 	if err != nil {
 		closeFile(newBlockedFile, "blocked log")
 		return fmt.Errorf("open trace log %q: %w", newCfg.Trace.LogPath, err)
