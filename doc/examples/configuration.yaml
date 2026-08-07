@@ -15,6 +15,14 @@ proxy:
   # Disable upstream TLS certificate verification globally (for dev/test only!)
   # insecure_skip_verify: false
 
+  # Ceiling on concurrent client connections (0 or unset = unlimited).
+  # A hijacked CONNECT tunnel carries no deadline at any layer, so a client that
+  # completes the CONNECT and then goes silent holds a file descriptor and a
+  # goroutine until the process dies. This is what bounds that. At the cap the
+  # proxy pauses accepting until a connection closes, warns, and increments
+  # proxy_listener_saturated_total.
+  # max_connections: 2048
+
   # MITM CA certificate - provide either PEM cert+key or a PKCS#12 keystore (not both)
   # Generate with: mitm-proxy gencert --type root --cn "My CA" --out-cert certs/ca.crt --out-key certs/ca.key
   # Or for intermediate CA: mitm-proxy gencert --type intermediate --signing-cert root.crt --signing-key root.key --out-chain certs/chain.crt --out-key certs/ca.key

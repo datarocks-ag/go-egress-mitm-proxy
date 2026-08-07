@@ -462,7 +462,7 @@ Available at `http://localhost:9090/metrics`:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `proxy_traffic_total` | Counter | domain, action | Request count |
+| `proxy_traffic_total` | Counter | domain, action | Request count. For a rewritten request `domain` is the matching rule's configured pattern (e.g. `*.internal.example.com`), not the request host; otherwise it is the ACL base domain, or `_other` |
 | `proxy_request_duration_seconds` | Histogram | action | Request latency |
 | `proxy_active_connections` | Gauge | - | Current connections |
 | `proxy_config_load_errors_total` | Counter | - | Config load failures |
@@ -471,6 +471,7 @@ Available at `http://localhost:9090/metrics`:
 | `proxy_response_status_total` | Counter | class | Response status codes (2xx, 4xx, 5xx) |
 | `proxy_bytes_total` | Counter | direction | Bytes transferred (request/response) |
 | `proxy_trace_records_total` | Counter | mode | Emitted trace records (mitm/passthrough) |
+| `proxy_listener_saturated_total` | Counter | - | Times the client connection limit was reached and accepting paused |
 
 Three of these measure something different than a first reading suggests, which matters if you are building alerts on them:
 

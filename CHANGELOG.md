@@ -110,6 +110,47 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   image.
 - `gencert` creates its output directories, so the documented Quick Start works
   on a fresh clone.
+- **A rewrite rule's `headers: {Host: ...}` reaches the backend.** `Host` is not
+  stored in `Request.Header`: net/http excludes it from `Header.WriteSubset` and
+  derives the wire value, and the HTTP/2 `:authority`, from `Request.Host`. The
+  injected value was silently discarded, so a rewrite aimed at a name-based vhost
+  got the load balancer's default backend -- while the ACCESS log said `REWRITTEN`
+  and the trace diff listed `Host` as added. Every observability surface reported
+  success.
+- **`target_scheme` moves the port with the scheme.** goproxy builds the MITM
+  request URL from the CONNECT authority, so an intercepted HTTPS request carries
+  `:443`. Rewriting only the scheme sent cleartext HTTP to port 443 of the target,
+  which a backend serving HTTP on 80 or 8080 refuses and a TLS listener reads as a
+  malformed record. The documented "HTTPS client to HTTP backend" rewrite could
+  not work under any configuration. A port that was the old scheme's default now
+  moves to the new one's; a port the operator chose explicitly is kept.
+- **A saturated connection ceiling no longer deadlocks shutdown.** `Accept` waits
+  for a free slot before calling the underlying `Accept`, and closing a
+  `net.Listener` does not interrupt a channel send. `http.Server.Shutdown` waits
+  on its listener group for `Serve` to return and that wait ignores its context,
+  so `Shutdown` never returned -- and in the drain sequence it is the first call,
+  leaving the tunnel drain, metrics shutdown and log close unrun and the process
+  hanging until SIGKILL. Closing the listener now releases a parked accept.
+- **A second SIGINT/SIGTERM terminates.** `signal.NotifyContext` keeps the signal
+  suppressed until `stop()`, which ran only at the end of `main` -- so a second
+  Ctrl-C did nothing for up to 40s and the operator needed SIGKILL from another
+  shell.
+- **Trace records no longer claim connection reuse for requests that were never
+  forwarded.** The inference was "no dial, no error", which is also true of the
+  403 synthesized for a blocked host, so the record asserted an upstream
+  connection to a host the proxy refused to contact. Upstream errors that the
+  round-trip wrapper converts into a synthetic 502/504 are now recorded too;
+  previously such a record carried the status and no cause at all.
+- **A request refused after its body was counted no longer inflates
+  `proxy_bytes_total`.** The request-bytes increment ran before the block check,
+  so a 10 MB POST to a blacklisted host was counted as egress that never left.
+- **The blocked-request audit write holds the read lock.** A SIGHUP between
+  fetching the logger and writing closed the file underneath the write, and slog
+  discards handler errors, so the entry appeared in neither the rotated nor the
+  new file.
+- **The Kubernetes example gates cleartext egress.** It set only `HTTPS_PROXY`;
+  every proxy-aware client selects by request scheme, so all plain-HTTP egress
+  went direct -- no ACL evaluation, no 403, no blocked-log entry, no metric.
 - **Fail-open denylist entries in the example configuration.** The example is
   what the Quick Start says to copy, so its denylist reads as an idiom. A raw
   regex was annotated as a substring match when raw patterns are anchored
@@ -119,6 +160,24 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   tests, which is what had been missing when each of them shipped broken.
 
 ### Breaking
+- **Trace records mask `Location`, `Content-Location` and `Referer` by default.**
+  `redact_query` only ever saw the request URL, and header values are masked by
+  name, so an OAuth 302 wrote the authorization code to the trace log verbatim.
+  These three now join the always-masked set and `redactURL` strips
+  `user:password@`. Anything parsing redirect targets out of trace records will
+  see `<redacted>`; add them to an allowlist only by setting `log_secrets: true`,
+  which disables all redaction.
+- **`proxy_traffic_total{domain}` changes for rewritten requests.** A rewrite is
+  now labelled with the matching rule's configured pattern (for example
+  `*.internal.example.com`) instead of the request host. Previously only
+  exact-match rules got their own label and every wildcard or regex rewrite
+  collapsed into `_other`. **Dashboards and alerts grouping on `domain` will see
+  new series for rewritten traffic and a drop in `_other`.**
+- **A rewrite configuring `Content-Length`, `Transfer-Encoding` or `Trailer` in
+  `headers`, or `Host` in `drop_headers`, no longer loads.** net/http derives
+  those from the request body and discards a configured value, and `Host` cannot
+  be removed from the header map at all, so the settings silently did nothing.
+  Run `mitm-proxy validate --config <file>` before upgrading.
 - **The blocked-request log renames `path` to `target`.** A CONNECT carries
   `host:port` in its request-target rather than a path, so the old field was
   empty for exactly the entries an audit log most needs — rejected HTTPS
@@ -134,6 +193,17 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   a config that silently under-enforced will now refuse to start.
 
 ### Changed
+- The container image is built with the toolchain the tests run against. The
+  Dockerfile used Go 1.26 while `go.mod` declared 1.25 and every CI step pinned
+  1.25; the `go` directive fixes the language version, not the linked standard
+  library, so the published image and the release binaries linked a different
+  `crypto/tls`, `net/http` and hijacked-connection implementation from the one the
+  unit tests exercised. `go.mod` is now the single source and the workflows read
+  it via `go-version-file`.
+- The example Kubernetes manifest declares the proxy as a native sidecar (an
+  `initContainer` with `restartPolicy: Always`, Kubernetes 1.29+). As an ordinary
+  container the kubelet stops it alongside the application, so egress died while
+  the application was still draining.
 - Server timeouts: `ReadTimeout`/`WriteTimeout` replaced with
   `ReadHeaderTimeout`. The old absolute deadlines severed plain-HTTP transfers
   at 60s mid-body while leaving every CONNECT tunnel unbounded, since hijacking
@@ -175,6 +245,18 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   added readiness/liveness probes with a grace period exceeding the drain budget.
 
 ### Added
+- Per-rewrite `target_port`: the TCP port to connect to, overriding both the
+  client's port and the scheme default. Needed whenever a rewrite target does not
+  listen on 80/443 -- a legacy backend on `8080` behind a `target_scheme`
+  downgrade is the usual case.
+- `max_connections` / `PROXY_MAX_CONNECTIONS` (default `0`, unlimited): a ceiling
+  on concurrent client connections. A hijacked CONNECT tunnel carries no deadline
+  at any layer -- `ReadHeaderTimeout` covers only the CONNECT request line, and
+  hijacking clears the deadline -- so a client that connects and goes silent holds
+  a descriptor and a goroutine until the process exits. At the cap the listener
+  pauses accepting until one closes, warns, and increments the new
+  `proxy_listener_saturated_total`. The shipped Kubernetes example sets 2048.
+- `proxy_listener_saturated_total`: times the connection ceiling was reached.
 - `PROXY_PRESTOP_GRACE` (default `10s`): how long to keep serving after `/readyz`
   starts failing on SIGTERM, so load balancers observe the failure and route away
   before the listener closes. Set `0` when a `preStop` hook already sleeps.
