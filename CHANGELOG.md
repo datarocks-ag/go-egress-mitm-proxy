@@ -10,6 +10,30 @@ git history for the full detail.
 
 ## [Unreleased]
 
+### Added
+- **The container image carries OCI metadata.** `title`, `description`, `source`,
+  `url`, `documentation`, `licenses`, `vendor`, `base.name`, plus a per-build
+  `version`, `revision` (the commit SHA) and `created` timestamp. `revision` is
+  what links a running container back to the commit that produced it, which
+  previously required matching the image digest by hand.
+
+  The published package read "No description provided" because the CI metadata
+  action derives that label from the GitHub repository description, which is
+  empty -- an empty value that overrode nothing, because nothing was set. The
+  description now lives in the Dockerfile and in the workflow, where it is
+  reviewable in a diff rather than in a repository setting.
+
+  The documentation link is pinned to the commit rather than to `main`. An image
+  is immutable and the README on a branch is not: a link to `main` would send
+  someone running a year-old tag to documentation describing a config format that
+  image never supported.
+
+  The labels are declared in the Dockerfile as well as the workflow so an image
+  built with `make docker-build`, or by anyone with a clone, describes itself the
+  same way the published one does. `make docker-build` passes the real version,
+  commit and timestamp; a published image reading `revision=unknown` was built
+  outside those paths.
+
 ## [4.1.0] - 2026-08-07
 
 ### Added
