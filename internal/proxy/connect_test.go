@@ -248,3 +248,72 @@ func TestConnectHandlerRecordsBlacklistedMITM(t *testing.T) {
 		t.Error("a non-blacklisted host was recorded as a CONNECT denial")
 	}
 }
+
+// TestConnectActionLabelsAreDistinct pins which metric label each CONNECT
+// outcome uses.
+//
+// The two blacklist paths are easy to describe backwards, and this project's
+// documentation did exactly that: a refused passthrough tunnel and an
+// intercepted blacklisted host are different events with different labels, and
+// the docs had them swapped. Prose cannot be trusted to keep them straight, so
+// the mapping is asserted here — both that the right label moves and that the
+// other one does not.
+func TestConnectActionLabelsAreDistinct(t *testing.T) {
+	const (
+		blacklistedOnly = "denied.example.com"
+		bothLists       = "leaked.vault.internal"
+
+		// TrafficTotal is labeled by base domain for ACL-matched hosts, not by the
+		// full hostname; these are spelled out rather than recomputed so the test
+		// also pins that labeling.
+		blacklistedOnlyLabel = "example.com"
+		bothListsLabel       = "vault.internal"
+	)
+
+	cfg := config.Config{}
+	cfg.ACL.Blacklist = []string{blacklistedOnly, bothLists}
+	cfg.ACL.Passthrough = []string{"*.vault.internal"}
+	rc := runtimeFor(t, cfg)
+	handler := NewConnectHandler(rc, testMitm, testPassthrough)
+
+	read := func(domain, action string) float64 {
+		return testutil.ToFloat64(metrics.TrafficTotal.WithLabelValues(domain, action))
+	}
+
+	t.Run("blacklisted host is intercepted and counts as BLACK-LISTED-CONNECT", func(t *testing.T) {
+		beforeConnect := read(blacklistedOnlyLabel, "BLACK-LISTED-CONNECT")
+		beforePlain := read(blacklistedOnlyLabel, "BLACK-LISTED")
+
+		action, _ := handler(blacklistedOnly+":443", connectCtx(t, blacklistedOnly+":443"))
+		if action != testMitm {
+			t.Fatalf("action = %v, want the MITM action: a blacklisted host is intercepted so "+
+				"HandleRequest can answer 403", action)
+		}
+		if delta := read(blacklistedOnlyLabel, "BLACK-LISTED-CONNECT") - beforeConnect; delta != 1 {
+			t.Errorf("BLACK-LISTED-CONNECT moved by %v, want 1", delta)
+		}
+		// HandleRequest records BLACK-LISTED later, only if the handshake succeeds.
+		// Counting it here too would double-count every intercepted denial.
+		if delta := read(blacklistedOnlyLabel, "BLACK-LISTED") - beforePlain; delta != 0 {
+			t.Errorf("BLACK-LISTED moved by %v at the CONNECT stage, want 0", delta)
+		}
+	})
+
+	t.Run("passthrough and blacklisted is refused and counts as BLACK-LISTED", func(t *testing.T) {
+		beforeConnect := read(bothListsLabel, "BLACK-LISTED-CONNECT")
+		beforePlain := read(bothListsLabel, "BLACK-LISTED")
+
+		action, _ := handler(bothLists+":443", connectCtx(t, bothLists+":443"))
+		if action != goproxy.RejectConnect {
+			t.Fatalf("action = %v, want RejectConnect: a passthrough tunnel is never inspected, "+
+				"so a denied host must not get one", action)
+		}
+		if delta := read(bothListsLabel, "BLACK-LISTED") - beforePlain; delta != 1 {
+			t.Errorf("BLACK-LISTED moved by %v, want 1", delta)
+		}
+		if delta := read(bothListsLabel, "BLACK-LISTED-CONNECT") - beforeConnect; delta != 0 {
+			t.Errorf("BLACK-LISTED-CONNECT moved by %v for a refused tunnel, want 0; "+
+				"that label is for intercepted hosts", delta)
+		}
+	})
+}

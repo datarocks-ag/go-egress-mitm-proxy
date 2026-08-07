@@ -37,10 +37,15 @@ Findings from a full multi-lens code review of `main`, grouped by area:
   CONNECT-stage check to passthrough hosts removed the backstop for everything
   else; blacklisted hosts are now intercepted and refused by the handler, which
   is also what puts them in the blocked-request log.
-- **A CONNECT refused at the CONNECT stage is recorded.** A host that is both
-  passthrough and blacklisted never reaches `HandleRequest`, so those denials
-  appeared in no metric. They now emit a warning and count under a distinct
-  `BLACK-LISTED-CONNECT` action.
+- **A blacklisted HTTPS attempt is recorded even when interception fails.** A
+  blacklisted host is intercepted rather than refused so the handler can answer
+  with a readable 403, but that leaves the denial recorded only if the client
+  completes the handshake with the proxy's certificate — a pinning SDK or a JVM
+  truststore never will, and goproxy routes that failure to debug level. The
+  attempt now warns and counts under a distinct `BLACK-LISTED-CONNECT` action at
+  the CONNECT stage, so a denial is observable regardless of whether the client
+  cooperates. The separate label keeps it from inflating the `BLACK-LISTED`
+  count that `HandleRequest` records when the handshake does succeed.
 - **The truststore password is kept out of the log stream.**
 - **The leaf-certificate cache is keyed by signing identity**, not by hostname
   alone, so two callers configured with different CAs cannot be served each

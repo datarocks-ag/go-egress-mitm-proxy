@@ -85,10 +85,10 @@ cmd/main    → cert, config, health, metrics, proxy, trace
 2. Otherwise, proxy presents cert signed by internal CA (MITM)
 3. Request ID generated and injected (`X-Request-ID`)
 4. Rule matching: Check rewrites first (exact then wildcard, with optional `path_pattern` regex filtering), then ACL blacklist/whitelist (regex), then default policy
-5. Actions: `PASSTHROUGH`, `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, `BLACK-LISTED-CONNECT` (CONNECT refused at the CONNECT stage for a passthrough+blacklisted host, which never reaches `HandleRequest`)
-5. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
-6. Headers dropped (`drop_headers`) and injected (`headers`) on rewritten requests
-7. Request scheme optionally changed (`target_scheme`) before forwarding
+5. Actions: `PASSTHROUGH`, `REWRITTEN`, `WHITE-LISTED`, `BLACK-LISTED`, `ALLOWED-BY-DEFAULT`, `BLOCKED`, plus `BLACK-LISTED-CONNECT` — recorded at the CONNECT stage when a blacklisted host is intercepted, so the attempt stays visible even if the client refuses the proxy certificate and never reaches `HandleRequest`. A host that is both passthrough and blacklisted is refused outright and counts as `BLACK-LISTED`
+6. For rewrites: Custom `DialContext` routes TCP to `target_ip` instead of DNS resolution
+7. Headers dropped (`drop_headers`) and injected (`headers`) on rewritten requests
+8. Request scheme optionally changed (`target_scheme`) before forwarding
 
 **Response Status Codes:**
 
