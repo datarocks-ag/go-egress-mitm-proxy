@@ -70,6 +70,23 @@ func TestTargetSchemeMovesThePort(t *testing.T) {
 			wantHostHdr: "api.internal:9000",
 		},
 		{
+			// The port number does not change, but 443 stops being an oddity and
+			// becomes the scheme default, so the Host header must drop it.
+			name:         "a scheme change can make an unchanged port the default",
+			requestURL:   "http://legacy.internal:443/x",
+			targetScheme: "https",
+			wantURL:      "https://legacy.internal:443/x",
+			wantHostHdr:  "legacy.internal",
+		},
+		{
+			// Mirror image: 80 was the default, and after the change it is not.
+			name:         "a scheme change can make an unchanged port non-default",
+			requestURL:   "https://legacy.internal:80/x",
+			targetScheme: "http",
+			wantURL:      "http://legacy.internal:80/x",
+			wantHostHdr:  "legacy.internal",
+		},
+		{
 			name:         "no scheme change leaves the authority alone",
 			requestURL:   "http://api.internal:8080/x",
 			targetScheme: "http",

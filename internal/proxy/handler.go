@@ -715,16 +715,26 @@ func applyTargetSchemeAndPort(r *http.Request, rw *config.CompiledRewriteRule) s
 		port = rw.TargetPort
 	}
 
-	if port != "" && port != r.URL.Port() {
-		r.URL.Host = net.JoinHostPort(r.URL.Hostname(), port)
-		// Keep the Host header consistent with the authority actually dialed.
-		// RFC 9110 omits the port when it is the scheme default. An explicit
-		// headers: {Host: ...} is applied after this and overrides it.
-		if port == defaultPortForScheme(r.URL.Scheme) {
-			r.Host = r.URL.Hostname()
-		} else {
-			r.Host = net.JoinHostPort(r.URL.Hostname(), port)
-		}
+	// Recompute the authority whenever the rule touched the scheme or the port,
+	// not only when the port number changed. A scheme change alone can make an
+	// unchanged port become the default -- http://host:443 rewritten to https --
+	// and the Host header has to follow, or it contradicts the RFC 9110 rule
+	// below while the URL does not.
+	if schemeChanged == "" && rw.TargetPort == "" {
+		return ""
+	}
+	if port == "" {
+		port = defaultPortForScheme(r.URL.Scheme)
+	}
+
+	r.URL.Host = net.JoinHostPort(r.URL.Hostname(), port)
+	// Keep the Host header consistent with the authority actually dialed.
+	// RFC 9110 omits the port when it is the scheme default. An explicit
+	// headers: {Host: ...} is applied after this and overrides it.
+	if port == defaultPortForScheme(r.URL.Scheme) {
+		r.Host = r.URL.Hostname()
+	} else {
+		r.Host = net.JoinHostPort(r.URL.Hostname(), port)
 	}
 	return schemeChanged
 }

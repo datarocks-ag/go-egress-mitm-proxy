@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/elazarl/goproxy"
 
@@ -91,7 +92,16 @@ func TestRewriteHostHeaderReachesBackend(t *testing.T) {
 	defer resp.Body.Close()               //nolint:errcheck // test cleanup
 	_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining a test response
 
-	got := <-seen
+	// Bounded: on a regression where the proxy answers the request itself the
+	// backend is never called, and an unbuffered receive would hang until the
+	// whole package times out -- ten minutes later, with a stack dump instead of
+	// an assertion.
+	var got string
+	select {
+	case got = <-seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the backend was never called; the request did not reach it at all")
+	}
 	if got != injectedHost {
 		t.Errorf("backend saw Host %q, want %q; the injected Host never reached the wire, "+
 			"so the request was served by the vhost the original name selects", got, injectedHost)
