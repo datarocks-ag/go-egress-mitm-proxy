@@ -88,7 +88,7 @@ type Config struct {
 type TraceConfig struct {
 	Enabled       bool     `yaml:"enabled"`        // Master switch; when false tracing is fully short-circuited
 	LogPath       string   `yaml:"log_path"`       // Optional dedicated JSON-lines file; empty = main log stream
-	RedactHeaders []string `yaml:"redact_headers"` // Header names to mask, in addition to the built-in defaults
+	RedactHeaders []string `yaml:"redact_headers"` // Header names to mask; a "-" prefix removes a built-in default
 	// RedactQuery masks URL query-string values. Defaults to true when omitted:
 	// query strings routinely carry tokens, api keys and presigned signatures,
 	// and trace records are written to disk. A pointer so an explicit
@@ -193,8 +193,8 @@ func CompileTrace(tc TraceConfig) (CompiledTrace, error) {
 	for _, h := range DefaultRedactHeaders {
 		ct.RedactHeaders[h] = true
 	}
-	for _, h := range tc.RedactHeaders {
-		ct.RedactHeaders[strings.ToLower(strings.TrimSpace(h))] = true
+	if err := applyRedactHeaders(ct.RedactHeaders, tc.RedactHeaders); err != nil {
+		return CompiledTrace{}, err
 	}
 
 	for i, r := range tc.Rules {
@@ -974,6 +974,55 @@ func validateRewriteHeaders(i int, rw RewriteRule) error {
 					"the request body", i, h)
 			}
 		}
+	}
+	return nil
+}
+
+// credentialRedactHeaders are the built-in defaults whose removal is worth a
+// warning. The URL-bearing defaults are frequently wanted in cleartext for
+// debugging redirect chains, which is the case the "-" prefix exists for; these
+// four carry the credential itself.
+var credentialRedactHeaders = map[string]bool{
+	"authorization": true, "proxy-authorization": true,
+	"cookie": true, "set-cookie": true,
+}
+
+// applyRedactHeaders applies the user's redact_headers list to the default set.
+//
+// A plain name adds to the set. A "-" prefix removes, which is what makes the
+// defaults a starting point rather than a floor. Before this the only way to see
+// a masked header was log_secrets: true, which disables redaction entirely -- so
+// an operator who needed Location to follow a redirect chain had to give up the
+// masking of Authorization and Cookie to get it. An all-or-nothing escape hatch
+// invites reaching for the widest setting to solve the narrowest problem.
+//
+// Entries are applied in order, so "location" after "-location" re-adds it.
+func applyRedactHeaders(set map[string]bool, entries []string) error {
+	for i, raw := range entries {
+		entry := strings.ToLower(strings.TrimSpace(raw))
+		name, remove := strings.CutPrefix(entry, "-")
+		if name == "" {
+			return fmt.Errorf("trace.redact_headers[%d]: %q names no header", i, raw)
+		}
+		if !remove {
+			set[name] = true
+			continue
+		}
+
+		// Refuse a removal that removes nothing. It reads as taking effect and
+		// does not, which for a redaction setting means an operator believes a
+		// header is visible in their traces when it was never masked to begin
+		// with -- and goes looking for the bug somewhere else.
+		if !set[name] {
+			return fmt.Errorf("trace.redact_headers[%d]: cannot remove %q: it is not masked "+
+				"(built-in defaults are %s)", i, name, strings.Join(DefaultRedactHeaders, ", "))
+		}
+		if credentialRedactHeaders[name] {
+			slog.Warn("Trace redaction disabled for a credential-bearing header",
+				"header", name,
+				"detail", "its value will be written to trace records verbatim")
+		}
+		delete(set, name)
 	}
 	return nil
 }

@@ -169,8 +169,17 @@ trace:
   # Redaction is secure-by-default. The built-in masked set
   # (Authorization, Proxy-Authorization, Cookie, Set-Cookie) is always applied;
   # redact_headers extends it. Set log_secrets: true to disable ALL redaction.
+  # A plain name adds to the masked set; a "-" prefix removes a built-in default.
+  # The built-ins are Authorization, Proxy-Authorization, Cookie, Set-Cookie,
+  # Location, Content-Location and Referer.
+  #
+  # Use the "-" form when you need one header in cleartext -- following a
+  # redirect chain, say -- instead of reaching for log_secrets, which turns off
+  # redaction for everything. Removing a credential-bearing default is allowed
+  # but warns at startup; removing a header that is not masked is a load error.
   redact_headers:
-    - "X-Api-Key"
+    - "X-Api-Key"           # add
+    # - "-location"         # remove a default: redirect targets logged verbatim
   redact_query: true      # mask ?token=... query-string values (default: true)
   log_secrets: false      # escape hatch: true logs everything verbatim
 
