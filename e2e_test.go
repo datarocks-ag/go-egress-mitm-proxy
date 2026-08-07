@@ -141,10 +141,13 @@ rewrites:
     headers:
       X-Backend: "pathonly"
 
-  # target_scheme: client connects via HTTPS, proxy forwards as HTTP to backend
+  # target_scheme: client connects via HTTPS, proxy forwards as HTTP to backend.
+  # target_port is required here: the CONNECT authority carries :443, and the
+  # http default the scheme change moves it to (80) is not where httpbin listens.
   - domain: "schemetest.example.com"
     target_ip: %[1]q
     target_scheme: "http"
+    target_port: "8080"
     headers:
       X-Scheme-Test: "downgraded"
 
@@ -686,6 +689,28 @@ func TestE2E(t *testing.T) {
 		resp, err := doGet(ctx, plainClient, "http://schemetest.example.com:8080/headers")
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		e2eCheckHeader(t, body, "X-Scheme-Test", "downgraded")
+	})
+
+	t.Run("target_scheme_downgrades_an_intercepted_https_request", func(t *testing.T) {
+		// The case the rewrite exists for, and the one the plain-HTTP case above
+		// cannot reach: an HTTPS client is intercepted, so goproxy builds the
+		// request URL from the CONNECT authority and it carries :443. Rewriting
+		// only the scheme sent cleartext HTTP to port 443 of the backend. The port
+		// must move with the scheme (to target_port here, since httpbin is on 8080).
+		resp, err := doGet(ctx, tlsClient, "https://schemetest.example.com/headers")
+		if err != nil {
+			t.Fatalf("intercepted HTTPS request with target_scheme failed: %v", err)
 		}
 		defer resp.Body.Close()
 		body, readErr := io.ReadAll(resp.Body)

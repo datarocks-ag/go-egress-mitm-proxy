@@ -81,10 +81,14 @@ rewrites:
     headers:
       X-Backend: "default"
 
-  # Scheme rewrite: forward HTTPS client requests as HTTP to the backend
+  # Scheme rewrite: forward HTTPS client requests as HTTP to the backend.
+  # An intercepted HTTPS request carries :443 (from the CONNECT authority), so a
+  # downgrade to http moves the port to 80. Set target_port when the backend
+  # listens elsewhere -- a legacy service on 8080 is the usual case.
   - domain: "legacy-backend.internal.com"
     target_ip: "10.20.30.90"
     target_scheme: "http"
+    target_port: "8080"
     headers:
       X-Forwarded-Proto: "https"
 

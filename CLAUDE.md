@@ -149,7 +149,8 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 - Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs
 - Global `insecure_skip_verify`: disables upstream TLS verification (dev/test only)
 - Per-rewrite `insecure`: skips TLS verification for specific rewrite targets (self-signed internal services)
-- Per-rewrite `target_scheme`: optional `"http"` or `"https"` to change the request scheme before forwarding (e.g., HTTPS client → HTTP backend)
+- Per-rewrite `target_scheme`: optional `"http"` or `"https"` to change the request scheme before forwarding (e.g., HTTPS client → HTTP backend). The port moves with the scheme when the client's port was that scheme's default — an intercepted HTTPS request carries `:443` from the CONNECT authority, so without this a downgrade sent cleartext HTTP to the TLS port. An explicitly chosen port is preserved
+- Per-rewrite `target_port`: optional TCP port overriding both the client's port and the scheme default, for backends that do not listen on 80/443
 - Per-rewrite `drop_headers`: list of header names to strip from the request before forwarding (case-insensitive via `r.Header.Del()`)
 - Per-rewrite `path_pattern`: optional regex matched against `r.URL.Path` for path-based routing (rules evaluated in YAML order, first match wins; passed to dialers via request context)
 - Blocked request log: optional JSON log file (`blocked_log_path` / `PROXY_BLOCKED_LOG_PATH`) capturing only `BLACK-LISTED` and `BLOCKED` requests; reopened on SIGHUP for log rotation. Written from `proxy.LogBlocked`, called from both the request path and the CONNECT reject path — a rejected tunnel never reaches `HandleRequest`, so without the second call site the log would silently omit those hosts
