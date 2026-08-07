@@ -43,12 +43,40 @@ var version = "dev"
 // shutdownTimeout bounds the drain period after SIGINT/SIGTERM.
 const shutdownTimeout = 30 * time.Second
 
+// defaultPreStopGrace is how long the proxy keeps serving after failing
+// readiness and before it closes the listener, so load balancers notice and
+// route away first. Sized at two probe intervals of the shipped Kubernetes
+// manifest (5s). This plus shutdownTimeout must stay under
+// terminationGracePeriodSeconds.
+const defaultPreStopGrace = 10 * time.Second
+
+// preStopGrace reads PROXY_PRESTOP_GRACE, so deployments that already sleep in a
+// preStop hook can set it to 0 rather than paying the wait twice. Tests set it
+// to 0 to avoid adding the delay to every container teardown.
+func preStopGrace() time.Duration {
+	raw := os.Getenv("PROXY_PRESTOP_GRACE")
+	if raw == "" {
+		return defaultPreStopGrace
+	}
+	d, err := time.ParseDuration(raw)
+	switch {
+	case err != nil:
+		slog.Warn("Unparseable PROXY_PRESTOP_GRACE; using the default",
+			"value", raw, "default", defaultPreStopGrace, "err", err)
+		return defaultPreStopGrace
+	case d < 0:
+		slog.Warn("Negative PROXY_PRESTOP_GRACE; using the default",
+			"value", raw, "default", defaultPreStopGrace)
+		return defaultPreStopGrace
+	}
+	return d
+}
+
 // Outbound connection pool sizing. These apply per transport, and TransportPool
 // clones the base transport once per distinct rewrite target.
 const (
 	maxIdleConnsPerTransport = 32
 	maxIdleConnsPerHost      = 10
-	maxConnsPerHost          = 64
 )
 
 // slogProxyLogger adapts goproxy's Logger interface to route through slog.
@@ -369,8 +397,47 @@ func main() {
 			return mitmAction, host
 		}))
 
-	// Per-rewrite-target transport pool; built below once proxyHandler.Tr exists.
-	var transportPool *proxy.TransportPool
+	// Configure the outbound HTTP transport with connection pooling and TLS settings.
+	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
+	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
+	//
+	// MaxIdleConns is per-transport, and TransportPool clones this one per rewrite
+	// target, so the process-wide idle ceiling is (targets + 1) x MaxIdleConns.
+	// Sized per transport accordingly rather than leaving a global figure to
+	// multiply.
+	//
+	// MaxConnsPerHost is deliberately NOT set. It bounds the wrong key and buys
+	// the bound with unbounded latency:
+	//
+	//   - Go keys connsPerHost on the *request URL* host:port, computed before the
+	//     dialer substitutes target_ip, and TransportPool clones per target. So N
+	//     rewritten hostnames still permit N x limit sockets to one upstream IP --
+	//     the ephemeral-port case a previous comment here claimed it covered is
+	//     the one case it does not.
+	//   - When the cap is reached, queueForConn parks the request and the only
+	//     escape is req.Context().Done(). goproxy builds MITM requests over
+	//     context.Background() with a bare WithCancel, so there is no deadline,
+	//     and ResponseHeaderTimeout does not bound body streaming. A handful of
+	//     large concurrent downloads from one registry would block the next client
+	//     indefinitely, holding its tunnel and listener slot, with no queue-depth
+	//     metric and no log line.
+	//
+	// A correct per-target bound has to live in the dialer, where the real dial
+	// address is known, and has to fail fast rather than queue. That is not
+	// implemented; TransportPool.Len() at least makes pool growth observable.
+	proxyHandler.Tr = proxy.NewOutboundTransport(baseTLSConfig, runtimeCfg, proxy.OutboundTransportOptions{
+		MaxIdleConns:          maxIdleConnsPerTransport,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	})
+
+	// Give each rewrite target its own connection pool. Go keys idle connections on
+	// the request URL's host:port, which is computed before our dialers substitute
+	// the target address, so a single transport would let rules for the same domain
+	// reuse each other's connections. See proxy.TransportPool.
+	//
+	transportPool := proxy.NewTransportPool(proxyHandler.Tr)
 
 	// Register the request handler for policy enforcement
 	proxyHandler.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
@@ -453,32 +520,6 @@ func main() {
 		io.WriteString(w, errStr) //nolint:errcheck // best-effort response to client
 	}
 
-	// Configure the outbound HTTP transport with connection pooling and TLS settings.
-	// DialTLSContext handles per-connection TLS with rewrite-specific InsecureSkipVerify.
-	// ForceAttemptHTTP2 enables Go's built-in HTTP/2 when custom dial functions are set.
-	// MaxIdleConns is per-transport, and TransportPool clones this one per rewrite
-	// target, so the process-wide idle ceiling is (targets + 1) x MaxIdleConns.
-	// Sized per transport accordingly rather than leaving the old global figure to
-	// multiply. MaxConnsPerHost bounds *active* connections, which nothing did
-	// before: for a split-brain proxy many client hostnames collapse onto one
-	// target_ip, which is exactly the ephemeral-port-exhaustion case.
-	proxyHandler.Tr = proxy.NewOutboundTransport(baseTLSConfig, runtimeCfg, proxy.OutboundTransportOptions{
-		MaxIdleConns:          maxIdleConnsPerTransport,
-		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
-		MaxConnsPerHost:       maxConnsPerHost,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-	})
-
-	// Give each rewrite target its own connection pool. Go keys idle connections on
-	// the request URL's host:port, which is computed before our dialers substitute
-	// the target address, so a single transport would let rules for the same domain
-	// reuse each other's connections. See proxy.TransportPool.
-	//
-	// Assigned here (after proxyHandler.Tr is built) but captured by the request
-	// handler registered above; the handler only runs once the server is serving.
-	transportPool = proxy.NewTransportPool(proxyHandler.Tr)
-
 	// Setup metrics and health endpoints
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
@@ -520,10 +561,24 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// Start metrics server in background
+	// Bind the metrics port before backgrounding the server, and treat a bind
+	// failure as fatal like every other startup dependency.
+	//
+	// ListenAndServe inside a bare goroutine meant a port collision only logged:
+	// the proxy still bound, still called SetReady, and served with /healthz,
+	// /readyz and /metrics all unreachable — so the readiness mechanism was inert
+	// and the pod sat NotReady with nothing obviously wrong in the logs. That
+	// "running, healthy-looking, receiving no traffic" state is exactly what the
+	// readiness work exists to prevent.
+	metricsLn, metricsErr := (&net.ListenConfig{}).Listen(context.Background(), "tcp", metricsServer.Addr)
+	if metricsErr != nil {
+		slog.Error("Failed to bind metrics port", "addr", metricsServer.Addr, "err", metricsErr)
+		os.Exit(1)
+	}
+
 	go func() {
 		slog.Info("Metrics server starting", "port", cfg.Proxy.MetricsPort)
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := metricsServer.Serve(metricsLn); err != nil && err != http.ErrServerClosed {
 			slog.Error("Metrics server error", "err", err)
 		}
 	}()
@@ -565,9 +620,26 @@ func main() {
 		<-ctx.Done()
 		slog.Info("Shutdown signal received, draining connections...")
 
-		// Fail readiness first so load balancers stop sending new connections
-		// while the in-flight ones finish.
+		// Fail readiness first, then keep serving for a moment before closing the
+		// listener.
+		//
+		// Failing readiness and shutting down in the same instant achieves
+		// nothing: a load balancer only stops routing here once its next probe
+		// fails, and Shutdown closes the listener immediately, so clients get
+		// ECONNREFUSED for a probe period or two. Only connections already
+		// accepted benefited from the drain. Serving through one full probe
+		// interval is what actually lets traffic move away first.
+		//
+		// Deployments with a preStop hook (sleep, then SIGTERM) can set this to
+		// zero; the shipped Kubernetes manifest has no hook and probes every 5s,
+		// so the default covers two intervals. It is inside
+		// terminationGracePeriodSeconds together with the drain budget.
 		health.SetNotReady()
+		if grace := preStopGrace(); grace > 0 {
+			slog.Info("Readiness failed; serving briefly so traffic can move away",
+				"grace", grace)
+			time.Sleep(grace)
+		}
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
@@ -587,7 +659,12 @@ func main() {
 			}
 		}
 
-		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		// Its own context: after a timed-out drain shutdownCtx is already expired,
+		// so reusing it made every timed-out drain also log a spurious metrics
+		// shutdown error.
+		metricsCtx, cancelMetrics := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelMetrics()
+		if err := metricsServer.Shutdown(metricsCtx); err != nil {
 			slog.Error("Metrics server shutdown error", "err", err)
 		}
 		runtimeCfg.CloseBlockedLog()

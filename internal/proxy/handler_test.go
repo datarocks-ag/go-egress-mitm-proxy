@@ -946,7 +946,6 @@ func TestNewOutboundTransport(t *testing.T) {
 	opts := OutboundTransportOptions{
 		MaxIdleConns:          32,
 		MaxIdleConnsPerHost:   10,
-		MaxConnsPerHost:       64,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
@@ -965,10 +964,11 @@ func TestNewOutboundTransport(t *testing.T) {
 		t.Error("DialTLSContext must be set, or per-rewrite insecure does not apply")
 	}
 
-	// MaxConnsPerHost is the ephemeral-port guard: many client hostnames collapse
-	// onto one target_ip in a split-brain proxy.
-	if tr.MaxConnsPerHost != opts.MaxConnsPerHost {
-		t.Errorf("MaxConnsPerHost = %d, want %d", tr.MaxConnsPerHost, opts.MaxConnsPerHost)
+	// MaxConnsPerHost must stay unset: Go keys it on the request URL host rather
+	// than the substituted dial target, and reaching the cap parks the request on
+	// a queue with no deadline.
+	if tr.MaxConnsPerHost != 0 {
+		t.Errorf("MaxConnsPerHost = %d, want 0 (see the comment at its call site)", tr.MaxConnsPerHost)
 	}
 	if tr.MaxIdleConns != opts.MaxIdleConns {
 		t.Errorf("MaxIdleConns = %d, want %d", tr.MaxIdleConns, opts.MaxIdleConns)

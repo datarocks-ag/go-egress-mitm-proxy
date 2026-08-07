@@ -196,6 +196,16 @@ func e2eCheckHeader(t *testing.T, body []byte, headerName, expectedValue string)
 	}
 }
 
+// proxyTestEnv is the environment every proxy container under test runs with.
+//
+// PROXY_PRESTOP_GRACE=0: in production the proxy keeps serving for two probe
+// intervals after failing readiness so load balancers route away first. Here
+// that would only add the delay to every container teardown, for no coverage —
+// it took the suite from 9s to 75s against a 120s timeout.
+func proxyTestEnv() map[string]string {
+	return map[string]string{"PROXY_PRESTOP_GRACE": "0"}
+}
+
 // doGet is a helper that performs an HTTP GET via the given client with a proper context.
 func doGet(ctx context.Context, client *http.Client, rawURL string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -268,6 +278,7 @@ func TestE2E(t *testing.T) {
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			Env:          proxyTestEnv(),
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(certsDir, "ca.crt"),
@@ -972,6 +983,7 @@ rewrites:
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			Env:          proxyTestEnv(),
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
@@ -1199,6 +1211,7 @@ acl:
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			Env:          proxyTestEnv(),
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),
@@ -1436,6 +1449,7 @@ acl:
 			},
 			ExposedPorts: []string{"8080/tcp", "9090/tcp"},
 			Networks:     []string{nw.Name},
+			Env:          proxyTestEnv(),
 			Files: []testcontainers.ContainerFile{
 				{
 					HostFilePath:      filepath.Join(mitmCertsDir, "ca.crt"),

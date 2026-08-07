@@ -15,6 +15,12 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    # Must exceed PROXY_PRESTOP_GRACE plus the 30s drain budget. Sized for the
+    # 10s default; if you raise PROXY_PRESTOP_GRACE, raise this by the same
+    # amount or Compose SIGKILLs the container mid-drain. Compose's own default
+    # is 10s, which killed it a third of the way in. The Kubernetes manifest
+    # accounts for the same thing via terminationGracePeriodSeconds.
+    stop_grace_period: 45s
     restart: unless-stopped
 
   # Optional: Prometheus for metrics collection
