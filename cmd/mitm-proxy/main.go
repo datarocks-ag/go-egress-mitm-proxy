@@ -546,57 +546,31 @@ func main() {
 		defer close(shutdownDone)
 
 		<-ctx.Done()
+
+		// Restore the default disposition for SIGINT/SIGTERM immediately.
+		// signal.NotifyContext keeps the signal registered -- and therefore
+		// suppressed -- until stop() runs, which was deferred to the end of main,
+		// past the whole 40s shutdown window. A second Ctrl-C, the universal
+		// escape hatch, did nothing for that entire period and the operator had to
+		// find another shell to SIGKILL from. Calling stop() here means the first
+		// signal starts the drain and the second one terminates.
+		stop()
+
 		slog.Info("Shutdown signal received, draining connections...")
 
-		// Fail readiness first, then keep serving for a moment before closing the
-		// listener.
-		//
-		// Failing readiness and shutting down in the same instant achieves
-		// nothing: a load balancer only stops routing here once its next probe
-		// fails, and Shutdown closes the listener immediately, so clients get
-		// ECONNREFUSED for a probe period or two. Only connections already
-		// accepted benefited from the drain. Serving through one full probe
-		// interval is what actually lets traffic move away first.
-		//
-		// Deployments with a preStop hook (sleep, then SIGTERM) can set this to
-		// zero; the shipped Kubernetes manifest has no hook and probes every 5s,
-		// so the default covers two intervals. It is inside
-		// terminationGracePeriodSeconds together with the drain budget.
-		health.SetNotReady()
-		if grace := preStopGrace(); grace > 0 {
-			slog.Info("Readiness failed; serving briefly so traffic can move away",
-				"grace", grace)
-			time.Sleep(grace)
-		}
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-
-		if err := proxyServer.Shutdown(shutdownCtx); err != nil {
-			slog.Error("Proxy server shutdown error", "err", err)
-		}
-
-		// Shutdown has stopped accepting and drained non-hijacked connections;
-		// wait out the tunnels it cannot see, within the same budget.
-		if open := trackedLn.Open(); open > 0 {
-			slog.Info("Waiting for tunnels to close", "open_connections", open)
-			if !trackedLn.WaitForDrain(shutdownCtx) {
-				slog.Warn("Drain deadline reached with connections still open",
-					"open_connections", trackedLn.Open(),
-					"timeout", shutdownTimeout)
-			}
-		}
-
-		// Its own context: after a timed-out drain shutdownCtx is already expired,
-		// so reusing it made every timed-out drain also log a spurious metrics
-		// shutdown error.
-		metricsCtx, cancelMetrics := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelMetrics()
-		if err := metricsServer.Shutdown(metricsCtx); err != nil {
-			slog.Error("Metrics server shutdown error", "err", err)
-		}
-		runtimeCfg.CloseBlockedLog()
-		runtimeCfg.CloseTraceLog()
+		drain(drainDeps{
+			proxyServer:   proxyServer,
+			metricsServer: metricsServer,
+			listener:      trackedLn,
+			grace:         preStopGrace(),
+			timeout:       shutdownTimeout,
+			setNotReady:   health.SetNotReady,
+			sleep:         time.Sleep,
+			closeLogs: func() {
+				runtimeCfg.CloseBlockedLog()
+				runtimeCfg.CloseTraceLog()
+			},
+		})
 	}()
 
 	// Start the proxy server
