@@ -465,7 +465,11 @@ func main() {
 	// the config.
 	//
 	// ReadHeaderTimeout keeps slowloris protection without capping body transfer,
-	// and IdleTimeout bounds keep-alive connections.
+	// and IdleTimeout bounds idle keep-alive connections -- but only those
+	// http.Server still owns. It does NOT cover a CONNECT tunnel: hijackLocked
+	// clears the deadline and nothing re-arms it, so once a tunnel is established
+	// no timeout applies to it at any layer. PROXY_MAX_CONNECTIONS is what bounds
+	// that population; see the comment on TrackingListener.slots.
 	//
 	// Known gap: a client that streams a body slowly but steadily is not bounded
 	// by time. That is inherent -- any deadline large enough for a legitimate
@@ -529,7 +533,14 @@ func main() {
 		slog.Error("Failed to bind proxy port", "addr", proxyServer.Addr, "err", lnErr)
 		os.Exit(1)
 	}
-	trackedLn := proxy.NewTrackingListener(proxyLn)
+	// A ceiling on concurrent client connections. Unlimited by default so this
+	// does not silently change the behavior of an existing deployment; the
+	// shipped Kubernetes example sets one, because a hijacked CONNECT that goes
+	// silent is otherwise bounded only by the process rlimit.
+	trackedLn := proxy.NewLimitedTrackingListener(proxyLn, cfg.Proxy.MaxConnections)
+	if cfg.Proxy.MaxConnections > 0 {
+		slog.Info("Client connection limit enabled", "max_connections", cfg.Proxy.MaxConnections)
+	}
 
 	// Publish the live client-connection count. This is the number the old
 	// proxy_active_connections gauge was meant to report; it previously

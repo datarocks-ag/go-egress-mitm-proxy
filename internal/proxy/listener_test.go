@@ -156,3 +156,95 @@ func TestWaitForDrainReturnsImmediatelyWhenIdle(t *testing.T) {
 		t.Errorf("WaitForDrain took %v with nothing open; want immediate", elapsed)
 	}
 }
+
+// TestLimitedListenerBoundsConcurrentConnections pins the ceiling.
+//
+// A hijacked CONNECT has no deadline of any kind, so a client that completes the
+// CONNECT and then goes silent holds an fd, a goroutine and a bufio buffer until
+// the process dies -- bounded only by the process rlimit. This is the lever that
+// bounds it, and it also stops those connections making WaitForDrain burn the
+// full budget on every rollout.
+func TestLimitedListenerBoundsConcurrentConnections(t *testing.T) {
+	base, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl := NewLimitedTrackingListener(base, 2)
+	defer tl.Close() //nolint:errcheck // test cleanup
+
+	accepted := make(chan net.Conn, 3)
+	go func() {
+		for {
+			c, acceptErr := tl.Accept()
+			if acceptErr != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	dial := func() net.Conn {
+		c, dialErr := (&net.Dialer{}).DialContext(t.Context(), "tcp", base.Addr().String())
+		if dialErr != nil {
+			t.Errorf("dial: %v", dialErr)
+			return nil
+		}
+		return c
+	}
+
+	// Two connections fill the ceiling.
+	c1, c2 := dial(), dial()
+	defer c1.Close() //nolint:errcheck // test cleanup
+	var a1, a2 net.Conn
+	for range 2 {
+		select {
+		case c := <-accepted:
+			if a1 == nil {
+				a1 = c
+			} else {
+				a2 = c
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("listener did not accept up to its limit")
+		}
+	}
+	_ = a1
+
+	// A third connect must not be accepted while the ceiling is full. The TCP
+	// handshake still completes (the kernel backlog absorbs it), so this asserts
+	// on Accept returning, not on the dial failing.
+	c3 := dial()
+	defer c3.Close() //nolint:errcheck // test cleanup
+	select {
+	case <-accepted:
+		t.Fatal("listener accepted beyond its limit; the ceiling does not bound anything")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// Closing one accepted connection frees a slot and the third is accepted.
+	if err := a2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-accepted:
+		c.Close() //nolint:errcheck // test cleanup
+	case <-time.After(2 * time.Second):
+		t.Fatal("a freed slot was never reused; the limiter leaks slots and wedges the listener")
+	}
+	c2.Close() //nolint:errcheck // test cleanup
+}
+
+// TestUnlimitedListenerIsTheDefault: the ceiling is opt-in, so an existing
+// deployment's behavior is unchanged until it sets one.
+func TestUnlimitedListenerIsTheDefault(t *testing.T) {
+	base, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl := NewTrackingListener(base)
+	defer tl.Close() //nolint:errcheck // test cleanup
+
+	if tl.slots != nil {
+		t.Error("NewTrackingListener installed a connection ceiling; it must default to unlimited")
+	}
+}

@@ -143,7 +143,7 @@ The proxy distinguishes timeout errors (`net.Error.Timeout()`, `context.Deadline
 
 **Configuration:**
 - YAML file (path via `CONFIG_PATH` env var, default: `config.yaml`)
-- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`, `PROXY_MITM_ORG`
+- Environment variable overrides: `PROXY_PORT`, `PROXY_METRICS_PORT`, `PROXY_DEFAULT_POLICY`, `PROXY_BLOCKED_LOG_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`, `PROXY_INSECURE_SKIP_VERIFY`, `PROXY_MITM_ORG`, `PROXY_MAX_CONNECTIONS`
 - MITM CA: PEM cert+key (`mitm_cert_path`/`mitm_key_path`) or PKCS#12 keystore (`mitm_keystore_path`/`mitm_keystore_password`), mutually exclusive
 - `mitm_org`: optional custom Organization for MITM leaf certificates (default: goproxy's built-in `"GoProxy untrusted MITM proxy Inc"`)
 - Outgoing TLS: optional PEM CA bundle (`outgoing_ca_bundle`) and/or PKCS#12 truststore (`outgoing_truststore_path`/`outgoing_truststore_password`), additive with system CAs

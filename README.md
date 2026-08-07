@@ -347,6 +347,7 @@ they are structured and must come from the config file.
 | `PROXY_METRICS_PORT` | Metrics endpoint port |
 | `PROXY_DEFAULT_POLICY` | `ALLOW` or `BLOCK` |
 | `PROXY_MITM_ORG` | Organization on generated MITM leaf certificates (see `mitm_org`) |
+| `PROXY_MAX_CONNECTIONS` | Ceiling on concurrent client connections (default `0` = unlimited). At the cap the listener pauses accepting until one closes, warns, and increments `proxy_listener_saturated_total`. A hijacked CONNECT tunnel has no deadline, so this is what bounds fd usage against a client that connects and goes silent. |
 | `PROXY_PRESTOP_GRACE` | How long to keep serving after failing `/readyz` on SIGTERM, before closing the listener (default `10s`; set `0` when a `preStop` hook already sleeps) |
 | `PROXY_MITM_CERT_PATH` | Path to MITM CA certificate (PEM) |
 | `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |

@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// shutdowner is the http.Server behaviour the drain sequence needs.
+// shutdowner is the http.Server behavior the drain sequence needs.
 type shutdowner interface {
 	Shutdown(ctx context.Context) error
 }
 
-// drainableListener is the TrackingListener behaviour the drain sequence needs:
+// drainableListener is the TrackingListener behavior the drain sequence needs:
 // how many client connections are still open, and a bounded wait for them.
 type drainableListener interface {
 	Open() int64
