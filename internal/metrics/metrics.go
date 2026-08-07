@@ -76,3 +76,15 @@ func RegisterActiveConnections(source func() float64) {
 		Help: "Number of client connections currently open",
 	}, source)
 }
+
+// ListenerSaturated counts how many times the listener hit its client
+// connection ceiling and had to pause accepting.
+//
+// At the cap the visible symptom is clients hanging on connect, which is
+// indistinguishable from a network problem. A counter makes the cause
+// attributable and gives an alert something to fire on before it becomes an
+// outage.
+var ListenerSaturated = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "proxy_listener_saturated_total",
+	Help: "Times the client connection limit was reached and accepting paused",
+})

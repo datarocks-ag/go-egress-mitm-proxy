@@ -367,6 +367,12 @@ func main() {
 		// The pool dispatches on the rewrite result that HandleRequest stores on the
 		// request context, so req here is the post-handler request, not r.
 		ctx.RoundTripper = goproxy.RoundTripperFunc(func(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
+			// Reaching here means the request is going upstream, which is what
+			// makes "no dial recorded" mean "reused from the pool" rather than
+			// "never left the proxy".
+			rec := trace.FromContext(req.Context())
+			rec.MarkForwarded()
+
 			resp, err := transportPool.RoundTrip(req)
 
 			// Timed here, not in HandleRequest: this span covers DNS, dial, TLS
@@ -376,6 +382,13 @@ func main() {
 
 			if err != nil {
 				status, reason := proxy.UpstreamErrorResponse(err)
+				// The error is converted to a synthetic response below, so
+				// goproxy never sees it and ctx.Error stays nil. Without this the
+				// trace record for a non-dial failure -- a ResponseHeaderTimeout
+				// on a pooled connection, say -- carried status 502 and no cause
+				// at all. Dial failures are already recorded by the dialers, which
+				// have the more specific error, and SetError keeps the first.
+				rec.SetError(err.Error())
 				slog.Warn("Upstream connection error",
 					"host", req.URL.Host,
 					"status", status,
@@ -465,7 +478,11 @@ func main() {
 	// the config.
 	//
 	// ReadHeaderTimeout keeps slowloris protection without capping body transfer,
-	// and IdleTimeout bounds keep-alive connections.
+	// and IdleTimeout bounds idle keep-alive connections -- but only those
+	// http.Server still owns. It does NOT cover a CONNECT tunnel: hijackLocked
+	// clears the deadline and nothing re-arms it, so once a tunnel is established
+	// no timeout applies to it at any layer. PROXY_MAX_CONNECTIONS is what bounds
+	// that population; see the comment on TrackingListener.slots.
 	//
 	// Known gap: a client that streams a body slowly but steadily is not bounded
 	// by time. That is inherent -- any deadline large enough for a legitimate
@@ -529,7 +546,14 @@ func main() {
 		slog.Error("Failed to bind proxy port", "addr", proxyServer.Addr, "err", lnErr)
 		os.Exit(1)
 	}
-	trackedLn := proxy.NewTrackingListener(proxyLn)
+	// A ceiling on concurrent client connections. Unlimited by default so this
+	// does not silently change the behavior of an existing deployment; the
+	// shipped Kubernetes example sets one, because a hijacked CONNECT that goes
+	// silent is otherwise bounded only by the process rlimit.
+	trackedLn := proxy.NewLimitedTrackingListener(proxyLn, cfg.Proxy.MaxConnections)
+	if cfg.Proxy.MaxConnections > 0 {
+		slog.Info("Client connection limit enabled", "max_connections", cfg.Proxy.MaxConnections)
+	}
 
 	// Publish the live client-connection count. This is the number the old
 	// proxy_active_connections gauge was meant to report; it previously
@@ -546,57 +570,31 @@ func main() {
 		defer close(shutdownDone)
 
 		<-ctx.Done()
+
+		// Restore the default disposition for SIGINT/SIGTERM immediately.
+		// signal.NotifyContext keeps the signal registered -- and therefore
+		// suppressed -- until stop() runs, which was deferred to the end of main,
+		// past the whole 40s shutdown window. A second Ctrl-C, the universal
+		// escape hatch, did nothing for that entire period and the operator had to
+		// find another shell to SIGKILL from. Calling stop() here means the first
+		// signal starts the drain and the second one terminates.
+		stop()
+
 		slog.Info("Shutdown signal received, draining connections...")
 
-		// Fail readiness first, then keep serving for a moment before closing the
-		// listener.
-		//
-		// Failing readiness and shutting down in the same instant achieves
-		// nothing: a load balancer only stops routing here once its next probe
-		// fails, and Shutdown closes the listener immediately, so clients get
-		// ECONNREFUSED for a probe period or two. Only connections already
-		// accepted benefited from the drain. Serving through one full probe
-		// interval is what actually lets traffic move away first.
-		//
-		// Deployments with a preStop hook (sleep, then SIGTERM) can set this to
-		// zero; the shipped Kubernetes manifest has no hook and probes every 5s,
-		// so the default covers two intervals. It is inside
-		// terminationGracePeriodSeconds together with the drain budget.
-		health.SetNotReady()
-		if grace := preStopGrace(); grace > 0 {
-			slog.Info("Readiness failed; serving briefly so traffic can move away",
-				"grace", grace)
-			time.Sleep(grace)
-		}
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-
-		if err := proxyServer.Shutdown(shutdownCtx); err != nil {
-			slog.Error("Proxy server shutdown error", "err", err)
-		}
-
-		// Shutdown has stopped accepting and drained non-hijacked connections;
-		// wait out the tunnels it cannot see, within the same budget.
-		if open := trackedLn.Open(); open > 0 {
-			slog.Info("Waiting for tunnels to close", "open_connections", open)
-			if !trackedLn.WaitForDrain(shutdownCtx) {
-				slog.Warn("Drain deadline reached with connections still open",
-					"open_connections", trackedLn.Open(),
-					"timeout", shutdownTimeout)
-			}
-		}
-
-		// Its own context: after a timed-out drain shutdownCtx is already expired,
-		// so reusing it made every timed-out drain also log a spurious metrics
-		// shutdown error.
-		metricsCtx, cancelMetrics := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelMetrics()
-		if err := metricsServer.Shutdown(metricsCtx); err != nil {
-			slog.Error("Metrics server shutdown error", "err", err)
-		}
-		runtimeCfg.CloseBlockedLog()
-		runtimeCfg.CloseTraceLog()
+		drain(drainDeps{
+			proxyServer:   proxyServer,
+			metricsServer: metricsServer,
+			listener:      trackedLn,
+			grace:         preStopGrace(),
+			timeout:       shutdownTimeout,
+			setNotReady:   health.SetNotReady,
+			sleep:         time.Sleep,
+			closeLogs: func() {
+				runtimeCfg.CloseBlockedLog()
+				runtimeCfg.CloseTraceLog()
+			},
+		})
 	}()
 
 	// Start the proxy server

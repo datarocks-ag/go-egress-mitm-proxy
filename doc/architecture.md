@@ -114,6 +114,7 @@ Environment variable overrides follow 12-factor app principles:
 - `PROXY_OUTGOING_CA_BUNDLE`, `PROXY_OUTGOING_TRUSTSTORE_PATH`, `PROXY_OUTGOING_TRUSTSTORE_PASSWORD`
 - `PROXY_INSECURE_SKIP_VERIFY`, `PROXY_BLOCKED_LOG_PATH`
 - `PROXY_MITM_ORG` (Organization on MITM leaf certificates)
+- `PROXY_MAX_CONNECTIONS` (ceiling on concurrent client connections; 0 = unlimited)
 - `PROXY_PRESTOP_GRACE` (read by `main`, not the config loader: how long to keep
   serving after `/readyz` starts failing on SIGTERM)
 

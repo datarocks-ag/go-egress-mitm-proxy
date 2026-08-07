@@ -347,6 +347,7 @@ they are structured and must come from the config file.
 | `PROXY_METRICS_PORT` | Metrics endpoint port |
 | `PROXY_DEFAULT_POLICY` | `ALLOW` or `BLOCK` |
 | `PROXY_MITM_ORG` | Organization on generated MITM leaf certificates (see `mitm_org`) |
+| `PROXY_MAX_CONNECTIONS` | Ceiling on concurrent client connections (default `0` = unlimited). At the cap the listener pauses accepting until one closes, warns, and increments `proxy_listener_saturated_total`. A hijacked CONNECT tunnel has no deadline, so this is what bounds fd usage against a client that connects and goes silent. |
 | `PROXY_PRESTOP_GRACE` | How long to keep serving after failing `/readyz` on SIGTERM, before closing the listener (default `10s`; set `0` when a `preStop` hook already sleeps) |
 | `PROXY_MITM_CERT_PATH` | Path to MITM CA certificate (PEM) |
 | `PROXY_MITM_KEY_PATH` | Path to MITM CA private key (PEM) |
@@ -531,7 +532,7 @@ Each record captures:
 
 **Matching:** rules are OR'd; within a single rule, `host` and `url` must both match (use separate rules for OR). `host`/`url` use the same convention as ACL/rewrites (wildcard, or `~` for raw regex).
 
-**Redaction is secure-by-default.** `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always masked; `redact_headers` extends the set, and `redact_query` masks query-string values and **defaults to `true`** — set it to `false` to opt out. Set `log_secrets: true` to disable all redaction (use with care — these logs may be shipped/retained).
+**Redaction is secure-by-default.** `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` are always masked, as are the URL-bearing `Location`, `Content-Location` and `Referer` — a 302 in an OAuth flow routinely carries the authorization code in `Location`, and header values are masked by name, so `redact_query` (which only sees the request URL) never covered it; `redact_headers` extends the set, and `redact_query` masks query-string values and **defaults to `true`** — set it to `false` to opt out. Set `log_secrets: true` to disable all redaction (use with care — these logs may be shipped/retained).
 
 **Passthrough hosts** (non-MITM tunnels) are traced TCP-only: connected IP, dial timing, and bytes transferred. Headers and bodies are inherently invisible because the traffic is not intercepted.
 

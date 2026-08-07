@@ -71,6 +71,7 @@ type Config struct {
 		MitmKeystorePassword       string   `yaml:"mitm_keystore_password"`       // Password for PKCS#12 keystore
 		MitmOrg                    string   `yaml:"mitm_org"`                     // Custom Organization for MITM leaf certificates
 		BlockedLogPath             string   `yaml:"blocked_log_path"`             // Optional path for blocked request log
+		MaxConnections             int      `yaml:"max_connections"`              // Optional ceiling on concurrent client connections (0 = unlimited)
 	} `yaml:"proxy"`
 	Rewrites []RewriteRule `yaml:"rewrites"` // Domain rewrite rules
 	ACL      struct {
@@ -143,7 +144,18 @@ type CompiledBodyCapture struct {
 }
 
 // DefaultRedactHeaders are always masked unless log_secrets is set.
-var DefaultRedactHeaders = []string{"authorization", "proxy-authorization", "cookie", "set-cookie"}
+//
+// The credential-bearing four are obvious. The URL-bearing three are here
+// because redact_query only ever saw the request URL: a 302 carrying
+// "Location: .../callback?code=4/0AY0e-g7...&state=xyz" wrote an OAuth
+// authorization code to the trace log verbatim, on the shipped example rule,
+// with redaction nominally enabled. Masking the whole value rather than just its
+// query is deliberate -- these headers are not needed in cleartext to correlate
+// a trace, and a partial mask invites the assumption that what is left is safe.
+var DefaultRedactHeaders = []string{
+	"authorization", "proxy-authorization", "cookie", "set-cookie",
+	"location", "content-location", "referer",
+}
 
 // DefaultBodyContentTypes are logged as text when no content_types are configured.
 var DefaultBodyContentTypes = []string{"application/json", "text/*", "application/xml", "application/x-www-form-urlencoded"}
@@ -552,6 +564,13 @@ func (c *Config) ApplyEnvOverrides() {
 	}
 	if v := os.Getenv("PROXY_INSECURE_SKIP_VERIFY"); v == "true" {
 		c.Proxy.InsecureSkipVerify = true
+	}
+	if v := os.Getenv("PROXY_MAX_CONNECTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.Proxy.MaxConnections = n
+		} else {
+			slog.Warn("Ignoring invalid PROXY_MAX_CONNECTIONS", "value", v)
+		}
 	}
 	if v := os.Getenv("PROXY_BLOCKED_LOG_PATH"); v != "" {
 		c.Proxy.BlockedLogPath = v

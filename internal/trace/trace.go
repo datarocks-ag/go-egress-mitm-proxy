@@ -37,6 +37,20 @@ var CtxKey = ctxKeyType{}
 // once rather than per record.
 var traceDropWarning sync.Once
 
+// MarkForwarded records that the request was handed to the upstream transport.
+//
+// It is what distinguishes "served from the idle connection pool" from "never
+// left the proxy". Both look identical on the Record -- no dial, no error -- and
+// only the first is a reused connection.
+func (r *Record) MarkForwarded() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.forwarded = true
+	r.mu.Unlock()
+}
+
 // FromContext returns the trace Record stored in ctx, or nil.
 func FromContext(ctx context.Context) *Record {
 	rec, ok := ctx.Value(CtxKey).(*Record)
@@ -83,8 +97,17 @@ func (rd Redactor) redactURL(raw string) string {
 		return raw
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.RawQuery == "" {
+	if err != nil {
 		return raw
+	}
+	// Strip userinfo before anything else. An absolute-form plain-HTTP target can
+	// carry user:password@, and url.URL.String() re-emits it, so the credential
+	// would reach the log even with query redaction on.
+	if u.User != nil {
+		u.User = url.User("<redacted>")
+	}
+	if u.RawQuery == "" {
+		return u.String()
 	}
 	q := u.Query()
 	for k := range q {
@@ -134,10 +157,12 @@ type Record struct {
 	connectedIP string
 	dialMillis  int64
 	connReused  bool
-	tlsVersion  string
-	tlsCipher   string
-	bytesUp     atomic.Int64
-	bytesDown   atomic.Int64
+	// forwarded records that the request was handed to the upstream transport.
+	forwarded  bool
+	tlsVersion string
+	tlsCipher  string
+	bytesUp    atomic.Int64
+	bytesDown  atomic.Int64
 
 	method        string
 	url           string
@@ -203,12 +228,26 @@ func (r *Record) SetTCP(connectedIP string, dialDur time.Duration, tlsVersion, t
 
 // SetError records an upstream/dial error for the trace.
 func (r *Record) SetError(msg string) {
+	// Nil-safe: callers on the request path hold whatever FromContext returned,
+	// which is nil whenever tracing is off or the request matched no rule.
+	if r == nil {
+		return
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	// Same reasoning as SetTCP: a dial abandoned after the request completed on a
 	// pooled connection must not attach its failure to a request that succeeded.
 	if r.connReused {
+		return
+	}
+
+	// Keep the first error. The dialers record the specific failure and classify
+	// it for the upstream error metrics; the round-trip wrapper sees only the
+	// wrapped form of the same thing, so letting it overwrite would replace a
+	// precise cause with a vaguer one.
+	if r.errMsg != "" {
 		return
 	}
 
@@ -262,8 +301,14 @@ func (r *Record) applyResponse(resp *http.Response) {
 
 	// A MITM response with no recorded dial means the upstream connection was
 	// reused from the pool; its remote IP is not observable for this request.
+	//
+	// forwarded gates this. Without it the condition was also satisfied by a
+	// request that never reached the network -- most importantly the 403
+	// HandleRequest synthesizes for a blocked host -- so the record asserted the
+	// proxy had reused an upstream connection to a host it deliberately refused
+	// to contact.
 	r.mu.Lock()
-	if r.mode == "mitm" && r.connectedIP == "" && r.errMsg == "" {
+	if r.mode == "mitm" && r.forwarded && r.connectedIP == "" && r.errMsg == "" {
 		r.connReused = true
 	}
 	r.mu.Unlock()

@@ -61,6 +61,23 @@ spec:
           ports:
             - containerPort: 8080
             - containerPort: 9090
+          env:
+            # A hijacked CONNECT tunnel carries no deadline: a client that
+            # completes the CONNECT and then goes silent holds an fd and a
+            # goroutine until the process dies. This bounds how many such
+            # connections can exist. At the cap the proxy pauses accepting, warns,
+            # and increments proxy_listener_saturated_total.
+            - name: PROXY_MAX_CONNECTIONS
+              value: "2048"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # No CPU limit on purpose: throttling a proxy adds latency to every
+              # request through it. The memory limit is the backstop for the
+              # connection ceiling above.
+              memory: 256Mi
           # /readyz reports 503 until the proxy port is bound, and again as soon
           # as shutdown begins, so it is safe to gate traffic on. /healthz stays
           # independent on purpose: failing it during a drain would have the
