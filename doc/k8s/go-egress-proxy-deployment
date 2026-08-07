@@ -13,6 +13,12 @@ spec:
       labels:
         app: my-app
     spec:
+      # NOTE: environment-variable proxying is advisory, not a gate. It is honoured
+      # only by clients that choose to read it; a static binary, a hardcoded
+      # http.Transport or anything deliberately evading it reaches the network
+      # directly. If egress must be enforced rather than encouraged, pair this with
+      # a NetworkPolicy or an init-container iptables REDIRECT so the proxy is the
+      # only route out of the pod.
       # Must exceed PROXY_PRESTOP_GRACE plus the 30s drain budget, or the kubelet
       # SIGKILLs the proxy mid-drain and the graceful shutdown is wasted. Sized
       # for the 10s default (10 + 30 = 40, with headroom); raise this by the same
@@ -23,8 +29,25 @@ spec:
         - name: app
           image: my-app-image:latest
           env:
+            # Both schemes, and both cases. Every proxy-aware client selects by
+            # REQUEST scheme, so HTTPS_PROXY alone leaves all cleartext egress
+            # going direct -- no ACL evaluation, no 403, no blocked-log entry and
+            # no proxy_traffic_total series for it. curl and several libraries
+            # read only the lowercase spellings.
+            - name: HTTP_PROXY
+              value: "http://localhost:8080"
             - name: HTTPS_PROXY
               value: "http://localhost:8080"
+            - name: http_proxy
+              value: "http://localhost:8080"
+            - name: https_proxy
+              value: "http://localhost:8080"
+            # Keep in-cluster and link-local traffic off the proxy. Adjust the
+            # CIDR to your cluster's service/pod ranges.
+            - name: NO_PROXY
+              value: "localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,169.254.169.254"
+            - name: no_proxy
+              value: "localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,169.254.169.254"
             - name: SSL_CERT_FILE # Point app to the Proxy CA
               value: "/etc/ssl/certs/proxy-ca.crt"
           volumeMounts:
