@@ -24,39 +24,20 @@ spec:
       # for the 10s default (10 + 30 = 40, with headroom); raise this by the same
       # amount if you raise PROXY_PRESTOP_GRACE.
       terminationGracePeriodSeconds: 45
-      containers:
-        # 1. Your Application
-        - name: app
-          image: my-app-image:latest
-          env:
-            # Both schemes, and both cases. Every proxy-aware client selects by
-            # REQUEST scheme, so HTTPS_PROXY alone leaves all cleartext egress
-            # going direct -- no ACL evaluation, no 403, no blocked-log entry and
-            # no proxy_traffic_total series for it. curl and several libraries
-            # read only the lowercase spellings.
-            - name: HTTP_PROXY
-              value: "http://localhost:8080"
-            - name: HTTPS_PROXY
-              value: "http://localhost:8080"
-            - name: http_proxy
-              value: "http://localhost:8080"
-            - name: https_proxy
-              value: "http://localhost:8080"
-            # Keep in-cluster and link-local traffic off the proxy. Adjust the
-            # CIDR to your cluster's service/pod ranges.
-            - name: NO_PROXY
-              value: "localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,169.254.169.254"
-            - name: no_proxy
-              value: "localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,169.254.169.254"
-            - name: SSL_CERT_FILE # Point app to the Proxy CA
-              value: "/etc/ssl/certs/proxy-ca.crt"
-          volumeMounts:
-            - name: ca-certs
-              mountPath: /etc/ssl/certs/proxy-ca.crt
-              subPath: ca.crt
-
-        # 2. The MITM Proxy Sidecar
+      # The proxy is declared as a native sidecar (an initContainer with
+      # restartPolicy: Always, Kubernetes >= 1.29) rather than an ordinary
+      # container. As an ordinary container the kubelet SIGTERMs it and the app
+      # at the same instant with no ordering guarantee: the proxy fails
+      # readiness, waits out PROXY_PRESTOP_GRACE and closes its listener while
+      # the app may still be draining for the rest of the grace period and still
+      # needs egress -- every outbound call then fails with ECONNREFUSED, turning
+      # a graceful app shutdown into dropped work on every deploy. A native
+      # sidecar starts before the app and is stopped only after it exits, which
+      # is the ordering this design already assumes.
+      initContainers:
+        # The MITM Proxy Sidecar
         - name: mitm-proxy
+          restartPolicy: Always
           image: my-registry/mitm-proxy:latest
           ports:
             - containerPort: 8080
@@ -101,6 +82,37 @@ spec:
               subPath: config.yaml
             - name: ca-certs
               mountPath: /etc/proxy/certs
+
+      containers:
+        # 1. Your Application
+        - name: app
+          image: my-app-image:latest
+          env:
+            # Both schemes, and both cases. Every proxy-aware client selects by
+            # REQUEST scheme, so HTTPS_PROXY alone leaves all cleartext egress
+            # going direct -- no ACL evaluation, no 403, no blocked-log entry and
+            # no proxy_traffic_total series for it. curl and several libraries
+            # read only the lowercase spellings.
+            - name: HTTP_PROXY
+              value: "http://localhost:8080"
+            - name: HTTPS_PROXY
+              value: "http://localhost:8080"
+            - name: http_proxy
+              value: "http://localhost:8080"
+            - name: https_proxy
+              value: "http://localhost:8080"
+            # Keep in-cluster and link-local traffic off the proxy. Adjust the
+            # CIDR to your cluster's service/pod ranges.
+            - name: NO_PROXY
+              value: "localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,169.254.169.254"
+            - name: no_proxy
+              value: "localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,169.254.169.254"
+            - name: SSL_CERT_FILE # Point app to the Proxy CA
+              value: "/etc/ssl/certs/proxy-ca.crt"
+          volumeMounts:
+            - name: ca-certs
+              mountPath: /etc/ssl/certs/proxy-ca.crt
+              subPath: ca.crt
 
       volumes:
         - name: config

@@ -74,17 +74,20 @@ func TestKubernetesManifestsMountConfigWhereTheBinaryReadsIt(t *testing.T) {
 		t.Fatalf("read Deployment: %v", err)
 	}
 
+	type container struct {
+		Name          string `yaml:"name"`
+		RestartPolicy string `yaml:"restartPolicy"`
+		VolumeMounts  []struct {
+			Name      string `yaml:"name"`
+			MountPath string `yaml:"mountPath"`
+		} `yaml:"volumeMounts"`
+	}
 	var manifest struct {
 		Spec struct {
 			Template struct {
 				Spec struct {
-					Containers []struct {
-						Name         string `yaml:"name"`
-						VolumeMounts []struct {
-							Name      string `yaml:"name"`
-							MountPath string `yaml:"mountPath"`
-						} `yaml:"volumeMounts"`
-					} `yaml:"containers"`
+					Containers     []container `yaml:"containers"`
+					InitContainers []container `yaml:"initContainers"`
 				} `yaml:"spec"`
 			} `yaml:"template"`
 		} `yaml:"spec"`
@@ -96,10 +99,22 @@ func TestKubernetesManifestsMountConfigWhereTheBinaryReadsIt(t *testing.T) {
 	// Must match CONFIG_PATH in the Dockerfile.
 	const wantMountPath = "/app/config.yaml"
 
+	// The proxy is a native sidecar, so it lives under initContainers; check both
+	// so this keeps working if that changes.
+	all := append(append([]container{}, manifest.Spec.Template.Spec.Containers...),
+		manifest.Spec.Template.Spec.InitContainers...)
+
 	var found bool
-	for _, c := range manifest.Spec.Template.Spec.Containers {
+	for _, c := range all {
 		if c.Name != "mitm-proxy" {
 			continue
+		}
+		// A native sidecar is an initContainer with restartPolicy: Always. Without
+		// it the kubelet runs the proxy to completion before starting the app,
+		// which never happens, and the pod hangs in Init.
+		if c.RestartPolicy != "Always" {
+			t.Errorf("mitm-proxy restartPolicy = %q, want \"Always\"; an initContainer without it "+
+				"blocks the pod from ever starting the app", c.RestartPolicy)
 		}
 		for _, m := range c.VolumeMounts {
 			if m.Name == "config" {
