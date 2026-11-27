@@ -10,6 +10,8 @@ git history for the full detail.
 
 ## [Unreleased]
 
+## [4.1.2] - 2026-11-27
+
 ### Security
 - **Updated `golang.org/x/{crypto,mod,net,text}`** to releases that fix six HIGH
   CVEs, among them an HTTP/2 SETTINGS-frame denial of service in `x/net/http2`.
@@ -409,6 +411,7 @@ dial interception (not DNS-level). Includes ACL enforcement
 automatic `X-Request-ID`, Prometheus metrics, health endpoints, hot reload
 (SIGHUP), graceful shutdown, and a CI pipeline.
 
+[4.1.2]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/datarocks-ag/go-egress-mitm-proxy/compare/v3.0.0...v4.0.0
