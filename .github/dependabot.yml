@@ -1,40 +1,91 @@
+# Dependabot: datarocks convention (https://github.com/datarocks-ag/github-actions/blob/develop/docs/dependabot.md).
+# Weekly on Monday, labels `dependencies` + the ecosystem, `chore(deps)` commits. Release-together
+# families and then all remaining minor and patch updates are grouped; major and security updates
+# arrive as PRs of their own.
 version: 2
 updates:
   # Go modules
-  - package-ecosystem: "gomod"
-    directory: "/"
+  - package-ecosystem: gomod
+    directory: /
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Europe/Zurich
     open-pull-requests-limit: 5
-    commit-message:
-      prefix: "deps"
     labels:
-      - "dependencies"
-      - "go"
+      - dependencies
+      - go
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
 
   # GitHub Actions
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Europe/Zurich
     open-pull-requests-limit: 5
-    commit-message:
-      prefix: "ci"
     labels:
-      - "dependencies"
-      - "ci"
+      - dependencies
+      - github_actions
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
 
   # Docker
-  - package-ecosystem: "docker"
-    directory: "/"
+  - package-ecosystem: docker
+    directory: /
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Europe/Zurich
     open-pull-requests-limit: 3
-    commit-message:
-      prefix: "docker"
     labels:
-      - "dependencies"
-      - "docker"
+      - dependencies
+      - docker
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Europe/Zurich
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
