@@ -10,6 +10,16 @@ git history for the full detail.
 
 ## [Unreleased]
 
+### Security
+- **Updated `golang.org/x/{crypto,mod,net,text}`** to releases that fix six HIGH
+  CVEs, among them an HTTP/2 SETTINGS-frame denial of service in `x/net/http2`.
+
+### Changed
+- **Built with Go 1.27** (go.mod and the container builder image). The patched
+  modules above require Go 1.26 or later.
+- Updated all other dependencies, including goproxy 1.9.4, client_golang 1.25.0,
+  go-pkcs12 0.7.4 and testcontainers-go 0.45.0.
+
 ## [4.1.1] - 2026-08-07
 
 ### Fixed
